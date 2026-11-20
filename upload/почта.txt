@@ -1,0 +1,756 @@
+1. База данных — prisma/schema.prisma (фрагменты)
+prisma
+model User {
+  id            String     @id @default(cuid())
+  name          String     @unique
+  email         String?    @unique // email для подтверждения регистрации; null — старые/демо-аккаунты
+  emailVerified DateTime?  // дата подтверждения email; null — аккаунт ещё не подтверждён
+  passwordHash  String
+  role          Role       @default(HELPER)
+  displayName   String?
+  avatar        String?
+  createdAt     DateTime   @default(now())
+  sessions          Session[]
+  reminders         Reminder[]
+  apiaryPoints      ApiaryPoint[]
+  verificationTokens VerificationToken[]
+}
+
+/** Одноразовый токен/код подтверждения email: в БД хранится только SHA-256 хеш. */
+model VerificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+Применение: bunx prisma db push --accept-data-loss
+
+2. Логика кодов — src/lib/verification.ts (полностью)
+ts
+/**
+ * Подтверждение email: коды и токены.
+ *
+ * КОД (основной способ): 6 цифр, crypto.randomInt. В БД хранится ТОЛЬКО
+ * SHA-256 хеш кода (утечка базы не раскрывает код), сырой код уходит
+ * пользователю в письме. Срок жизни — 30 минут, код одноразовый;
+ * не более 5 неверных попыток ввода.
+ *
+ * ТОКЕН-ССЫЛКА (legacy, остался для /api/auth/verify): randomBytes(32) → hex,
+ * в БД SHA-256 хеш, срок 24 часа, одноразовый.
+ *
+ * Плюс rate limit повторной отправки: не более 3 запросов на один email в час.
+ * Хранение в памяти процесса (Map) — достаточно для этого приложения.
+ */
+import { createHash, randomBytes, randomInt } from 'node:crypto'
+import { db } from './db'
+
+export const VERIFICATION_TTL_MS = 24 * 3600 * 1000 // 24 часа (для токена-ссылки)
+export const CODE_TTL_MS = 30 * 60 * 1000 // 30 минут (для кода из письма)
+const MAX_CODE_ATTEMPTS = 5
+
+function hashToken(raw: string): string {
+  return createHash('sha256').update(raw).digest('hex')
+}
+
+/**
+ * Создаёт новый токен подтверждения для пользователя. Предыдущие токены
+ * пользователя удаляются — действительна всегда только последняя ссылка.
+ * Возвращает СЫРОЙ токен (только для ссылки в письме).
+ */
+export async function issueVerificationToken(userId: string): Promise<string> {
+  const raw = randomBytes(32).toString('hex')
+  await db.verificationToken.deleteMany({ where: { userId } })
+  await db.verificationToken.create({
+    data: {
+      userId,
+      tokenHash: hashToken(raw),
+      expiresAt: new Date(Date.now() + VERIFICATION_TTL_MS),
+    },
+  })
+  return raw
+}
+
+export type ConsumeResult = { ok: true; userId: string } | { ok: false }
+
+/* ------------------------------------------------------------------ */
+/* КОД ПОДТВЕРЖДЕНИЯ (основной способ)                                  */
+/* ------------------------------------------------------------------ */
+
+/** userId → счётчик неверных попыток ввода кода. */
+const codeAttempts = new Map<string, { count: number; firstAt: number }>()
+
+function resetAttempts(userId: string): void {
+  codeAttempts.delete(userId)
+}
+
+function failAttempt(userId: string): number {
+  const now = Date.now()
+  const rec = codeAttempts.get(userId)
+  if (!rec || now - rec.firstAt > CODE_TTL_MS) {
+    codeAttempts.set(userId, { count: 1, firstAt: now })
+    return 1
+  }
+  rec.count += 1
+  return rec.count
+}
+
+function attemptsLeft(userId: string): number {
+  const rec = codeAttempts.get(userId)
+  if (!rec || Date.now() - rec.firstAt > CODE_TTL_MS) return MAX_CODE_ATTEMPTS
+  return Math.max(0, MAX_CODE_ATTEMPTS - rec.count)
+}
+
+/**
+ * Создаёт новый 6-значный код подтверждения для пользователя. Предыдущие
+ * записи пользователя удаляются — действителен всегда только последний код.
+ * Возвращает СЫРОЙ код (только для письма).
+ */
+export async function issueVerificationCode(userId: string): Promise<string> {
+  const code = String(randomInt(100000, 1000000))
+  await db.verificationToken.deleteMany({ where: { userId } })
+  await db.verificationToken.create({
+    data: {
+      userId,
+      tokenHash: hashToken(code),
+      expiresAt: new Date(Date.now() + CODE_TTL_MS),
+    },
+  })
+  resetAttempts(userId)
+  return code
+}
+
+export type CodeConsumeResult = 'ok' | 'invalid' | 'expired' | 'locked'
+
+/**
+ * Проверяет код из письма по email. Валидный и не истёкший — ставит
+ * User.emailVerified и удаляет запись (одноразовость).
+ * 'invalid' — неверный код (или аккаунта нет); 'expired' — срок вышел;
+ * 'locked' — слишком много неверных попыток.
+ */
+export async function consumeVerificationCode(email: string, code: string): Promise<CodeConsumeResult> {
+  const user = await db.user.findUnique({ where: { email } })
+  if (!user) return 'invalid'
+
+  const record = await db.verificationToken.findFirst({ where: { userId: user.id } })
+  if (!record) return 'expired'
+
+  if (record.expiresAt.getTime() < Date.now()) {
+    await db.verificationToken.delete({ where: { id: record.id } }).catch(() => undefined)
+    return 'expired'
+  }
+
+  if (attemptsLeft(user.id) <= 0) return 'locked'
+
+  if (hashToken(code) !== record.tokenHash) {
+    const fails = failAttempt(user.id)
+    return fails >= MAX_CODE_ATTEMPTS ? 'locked' : 'invalid'
+  }
+
+  await db.$transaction([
+    db.user.update({ where: { id: user.id }, data: { emailVerified: new Date() } }),
+    db.verificationToken.delete({ where: { id: record.id } }),
+  ])
+  resetAttempts(user.id)
+  return 'ok'
+}
+
+/**
+ * Проверяет сырой токен из ссылки. Если он валиден и не истёк — ставит
+ * User.emailVerified = текущая дата и удаляет запись токена (одноразовость).
+ * Невалидный / истёкший / отсутствующий → { ok: false }.
+ */
+export async function consumeVerificationToken(raw: string | null): Promise<ConsumeResult> {
+  if (!raw) return { ok: false }
+  const record = await db.verificationToken.findUnique({ where: { tokenHash: hashToken(raw) } })
+  if (!record) return { ok: false }
+
+  if (record.expiresAt.getTime() < Date.now()) {
+    // Истёкший токен сразу чистим, чтобы не копился мусор.
+    await db.verificationToken.delete({ where: { id: record.id } }).catch(() => undefined)
+    return { ok: false }
+  }
+
+  await db.$transaction([
+    db.user.update({ where: { id: record.userId }, data: { emailVerified: new Date() } }),
+    db.verificationToken.delete({ where: { id: record.id } }),
+  ])
+  return { ok: true, userId: record.userId }
+}
+
+/* ------------------------------------------------------------------ */
+/* Rate limit повторной отправки: 3 запроса на email в час              */
+/* ------------------------------------------------------------------ */
+
+const RESEND_WINDOW_MS = 3600 * 1000 // 1 час
+const RESEND_MAX_PER_WINDOW = 3
+
+/** email (в нижнем регистре) → времена запросов внутри текущего часа. */
+const resendHits = new Map<string, number[]>()
+
+export function checkResendRateLimit(email: string): { allowed: boolean; retryAfterSec: number } {
+  const now = Date.now()
+  const list = (resendHits.get(email) ?? []).filter((t) => now - t < RESEND_WINDOW_MS)
+
+  if (list.length >= RESEND_MAX_PER_WINDOW) {
+    const retryAfterSec = Math.max(1, Math.ceil((RESEND_WINDOW_MS - (now - list[0])) / 1000))
+    resendHits.set(email, list)
+    return { allowed: false, retryAfterSec }
+  }
+
+  list.push(now)
+  resendHits.set(email, list)
+  return { allowed: true, retryAfterSec: 0 }
+}
+3. Отправка письма — src/lib/email.ts (полностью)
+ts
+/**
+ * Письмо с кодом подтверждения email через SMTP (nodemailer).
+ *
+ * Настройки берутся из .env:
+ *   EMAIL_SERVER_HOST / EMAIL_SERVER_PORT / EMAIL_SERVER_USER /
+ *   EMAIL_SERVER_PASSWORD / EMAIL_FROM
+ *
+ * Пользователь вводит 6-значный код из письма прямо в приложении — переход
+ * по ссылкам не требуется, поэтому домен в письме не нужен.
+ * Если SMTP не настроен (пустой EMAIL_SERVER_HOST или EMAIL_FROM) — dev-режим:
+ * код печатается в консоль сервера. Регистрация при этом не ломается.
+ */
+import nodemailer from 'nodemailer'
+
+const APP_NAME = 'Цифровой улей'
+
+function isSmtpConfigured(): boolean {
+  return Boolean(process.env.EMAIL_SERVER_HOST && process.env.EMAIL_FROM)
+}
+
+/** HTML-письмо на русском: приветствие, пояснение, крупный код, примечания. */
+function buildVerificationHtml(name: string, code: string): string {
+  const greeting = name ? `Здравствуйте, ${name}!` : 'Здравствуйте!'
+  return `<!DOCTYPE html>
+<html lang="ru">
+  <body style="margin:0; padding:0; background-color:#f4f1ee;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f1ee; padding:32px 16px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px; background-color:#ffffff; border-radius:16px; padding:40px 36px; font-family:Arial, Helvetica, sans-serif; color:#2a1a12;">
+            <tr>
+              <td style="font-size:20px; font-weight:bold; padding-bottom:16px;">
+                ${APP_NAME}
+              </td>
+            </tr>
+            <tr>
+              <td style="font-size:16px; padding-bottom:12px;">
+                ${greeting}
+              </td>
+            </tr>
+            <tr>
+              <td style="font-size:14px; line-height:1.6; color:#555555; padding-bottom:24px;">
+                Чтобы завершить регистрацию, введите этот код подтверждения в приложении:
+              </td>
+            </tr>
+            <tr>
+              <td align="center" style="padding-bottom:24px;">
+                <div style="font-size:34px; font-weight:bold; letter-spacing:10px; color:#c2410c; background-color:#fff7ed; border:1px solid #fed7aa; border-radius:12px; padding:18px 16px; text-align:center;">${code}</div>
+              </td>
+            </tr>
+            <tr>
+              <td style="font-size:13px; line-height:1.6; color:#555555; padding-bottom:20px;">
+                Введите код в приложении на экране «Проверьте почту» и нажмите «Подтвердить email».
+              </td>
+            </tr>
+            <tr>
+              <td style="font-size:12px; color:#999999; border-top:1px solid #eeeeee; padding-top:16px;">
+                Код действителен 30 минут. Если вы не регистрировались в «${APP_NAME}», просто проигнорируйте это письмо.
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`
+}
+
+/** Текстовая версия письма (multipart) — улучшает доставляемость и читаемость без HTML. */
+function buildVerificationText(name: string, code: string): string {
+  const greeting = name ? `Здравствуйте, ${name}!` : 'Здравствуйте!'
+  return [
+    greeting,
+    '',
+    'Чтобы завершить регистрацию в «Цифровом улье», введите этот код подтверждения в приложении:',
+    '',
+    `    ${code}`,
+    '',
+    'Код действителен 30 минут.',
+    'Если вы не регистрировались в «Цифровом улье», просто проигнорируйте это письмо.',
+  ].join('\n')
+}
+
+export type SendResult = 'sent' | 'dev-logged'
+
+/**
+ * Отправляет письмо с кодом подтверждения. Бросает исключение только при
+ * настроенном, но неудавшемся SMTP-вызове — вызывающий код решает, как реагировать.
+ */
+export async function sendVerificationEmail(to: string, name: string, code: string): Promise<SendResult> {
+  // SMTP не настроен — dev-fallback: печатаем код в консоль сервера.
+  if (!isSmtpConfigured()) {
+    console.log(`[email] SMTP не настроен, письмо НЕ отправлено. Код подтверждения для ${to}: ${code}`)
+    return 'dev-logged'
+  }
+
+  const port = Number(process.env.EMAIL_SERVER_PORT ?? 587)
+  const transporter = nodemailer.createTransport({
+    host: process.env.EMAIL_SERVER_HOST,
+    port,
+    secure: port === 465, // 465 — implicit TLS, 587 — STARTTLS
+    auth: process.env.EMAIL_SERVER_USER
+      ? {
+          user: process.env.EMAIL_SERVER_USER,
+          pass: process.env.EMAIL_SERVER_PASSWORD,
+        }
+      : undefined,
+    // CHANGED: Mail.ru обрывает TLS-рукопожатие без явного минимального TLS 1.2
+    tls: { minVersion: 'TLSv1.2' },
+  })
+
+  const info = await transporter.sendMail({
+    from: process.env.EMAIL_FROM,
+    to,
+    subject: `Код подтверждения — ${APP_NAME}`,
+    html: buildVerificationHtml(name, code),
+    text: buildVerificationText(name, code),
+    // CHANGED: просим Gmail прислать отчёт при отказе/задержке — придёт в ящик отправителя
+    dsn: { notify: ['FAILURE', 'DELAY'], ret: 'HDRS' },
+  })
+  console.log(`[email] письмо с кодом отправлено на ${to} (${info.messageId}). Код: ${code}`)
+  return 'sent'
+}
+4. API-маршруты
+src/app/api/auth/register/route.ts (полностью):
+
+ts
+import { NextResponse } from 'next/server'
+import { ensureSeeded } from '@/lib/bootstrap'
+import { registerUser } from '@/lib/auth'
+import { issueVerificationCode } from '@/lib/verification'
+import { sendVerificationEmail } from '@/lib/email'
+import type { Role } from '@/lib/api-types'
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
+
+/**
+ * Человекочитаемое предупреждение при неудачной отправке кода.
+ * CHANGED: Mail.ru проверяет существование ящика получателя и отклоняет
+ * несуществующие адреса (550 non-local recipient verification failed) —
+ * показываем это пользователю сразу, чтобы он поправил опечатку в email.
+ */
+function smtpWarning(e: unknown): string {
+  const err = e as { responseCode?: number; code?: string }
+  if (err.responseCode === 550 || err.code === 'EENVELOPE') {
+    return 'Код не удалось отправить: почтовый сервер отклонил этот адрес. Проверьте правильность email и отправьте код повторно.'
+  }
+  return 'Не удалось отправить код на почту. Воспользуйтесь кнопкой «Отправить код повторно».'
+}
+
+/**
+ * Регистрация нового пользователя: имя + email + пароль.
+ * CHANGED: сессия/cookie НЕ выдаются — доступ откроется только после
+ * подтверждения email кодом из письма.
+ */
+export async function POST(req: Request) {
+  try {
+    await ensureSeeded()
+    const body = (await req.json()) as { name?: string; email?: string; password?: string; role?: string }
+    const name = (body.name ?? '').trim()
+    const email = (body.email ?? '').trim().toLowerCase()
+    const password = body.password ?? ''
+    const role = body.role === 'BEEKEEPER' ? 'BEEKEEPER' : 'HELPER'
+
+    if (name.length < 2 || name.length > 40) {
+      return NextResponse.json({ error: 'Имя: от 2 до 40 символов' }, { status: 400 })
+    }
+    if (!EMAIL_RE.test(email)) {
+      return NextResponse.json({ error: 'Введите корректный email' }, { status: 400 })
+    }
+    if (password.length < 4) {
+      return NextResponse.json({ error: 'Пароль — минимум 4 символа' }, { status: 400 })
+    }
+
+    const res = await registerUser(name, email, password, role as Role)
+    if (!res.ok) {
+      return NextResponse.json({ error: res.error }, { status: 400 })
+    }
+
+    // Код подтверждения: в БД только SHA-256 хеш, сырой код уходит в письме.
+    const code = await issueVerificationCode(res.user.id)
+    let warning: string | null = null
+    try {
+      const send = await sendVerificationEmail(email, name, code)
+      if (send === 'dev-logged') {
+        console.log(`[register] письмо для ${email} не отправлено (SMTP не настроен) — код в консоли сервера`)
+      }
+    } catch (e) {
+      // Аккаунт уже создан: не откатываем регистрацию, пусть пользователь
+      // воспользуется «Отправить код повторно».
+      console.error('register: не удалось отправить письмо', e)
+      warning = smtpWarning(e)
+    }
+
+    // Никакой сессии и никакого редиректа в приложение — только сообщение.
+    return NextResponse.json({
+      message: 'Регистрация успешна. Проверьте почту для подтверждения аккаунта',
+      ...(warning ? { warning } : {}),
+    })
+  } catch (e) {
+    console.error('register error', e)
+    return NextResponse.json({ error: 'Ошибка сервера при регистрации' }, { status: 500 })
+  }
+}
+src/app/api/auth/verify-code/route.ts (полностью, новый):
+
+ts
+import { NextResponse } from 'next/server'
+import { consumeVerificationCode } from '@/lib/verification'
+
+const CODE_RE = /^\d{6}$/
+
+/**
+ * POST /api/auth/verify-code  { email, code }
+ * Подтверждение email кодом из письма (основной способ).
+ *   • ok      → 200 «Email подтверждён. Теперь вы можете войти»
+ *   • invalid → 400 «Неверный код»
+ *   • expired → 400 «Код истёк. Запросите новый код»
+ *   • locked  → 429 после 5 неверных попыток
+ */
+export async function POST(req: Request) {
+  try {
+    const body = (await req.json().catch(() => ({}))) as { email?: string; code?: string }
+    const email = (body.email ?? '').trim().toLowerCase()
+    const code = (body.code ?? '').replace(/\s+/g, '')
+
+    if (!CODE_RE.test(code)) {
+      return NextResponse.json({ error: 'Введите 6-значный код из письма' }, { status: 400 })
+    }
+
+    const result = await consumeVerificationCode(email, code)
+
+    if (result === 'ok') {
+      return NextResponse.json({ message: 'Email подтверждён. Теперь вы можете войти' })
+    }
+    if (result === 'expired') {
+      return NextResponse.json({ error: 'Код истёк. Запросите новый код' }, { status: 400 })
+    }
+    if (result === 'locked') {
+      return NextResponse.json(
+        { error: 'Слишком много неверных попыток. Запросите новый код и попробуйте снова' },
+        { status: 429 },
+      )
+    }
+    return NextResponse.json({ error: 'Неверный код' }, { status: 400 })
+  } catch (e) {
+    console.error('verify-code error', e)
+    return NextResponse.json({ error: 'Ошибка сервера. Попробуйте позже.' }, { status: 500 })
+  }
+}
+src/app/api/auth/resend-verification/route.ts (полностью):
+
+ts
+import { NextResponse } from 'next/server'
+import { db } from '@/lib/db'
+import { checkResendRateLimit, issueVerificationCode } from '@/lib/verification'
+import { sendVerificationEmail } from '@/lib/email'
+
+/**
+ * POST /api/auth/resend-verification  { email }
+ * Повторная отправка письма подтверждения.
+ *   • Rate limit: не более 3 запросов на один email в час (Map в памяти процесса).
+ *   • Пользователь не найден → всё равно 200 (не раскрываем существование аккаунта).
+ *   • Email уже подтверждён → 200 «Email уже подтверждён».
+ *   • Иначе — новый код (старые записи пользователя удаляются) и письмо.
+ */
+export async function POST(req: Request) {
+  try {
+    const body = (await req.json().catch(() => ({}))) as { email?: string }
+    const email = (body.email ?? '').trim().toLowerCase()
+    if (!email) {
+      return NextResponse.json({ error: 'Укажите email' }, { status: 400 })
+    }
+
+    // Rate limit считаем по каждому запросу, до проверок существования аккаунта.
+    const rl = checkResendRateLimit(email)
+    if (!rl.allowed) {
+      const minutes = Math.max(1, Math.ceil(rl.retryAfterSec / 60))
+      return NextResponse.json(
+        { error: `Слишком много запросов. Попробуйте ещё раз примерно через ${minutes} мин.` },
+        { status: 429 },
+      )
+    }
+
+    const user = await db.user.findUnique({ where: { email } })
+    if (!user || !user.email) {
+      // Не раскрываем, существует ли аккаунт с таким email.
+      return NextResponse.json({ message: 'Если такой email зарегистрирован и не подтверждён, мы отправили письмо' })
+    }
+    if (user.emailVerified) {
+      return NextResponse.json({ message: 'Email уже подтверждён' })
+    }
+
+    const code = await issueVerificationCode(user.id)
+    try {
+      const send = await sendVerificationEmail(user.email, user.name, code)
+      if (send === 'dev-logged') {
+        console.log(`[resend] письмо для ${user.email} не отправлено (SMTP не настроен) — код в консоли сервера`)
+      }
+    } catch (e) {
+      console.error('resend-verification: не удалось отправить письмо', e)
+      // CHANGED: Mail.ru отклоняет несуществующие адреса — сообщаем пользователю
+      const err = e as { responseCode?: number; code?: string }
+      if (err.responseCode === 550 || err.code === 'EENVELOPE') {
+        return NextResponse.json({
+          message: 'Если такой email зарегистрирован и не подтверждён, мы отправили код',
+          warning: 'Код не удалось отправить: почтовый сервер отклонил этот адрес. Проверьте правильность email.',
+        })
+      }
+    }
+
+    return NextResponse.json({ message: 'Если такой email зарегистрирован и не подтверждён, мы отправили код' })
+  } catch (e) {
+    console.error('resend-verification error', e)
+    return NextResponse.json({ error: 'Ошибка сервера. Попробуйте позже.' }, { status: 500 })
+  }
+}
+src/app/api/auth/login/route.ts (полностью):
+
+ts
+import { NextResponse } from 'next/server'
+import { ensureSeeded } from '@/lib/bootstrap'
+import { loginUser, sessionCookieOptions, SESSION_COOKIE } from '@/lib/auth'
+
+/**
+ * Вход по имени и паролю.
+ * CHANGED: если email пользователя ещё не подтверждён (emailVerified = null)
+ * — 403 «Подтвердите email. Проверьте почту.», сессия НЕ создаётся.
+ */
+export async function POST(req: Request) {
+  try {
+    await ensureSeeded()
+    const body = (await req.json()) as { name?: string; password?: string }
+    const name = (body.name ?? '').trim()
+    const password = body.password ?? ''
+    if (!name || !password) {
+      return NextResponse.json({ error: 'Введите имя и пароль' }, { status: 400 })
+    }
+    const result = await loginUser(name, password)
+
+    if (result.status === 'invalid') {
+      return NextResponse.json({ error: 'Неверное имя или пароль' }, { status: 401 })
+    }
+    if (result.status === 'unverified') {
+      return NextResponse.json(
+        {
+          error: 'Подтвердите email. Проверьте почту.',
+          needsVerification: true,
+          // email вернём только после успешной проверки пароля — это сам владелец аккаунта
+          email: result.email,
+        },
+        { status: 403 },
+      )
+    }
+
+    const out = NextResponse.json({ user: result.result.user })
+    out.cookies.set(SESSION_COOKIE, result.result.token, sessionCookieOptions)
+    return out
+  } catch (e) {
+    console.error('login error', e)
+    return NextResponse.json({ error: 'Ошибка сервера при входе' }, { status: 500 })
+  }
+}
+src/app/api/auth/verify/route.ts (legacy-ссылка, полностью):
+
+ts
+import { NextResponse } from 'next/server'
+import { consumeVerificationToken } from '@/lib/verification'
+
+/**
+ * GET /api/auth/verify?token={rawToken} — переход по ссылке из письма.
+ * Ответ — ТОЛЬКО редирект (не JSON):
+ *   • токен валиден и не истёк → User.emailVerified = текущая дата, запись
+ *     токена удалена, редирект на /login?verified=true
+ *   • токен невалиден / истёк / отсутствует → редирект на /login?error=invalid_token
+ */
+export async function GET(req: Request) {
+  // Базу редиректа берём из самого запроса (учитывая x-forwarded-proto за прокси),
+  // чтобы браузер остался на том же домене, с которого открыл ссылку.
+  const url = new URL(req.url)
+  const proto = req.headers.get('x-forwarded-proto') ?? url.protocol.replace(':', '')
+  const host = req.headers.get('host') ?? url.host
+  const base = `${proto}://${host}`
+
+  const token = url.searchParams.get('token')
+  const ok = await consumeVerificationToken(token).catch(() => ({ ok: false as const }))
+
+  if (!ok.ok) {
+    return NextResponse.redirect(`${base}/login?error=invalid_token`)
+  }
+  return NextResponse.redirect(`${base}/login?verified=true`)
+}
+5. Изменения в src/lib/auth.ts (фрагменты, остальное без изменений)
+ts
+export type LoginResult =
+  | { status: 'ok'; result: AuthResult }
+  | { status: 'unverified'; email: string } // есть email, но он не подтверждён
+  | { status: 'invalid' } // неверное имя или пароль
+
+export async function loginUser(name: string, password: string): Promise<LoginResult> {
+  const user = await db.user.findUnique({ where: { name } })
+  if (!user || !verifyPassword(password, user.passwordHash)) return { status: 'invalid' }
+  // CHANGED: вход только для аккаунтов с подтверждённым email.
+  // Сессия НЕ создаётся, пока email не подтверждён.
+  if (user.email && !user.emailVerified) return { status: 'unverified', email: user.email }
+  const token = await createSession(user.id)
+  return { status: 'ok', result: { user: toSafeUser(user), token } }
+}
+
+/**
+ * CHANGED: создаёт неподтверждённого пользователя (email + пароль) БЕЗ сессии.
+ * Токен подтверждения и отправку письма выполняет вызывающий маршрут
+ * (см. src/lib/verification.ts и /api/auth/register).
+ */
+export async function registerUser(
+  name: string,
+  email: string,
+  password: string,
+  role: Role,
+): Promise<{ ok: true; user: RegisteredUser } | { ok: false; error: string }> {
+  const existsName = await db.user.findUnique({ where: { name } })
+  if (existsName) return { ok: false, error: 'Пользователь с таким именем уже есть' }
+  const existsEmail = await db.user.findUnique({ where: { email } })
+  if (existsEmail) return { ok: false, error: 'Пользователь с таким email уже зарегистрирован' }
+  const user = await db.user.create({
+    data: { name, email, passwordHash: hashPassword(password), role },
+  })
+  // Сессию намеренно не создаём: доступ открывается только после подтверждения email.
+  return { ok: true, user: { id: user.id, name: user.name, email: user.email as string, role: user.role as Role } }
+}
+6. Бэкфилл старых аккаунтов — src/lib/bootstrap.ts (фрагмент, добавлен перед сидингом)
+ts
+    // Старые/демо-аккаунты не имеют email — помечаем их подтверждёнными,
+    // чтобы демо-вход продолжал работать. Новые регистрации не затрагиваются.
+    await db.user.updateMany({
+      where: { email: null, emailVerified: null },
+      data: { emailVerified: new Date() },
+    })
+7. Интерфейс — src/components/bee/AuthView.tsx
+Полный файл (540 строк) лежит в проекте. Ключевые добавленные части:
+
+tsx
+// Состояния экрана «Проверьте почту»
+const [pendingEmail, setPendingEmail] = useState<PendingEmail | null>(null) // { email, kind: 'registered' | 'unverified' }
+const [pendingWarning, setPendingWarning] = useState<string | null>(null)
+const [codeInput, setCodeInput] = useState('')
+const [verifying, setVerifying] = useState(false)
+const [codeMsg, setCodeMsg] = useState<AuthNotice | null>(null)
+const [verifiedOk, setVerifiedOk] = useState(false)
+
+// Ввод кода: поле принимает только цифры, максимум 6
+<Input
+  id="auth-code"
+  value={codeInput}
+  onChange={(e) => setCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
+  placeholder="000000"
+  inputMode="numeric"
+  autoComplete="one-time-code"
+  autoFocus
+  className="border-red-200 text-center font-mono text-2xl tracking-[0.45em] focus-visible:ring-red-300"
+/>
+
+// Проверка кода
+const submitCode = async () => {
+  if (verifying || !pendingEmail) return
+  const code = codeInput.replace(/\s+/g, '')
+  if (!CODE_RE.test(code)) {
+    setCodeMsg({ kind: 'error', text: 'Введите 6-значный код из письма' })
+    return
+  }
+  setVerifying(true)
+  setCodeMsg(null)
+  try {
+    const res = await fetch('/api/auth/verify-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: pendingEmail.email, code }),
+    })
+    const j = (await res.json()) as { message?: string; error?: string }
+    if (!res.ok) {
+      setCodeMsg({ kind: 'error', text: j.error ?? 'Не удалось подтвердить код' })
+      return
+    }
+    setVerifiedOk(true) // зелёный экран «Email подтверждён» + кнопка «Войти в систему»
+  } catch {
+    setCodeMsg({ kind: 'error', text: 'Сервер недоступен — попробуйте ещё раз' })
+  } finally {
+    setVerifying(false)
+  }
+}
+
+// При 403 (вход в неподтверждённый аккаунт) сразу показываем экран ввода кода:
+if (res.status === 403 && j.needsVerification && j.email) {
+  setPendingEmail({ email: j.email, kind: 'unverified' })
+  setCodeInput(''); setCodeMsg(null); setVerifiedOk(false)
+  return
+}
+Кнопка подтверждения — оранжевая (#f97316), resend — с 60-секундной блокировкой. Полный файл могу прислать отдельно, если нужен дословно.
+
+src/app/login/page.tsx (полностью):
+
+ts
+/**
+ * Страница входа /login — отдельный маршрут, куда ведут редиректы из письма
+ * подтверждения (GET /api/auth/verify):
+ *   • ?verified=true      → зелёный баннер «Email подтверждён. Теперь вы можете войти.»
+ *   • ?error=invalid_token → красный баннер «Ссылка недействительна или истекла.
+ *                            Запросите новое письмо.»
+ * После успешного входа пользователь возвращается в приложение на «/».
+ */
+import { AuthView, type AuthNotice } from '@/components/bee/AuthView'
+
+export const dynamic = 'force-dynamic'
+
+export default async function LoginPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ verified?: string | string[]; error?: string | string[] }>
+}) {
+  const sp = await searchParams
+  let notice: AuthNotice | null = null
+  if (sp.verified) {
+    notice = { kind: 'success', text: 'Email подтверждён. Теперь вы можете войти.' }
+  } else if (sp.error === 'invalid_token') {
+    notice = { kind: 'error', text: 'Ссылка недействительна или истекла. Запросите новое письмо.' }
+  }
+  return <AuthView notice={notice} standalone />
+}
+8. Настройки — .env
+bash
+DATABASE_URL=file:/home/z/my-project/db/custom.db
+
+# --- Подтверждение email (SMTP / nodemailer) ---
+# Пустой EMAIL_SERVER_HOST = dev-режим: код подтверждения печатается в консоль сервера.
+EMAIL_SERVER_HOST=smtp.mail.ru
+EMAIL_SERVER_PORT=465
+EMAIL_SERVER_USER=digitalhive@mail.ru
+EMAIL_SERVER_PASSWORD=bSERt2HcpVekPR0I0Qux
+EMAIL_FROM=Цифровой улей <digitalhive@mail.ru>
+# Базовый URL для ссылок в письмах: пусто или localhost => берётся из заголовков запроса
+NEXT_PUBLIC_APP_URL=
+9. Зависимости и команды
+bash
+bun add nodemailer
+bun add -d @types/nodemailer
+bunx prisma db push --accept-data-loss   # применить схему
+bun run dev                              # запустить сервер

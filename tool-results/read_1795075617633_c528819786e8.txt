@@ -1,0 +1,1122 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * «История событий»: красиво оформленный почасовой журнал датчиков ульев.
+     5→ *
+     6→ * Параметры (температура, влажность, масса) фиксируются КАЖДЫЙ ЧАС — записи
+     7→ * журнала живут в БД (SensorLog) и наполняются по якорной CSV-выгрузке
+     8→ * телеметрии. При наведении на запись всплывает окно с подробной таблицей
+     9→ * изменений параметров; таблицу можно закрепить кликом (и на телефоне тоже).
+    10→ *
+    11→ * Быстрый доступ по периодам: День / Месяц / Год, шаг стрелками и кнопка
+    12→ * календаря — клик по числу открывает этот день с данными.
+    13→ * Времена журнала показываются в UTC — то же время, что в исходной таблице
+    14→ * телеметрии, независимо от часового пояса браузера.
+    15→ */
+    16→import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+    17→import { AnimatePresence, motion } from 'framer-motion'
+    18→import {
+    19→  CalendarDays,
+    20→  ChevronLeft,
+    21→  ChevronRight,
+    22→  Clock3,
+    23→  Droplets,
+    24→  History,
+    25→  MousePointerClick,
+    26→  RefreshCcw,
+    27→  Thermometer,
+    28→  TriangleAlert,
+    29→  Weight,
+    30→  X,
+    31→} from 'lucide-react'
+    32→import { ru } from 'date-fns/locale'
+    33→import { Button } from '@/components/ui/button'
+    34→import { Card, CardContent } from '@/components/ui/card'
+    35→import { Calendar } from '@/components/ui/calendar'
+    36→import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+    37→import { cn } from '@/lib/utils'
+    38→import type {
+    39→  HistoryLogDto,
+    40→  HistoryResponse,
+    41→  HistoryScope,
+    42→} from '@/lib/api-types'
+    43→
+    44→const ease = { duration: 0.25, ease: 'easeOut' as const }
+    45→
+    46→/* ------------------------------------------------------------------ */
+    47→/* Форматирование «стеночных часов» журнала (UTC)                      */
+    48→/* ------------------------------------------------------------------ */
+    49→
+    50→const MONTHS_GEN = [
+    51→  'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+    52→  'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря',
+    53→]
+    54→const MONTHS_NOM = [
+    55→  'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+    56→  'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь',
+    57→]
+    58→const WEEKDAYS = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+    59→
+    60→const pad2 = (n: number) => String(n).padStart(2, '0')
+    61→
+    62→/** «2026-08-29» → «29 августа 2026» (UTC). */
+    63→function fmtDateLabel(key: string): string {
+    64→  const [y, m, d] = key.split('-').map(Number)
+    65→  return `${d} ${MONTHS_GEN[m - 1]} ${y}`
+    66→}
+    67→
+    68→/** «2026-08» → «Август 2026». */
+    69→function fmtMonthLabel(key: string): string {
+    70→  const [y, m] = key.split('-').map(Number)
+    71→  return `${MONTHS_NOM[m - 1]} ${y}`
+    72→}
+    73→
+    74→/** ISO → «HH:MM» (UTC). */
+    75→function fmtTime(iso: string): string {
+    76→  const d = new Date(iso)
+    77→  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
+    78→}
+    79→
+    80→const dayKeyOf = (d: Date) => d.toISOString().slice(0, 10)
+    81→const parseDayKey = (key: string) => new Date(`${key}T00:00:00Z`)
+    82→
+    83→function addDaysKey(key: string, days: number): string {
+    84→  const d = parseDayKey(key)
+    85→  d.setUTCDate(d.getUTCDate() + days)
+    86→  return dayKeyOf(d)
+    87→}
+    88→
+    89→function addMonthsKey(key: string, months: number): string {
+    90→  const [y, m] = key.split('-').map(Number)
+    91→  const d = new Date(Date.UTC(y, m - 1 + months, 1))
+    92→  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}`
+    93→}
+    94→
+    95→/* ------------------------------------------------------------------ */
+    96→/* Плавающая таблица изменений                                         */
+    97→/* ------------------------------------------------------------------ */
+    98→
+    99→interface PopRect {
+   100→  left: number
+   101→  right: number
+   102→  top: number
+   103→}
+   104→
+   105→interface PopState {
+   106→  rect: PopRect
+   107→  title: string
+   108→  subtitle?: string
+   109→  table: React.ReactNode
+   110→}
+   111→
+   112→/** Компактная таблица с дельтами: строка «время → параметры». */
+   113→function MiniTable({
+   114→  head,
+   115→  rows,
+   116→  highlight,
+   117→}: {
+   118→  head: string[]
+   119→  rows: Array<Array<React.ReactNode>>
+   120→  highlight?: number
+   121→}) {
+   122→  return (
+   123→    <table className="w-full border-collapse text-[11px]">
+   124→      <thead>
+   125→        <tr className="bg-red-50/80 dark:bg-[#2C211C]">
+   126→          {head.map((h) => (
+   127→            <th
+   128→              key={h}
+   129→              className="whitespace-nowrap px-2 py-1.5 text-left font-bold uppercase tracking-wide text-gray-500 first:rounded-tl-lg last:rounded-tr-lg"
+   130→            >
+   131→              {h}
+   132→            </th>
+   133→          ))}
+   134→        </tr>
+   135→      </thead>
+   136→      <tbody>
+   137→        {rows.map((cells, i) => (
+   138→          <tr
+   139→            key={i}
+   140→            className={cn(
+   141→              'border-t border-red-50 dark:border-[#2C211C]',
+   142→              i % 2 === 1 && 'bg-red-50/25 dark:bg-[#2A1D18]',
+   143→              highlight === i && 'bg-amber-50 ring-1 ring-inset ring-amber-200 dark:bg-[#3A2C14]',
+   144→            )}
+   145→          >
+   146→            {cells.map((c, j) => (
+   147→              <td key={j} className={cn('whitespace-nowrap px-2 py-1.5 tabular-nums', j === 0 && 'font-bold text-[#2A1A12] dark:text-[#E8D9CF]')}>
+   148→                {c}
+   149→              </td>
+   150→            ))}
+   151→          </tr>
+   152→        ))}
+   153→      </tbody>
+   154→    </table>
+   155→  )
+   156→}
+   157→
+   158→/** Стрелка дельты: зелёный рост, красное падение, серый ноль. */
+   159→function Delta({ v, unit }: { v: number; unit: string }) {
+   160→  const eps = unit === '°C' ? 0.05 : unit === '%' ? 0.5 : 0.05
+   161→  const up = v > eps
+   162→  const down = v < -eps
+   163→  return (
+   164→    <span
+   165→      className={cn(
+   166→        'inline-flex items-center gap-0.5 font-semibold',
+   167→        up && 'text-emerald-600',
+   168→        down && 'text-red-600',
+   169→        !up && !down && 'text-gray-400',
+   170→      )}
+   171→    >
+   172→      {up ? '↑' : down ? '↓' : '·'} {up || down ? `${v > 0 ? '+' : ''}${unit === '%' ? Math.round(v) : v.toFixed(1)}` : '0'}
+   173→    </span>
+   174→  )
+   175→}
+   176→
+   177→/** Всплывающее окно с подробной таблицей: следует за записью при наведении,
+   178→ *  закрепляется кликом (работает и на телефоне). */
+   179→function DetailPopup({
+   180→  pop,
+   181→  pinned,
+   182→  onEnter,
+   183→  onLeave,
+   184→  onClose,
+   185→}: {
+   186→  pop: PopState
+   187→  pinned: boolean
+   188→  onEnter: () => void
+   189→  onLeave?: () => void
+   190→  onClose: () => void
+   191→}) {
+   192→  const W = 372
+   193→  const space = typeof window !== 'undefined' ? window.innerWidth - pop.rect.right : 9999
+   194→  const left = space >= W + 16
+   195→    ? pop.rect.right + 12
+   196→    : Math.max(12, pop.rect.left - W - 12)
+   197→  const top = typeof window !== 'undefined'
+   198→    ? Math.max(12, Math.min(pop.rect.top - 8, window.innerHeight - 300))
+   199→    : pop.rect.top
+   200→  return (
+   201→    <motion.div
+   202→      initial={{ opacity: 0, y: 8, scale: 0.97 }}
+   203→      animate={{ opacity: 1, y: 0, scale: 1 }}
+   204→      exit={{ opacity: 0, y: 6, scale: 0.98 }}
+   205→      transition={ease}
+   206→      onMouseEnter={onEnter}
+   207→      onMouseLeave={onLeave}
+   208→      style={{ left, top, width: W }}
+   209→      className={cn(
+   210→        'fixed z-[61] overflow-hidden rounded-2xl border border-red-100 bg-white shadow-xl shadow-red-100/70 dark:bg-[#221814] dark:shadow-black/40',
+   211→        pinned && 'ring-2 ring-red-200',
+   212→      )}
+   213→    >
+   214→      <div className="flex items-start justify-between gap-2 border-b border-red-50 bg-red-50/50 px-3.5 py-2.5 dark:border-[#2C211C] dark:bg-[#2C211C]">
+   215→        <div className="min-w-0">
+   216→          <p className="truncate text-xs font-extrabold text-[#2A1A12] dark:text-[#E8D9CF]">{pop.title}</p>
+   217→          {pop.subtitle && <p className="mt-0.5 text-[10px] text-gray-400">{pop.subtitle}</p>}
+   218→        </div>
+   219→        {pinned && (
+   220→          <button
+   221→            onClick={onClose}
+   222→            aria-label="Закрыть таблицу"
+   223→            className="rounded-md p-1 text-gray-400 transition hover:bg-red-50 hover:text-red-600 dark:hover:bg-[#2C211C]"
+   224→          >
+   225→            <X className="h-3.5 w-3.5" />
+   226→          </button>
+   227→        )}
+   228→      </div>
+   229→      <div className="history-scroll max-h-[46vh] overflow-y-auto overscroll-contain px-1.5 py-1.5">
+   230→        {pop.table}
+   231→      </div>
+   232→    </motion.div>
+   233→  )
+   234→}
+   235→
+   236→/* ------------------------------------------------------------------ */
+   237→/* Мелкие блоки интерфейса                                             */
+   238→/* ------------------------------------------------------------------ */
+   239→
+   240→function SummaryChip({ icon, label, value }: { icon: React.ReactNode; label: string; value: React.ReactNode }) {
+   241→  return (
+   242→    <span className="inline-flex items-center gap-2 rounded-full border border-red-100 bg-white px-3.5 py-2 text-xs font-bold text-gray-600 shadow-sm dark:bg-[#221814]">
+   243→      <span className="text-red-600">{icon}</span>
+   244→      {value} <span className="font-semibold text-gray-400">{label}</span>
+   245→    </span>
+   246→  )
+   247→}
+   248→
+   249→/** Мини-карточка показаний одного улья в конкретный час. */
+   250→function HourCard({
+   251→  name,
+   252→  log,
+   253→  alarm,
+   254→  onHover,
+   255→  onLeave,
+   256→  onClick,
+   257→}: {
+   258→  name: string
+   259→  log: HistoryLogDto
+   260→  alarm: boolean
+   261→  onHover: (el: HTMLElement) => void
+   262→  onLeave: () => void
+   263→  onClick: (el: HTMLElement) => void
+   264→}) {
+   265→  return (
+   266→    <div
+   267→      onMouseEnter={(e) => onHover(e.currentTarget)}
+   268→      onMouseLeave={onLeave}
+   269→      onClick={(e) => onClick(e.currentTarget)}
+   270→      className={cn(
+   271→        'cursor-pointer rounded-xl border px-2.5 py-2 transition-shadow hover:shadow-md',
+   272→        alarm
+   273→          ? 'border-red-300 bg-red-50/70 dark:bg-[#331B16]'
+   274→          : 'border-red-100 bg-red-50/40 dark:bg-[#2C211C]',
+   275→      )}
+   276→    >
+   277→      <p className="flex items-center gap-1 truncate text-[10px] font-bold text-gray-500">
+   278→        {alarm && <TriangleAlert className="h-3 w-3 shrink-0 text-red-500" />}
+   279→        {name}
+   280→      </p>
+   281→      <div className="mt-1 flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5 text-[11px] font-extrabold tabular-nums text-[#2A1A12] dark:text-[#E8D9CF]">
+   282→        <span className="inline-flex items-center gap-0.5">
+   283→          <Thermometer className="h-3 w-3 text-red-500" /> {log.tempC.toFixed(1)}°
+   284→        </span>
+   285→        <span className="inline-flex items-center gap-0.5">
+   286→          <Weight className="h-3 w-3 text-amber-500" /> {log.weightKg.toFixed(1)} кг
+   287→        </span>
+   288→        <span className="inline-flex items-center gap-0.5">
+   289→          <Droplets className="h-3 w-3 text-sky-500" /> {log.humidityPct}%
+   290→        </span>
+   291→      </div>
+   292→    </div>
+   293→  )
+   294→}
+   295→
+   296→/* ------------------------------------------------------------------ */
+   297→/* Основной экран                                                      */
+   298→/* ------------------------------------------------------------------ */
+   299→
+   300→export function HistoryView() {
+   301→  const [scope, setScope] = useState<HistoryScope>('day')
+   302→  /** Выбранный период: yyyy-MM-dd | yyyy-MM | yyyy; null — «последние записи». */
+   303→  const [dateKey, setDateKey] = useState<string | null>(null)
+   304→  const [pointFilter, setPointFilter] = useState<'all' | string>('all')
+   305→  const [data, setData] = useState<HistoryResponse | null>(null)
+   306→  const [calOpen, setCalOpen] = useState(false)
+   307→  const [reloadTick, setReloadTick] = useState(0)
+   308→
+   309→  const [hoverPop, setHoverPop] = useState<PopState | null>(null)
+   310→  const [pinnedPop, setPinnedPop] = useState<PopState | null>(null)
+   311→  const leaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+   312→
+   313→  const range = data?.range ?? { from: '2026-07-01', to: '2026-08-29' }
+   314→
+   315→  /* Загрузка: состояние «загрузки/ошибки» производное от ключа периода —
+   316→     без setState внутри тела эффекта (правило react-hooks). */
+   317→  const defaultYear = range.to.slice(0, 4)
+   318→  const currentKey = `${scope}|${dateKey ?? (scope === 'year' ? defaultYear : 'latest')}|${reloadTick}`
+   319→  const [loadedKey, setLoadedKey] = useState<string | null>(null)
+   320→  const [errState, setErrState] = useState<{ key: string; message: string } | null>(null)
+   321→  const loading = loadedKey !== currentKey
+   322→  const error = errState && errState.key === currentKey ? errState.message : null
+   323→
+   324→  useEffect(() => {
+   325→    const ctrl = new AbortController()
+   326→    const q = dateKey
+   327→      ? scope === 'day'
+   328→        ? `date=${dateKey}`
+   329→        : scope === 'month'
+   330→          ? `month=${dateKey}`
+   331→          : `year=${dateKey}`
+   332→      : scope === 'year'
+   333→        ? `year=${defaultYear}`
+   334→        : ''
+   335→    fetch(`/api/history?scope=${scope}${q ? `&${q}` : ''}`, { cache: 'no-store', signal: ctrl.signal })
+   336→      .then(async (res) => {
+   337→        const j = (await res.json().catch(() => ({}))) as HistoryResponse & { error?: string }
+   338→        if (!res.ok) throw new Error(j.error ?? `HTTP ${res.status}`)
+   339→        return j
+   340→      })
+   341→      .then((j) => {
+   342→        if (ctrl.signal.aborted) return
+   343→        setData(j)
+   344→        setHoverPop(null)
+   345→        setPinnedPop(null)
+   346→        setErrState(null)
+   347→        const resolvedDate = dateKey ?? j.date
+   348→        setLoadedKey(`${scope}|${resolvedDate}|${reloadTick}`)
+   349→        if (!dateKey) setDateKey(j.date)
+   350→      })
+   351→      .catch((e: unknown) => {
+   352→        if (e instanceof DOMException && e.name === 'AbortError') return
+   353→        setErrState({
+   354→          key: `${scope}|${dateKey ?? (scope === 'year' ? defaultYear : 'latest')}|${reloadTick}`,
+   355→          message: e instanceof Error ? e.message : 'Не удалось загрузить журнал',
+   356→        })
+   357→        setLoadedKey(`${scope}|${dateKey ?? (scope === 'year' ? defaultYear : 'latest')}|${reloadTick}`)
+   358→      })
+   359→    return () => ctrl.abort()
+   360→  }, [scope, dateKey, reloadTick, defaultYear])
+   361→
+   362→  /* Всплывающие таблицы */
+   363→  const openPop = useCallback(
+   364→    (el: HTMLElement, title: string, subtitle: string | undefined, table: React.ReactNode) => {
+   365→      if (leaveTimer.current) {
+   366→        clearTimeout(leaveTimer.current)
+   367→        leaveTimer.current = null
+   368→      }
+   369→      const r = el.getBoundingClientRect()
+   370→      setHoverPop({ rect: { left: r.left, right: r.right, top: r.top }, title, subtitle, table })
+   371→    },
+   372→    [],
+   373→  )
+   374→  const closePopSoon = useCallback(() => {
+   375→    if (leaveTimer.current) clearTimeout(leaveTimer.current)
+   376→    leaveTimer.current = setTimeout(() => setHoverPop(null), 180)
+   377→  }, [])
+   378→  const keepPop = useCallback(() => {
+   379→    if (leaveTimer.current) {
+   380→      clearTimeout(leaveTimer.current)
+   381→      leaveTimer.current = null
+   382→    }
+   383→  }, [])
+   384→  const pinPop = useCallback(
+   385→    (el: HTMLElement, title: string, subtitle: string | undefined, table: React.ReactNode) => {
+   386→      const r = el.getBoundingClientRect()
+   387→      const st = { rect: { left: r.left, right: r.right, top: r.top }, title, subtitle, table }
+   388→      setPinnedPop((prev) =>
+   389→        prev && prev.title === title && prev.rect.top === st.rect.top ? null : st,
+   390→      )
+   391→    },
+   392→    [],
+   393→  )
+   394→  useEffect(() => () => void (leaveTimer.current && clearTimeout(leaveTimer.current)), [])
+   395→
+   396→  /* Данные журнала с фильтром по улью */
+   397→  const pointName = useMemo(() => {
+   398→    const m = new Map<string, string>()
+   399→    for (const p of data?.points ?? []) m.set(p.id, p.name)
+   400→    return m
+   401→  }, [data])
+   402→
+   403→  const filteredLogs = useMemo(() => {
+   404→    if (!data?.logs) return []
+   405→    return pointFilter === 'all' ? data.logs : data.logs.filter((l) => l.pointId === pointFilter)
+   406→  }, [data, pointFilter])
+   407→
+   408→  /* День: группировка по часам */
+   409→  const dayHours = useMemo(() => {
+   410→    const map = new Map<number, HistoryLogDto[]>()
+   411→    for (const l of filteredLogs) {
+   412→      const h = new Date(l.recordedAt).getUTCHours()
+   413→      const arr = map.get(h)
+   414→      if (arr) arr.push(l)
+   415→      else map.set(h, [l])
+   416→    }
+   417→    return [...map.entries()].sort(([a], [b]) => a - b)
+   418→  }, [filteredLogs])
+   419→
+   420→  /* Сводки периода */
+   421→  const daySummary = useMemo(() => {
+   422→    if (filteredLogs.length === 0) return null
+   423→    const avgT = filteredLogs.reduce((s, l) => s + l.tempC, 0) / filteredLogs.length
+   424→    const avgH = filteredLogs.reduce((s, l) => s + l.humidityPct, 0) / filteredLogs.length
+   425→    const byPoint = new Map<string, { first: number; last: number }>()
+   426→    for (const l of filteredLogs) {
+   427→      const acc = byPoint.get(l.pointId) ?? { first: l.weightKg, last: l.weightKg }
+   428→      acc.last = l.weightKg
+   429→      byPoint.set(l.pointId, acc)
+   430→    }
+   431→    const gain = [...byPoint.values()].reduce((s, v) => s + (v.last - v.first), 0)
+   432→    const alarms = filteredLogs.filter((l) => l.alarm).length
+   433→    return { avgT, avgH, gain, alarms, logs: filteredLogs.length }
+   434→  }, [filteredLogs])
+   435→
+   436→  const monthSummary = useMemo(() => {
+   437→    const days = (data?.days ?? []).filter((d) => pointFilter === 'all' || d.perPoint.some((p) => p.pointId === pointFilter))
+   438→    if (days.length === 0) return null
+   439→    const pts = days.flatMap((d) => (pointFilter === 'all' ? d.perPoint : d.perPoint.filter((p) => p.pointId === pointFilter)))
+   440→    const avgT = pts.reduce((s, p) => s + p.avgTempC * p.logs, 0) / pts.reduce((s, p) => s + p.logs, 0)
+   441→    const avgH = pts.reduce((s, p) => s + p.avgHumidityPct * p.logs, 0) / pts.reduce((s, p) => s + p.logs, 0)
+   442→    const gain = pts.reduce((s, p) => s + p.deltaWeightKg, 0)
+   443→    const alarms = pts.reduce((s, p) => s + p.alarms, 0)
+   444→    const logs = pts.reduce((s, p) => s + p.logs, 0)
+   445→    return { days: days.length, avgT, avgH, gain, alarms, logs }
+   446→  }, [data, pointFilter])
+   447→
+   448→  const yearSummary = useMemo(() => {
+   449→    const months = (data?.months ?? []).filter((m) => pointFilter === 'all' || m.perPoint.some((p) => p.pointId === pointFilter))
+   450→    if (months.length === 0) return null
+   451→    const pts = months.flatMap((m) => (pointFilter === 'all' ? m.perPoint : m.perPoint.filter((p) => p.pointId === pointFilter)))
+   452→    const avgT = pts.reduce((s, p) => s + p.avgTempC * p.logs, 0) / pts.reduce((s, p) => s + p.logs, 0)
+   453→    const avgH = pts.reduce((s, p) => s + p.avgHumidityPct * p.logs, 0) / pts.reduce((s, p) => s + p.logs, 0)
+   454→    const gain = pts.reduce((s, p) => s + p.deltaWeightKg, 0)
+   455→    const alarms = pts.reduce((s, p) => s + p.alarms, 0)
+   456→    const logs = pts.reduce((s, p) => s + p.logs, 0)
+   457→    return { months: months.length, avgT, avgH, gain, alarms, logs }
+   458→  }, [data, pointFilter])
+   459→
+   460→  /* Таблицы для всплывающих окон */
+   461→
+   462→  /** Почасовые изменения одной семьи за выбранный день. */
+   463→  const dayHiveTable = useCallback(
+   464→    (pointId: string, hour: number) => {
+   465→      const logs = data?.logs?.filter((l) => l.pointId === pointId) ?? []
+   466→      const rows = logs.map((l, i) => {
+   467→        const prev = i > 0 ? logs[i - 1] : null
+   468→        return [
+   469→          fmtTime(l.recordedAt),
+   470→          `${l.weightKg.toFixed(1)} кг`,
+   471→          <Delta key="dw" v={prev ? l.weightKg - prev.weightKg : 0} unit="кг" />,
+   472→          `${l.tempC.toFixed(1)}°C`,
+   473→          <Delta key="dt" v={prev ? l.tempC - prev.tempC : 0} unit="°C" />,
+   474→          `${l.humidityPct}%`,
+   475→          <Delta key="dh" v={prev ? l.humidityPct - prev.humidityPct : 0} unit="%" />,
+   476→        ]
+   477→      })
+   478→      return (
+   479→        <MiniTable
+   480→          head={['Час', 'Вес', 'Δ', 'Темп.', 'Δ', 'Влажн.', 'Δ']}
+   481→          rows={rows}
+   482→          highlight={hour}
+   483→        />
+   484→      )
+   485→    },
+   486→    [data],
+   487→  )
+   488→
+   489→  /** Снимок всех ульев в конкретный час. */
+   490→  const hourSnapshotTable = useCallback(
+   491→    (hour: number) => {
+   492→      const logs = (data?.logs ?? []).filter((l) => new Date(l.recordedAt).getUTCHours() === hour)
+   493→      const rows = logs.map((l) => [
+   494→        pointName.get(l.pointId) ?? 'Улей',
+   495→        `${l.weightKg.toFixed(1)} кг`,
+   496→        `${l.tempC.toFixed(1)}°C`,
+   497→        `${l.humidityPct}%`,
+   498→        l.alarm ? <span key="a" className="inline-flex items-center gap-1 font-bold text-red-600"><TriangleAlert className="h-3 w-3" /> тревога</span> : <span key="a" className="text-emerald-600">норма</span>,
+   499→      ])
+   500→      return <MiniTable head={['Улей', 'Вес', 'Темп.', 'Влажн.', 'Статус']} rows={rows} />
+   501→    },
+   502→    [data, pointName],
+   503→  )
+   504→
+   505→  /** Сводка по ульям за день (месячный вид). */
+   506→  const monthDayTable = useCallback(
+   507→    (date: string) => {
+   508→      const day = data?.days?.find((d) => d.date === date)
+   509→      const per = (day?.perPoint ?? []).filter((p) => pointFilter === 'all' || p.pointId === pointFilter)
+   510→      const rows = per.map((p) => [
+   511→        pointName.get(p.pointId) ?? 'Улей',
+   512→        `${p.startWeightKg.toFixed(1)} кг`,
+   513→        `${p.endWeightKg.toFixed(1)} кг`,
+   514→        <span key="d" className={cn('font-bold', p.deltaWeightKg >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+   515→          {p.deltaWeightKg >= 0 ? '+' : ''}{p.deltaWeightKg.toFixed(1)} кг
+   516→        </span>,
+   517→        `${p.avgTempC.toFixed(1)}°C`,
+   518→        `${p.minTempC.toFixed(1)}…${p.maxTempC.toFixed(1)}°C`,
+   519→        `${p.avgHumidityPct}%`,
+   520→        `${p.logs}`,
+   521→        p.alarms > 0 ? <span key="a" className="font-bold text-red-600">{p.alarms}</span> : <span key="a" className="text-gray-400">0</span>,
+   522→      ])
+   523→      return (
+   524→        <MiniTable
+   525→          head={['Улей', 'Вес утро', 'Вес вечер', 'Δ за день', 'Ср t°', 't макс/мин', 'Ср влажн.', 'Записей', 'Событий']}
+   526→          rows={rows}
+   527→        />
+   528→      )
+   529→    },
+   530→    [data, pointFilter, pointName],
+   531→  )
+   532→
+   533→  /** Сводка по ульям за месяц (годовой вид). */
+   534→  const yearMonthTable = useCallback(
+   535→    (month: string) => {
+   536→      const m = data?.months?.find((x) => x.month === month)
+   537→      const per = (m?.perPoint ?? []).filter((p) => pointFilter === 'all' || p.pointId === pointFilter)
+   538→      const rows = per.map((p) => [
+   539→        pointName.get(p.pointId) ?? 'Улей',
+   540→        `${p.avgTempC.toFixed(1)}°C`,
+   541→        `${p.avgHumidityPct}%`,
+   542→        <span key="d" className={cn('font-bold', p.deltaWeightKg >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+   543→          {p.deltaWeightKg >= 0 ? '+' : ''}{p.deltaWeightKg.toFixed(1)} кг
+   544→        </span>,
+   545→        `${p.logs}`,
+   546→        p.alarms > 0 ? <span key="a" className="font-bold text-red-600">{p.alarms}</span> : <span key="a" className="text-gray-400">0</span>,
+   547→      ])
+   548→      return <MiniTable head={['Улей', 'Ср t°', 'Ср влажн.', 'Набор веса', 'Записей', 'Событий']} rows={rows} />
+   549→    },
+   550→    [data, pointFilter, pointName],
+   551→  )
+   552→
+   553→  /* Переключение периодов */
+   554→
+   555→  const clampDayKey = (key: string) =>
+   556→    key < range.from ? range.from : key > range.to ? range.to : key
+   557→
+   558→  /** «2026-08-29» / «2026-08» / «2026» → ключ дня в пределах диапазона журнала. */
+   559→  const asDayKey = (k: string) => {
+   560→    if (k.length === 10) return k
+   561→    if (k.length === 7) return `${k}-01`
+   562→    return `${k}-${range.from.slice(5, 7)}-01`
+   563→  }
+   564→
+   565→  const clampMonthKey = (key: string) => {
+   566→    const from = range.from.slice(0, 7)
+   567→    const to = range.to.slice(0, 7)
+   568→    return key < from ? from : key > to ? to : key
+   569→  }
+   570→
+   571→  const switchScope = (next: HistoryScope) => {
+   572→    if (next === scope) return
+   573→    const cur = dateKey ?? range.to
+   574→    let key: string
+   575→    if (next === 'day') key = clampDayKey(asDayKey(cur))
+   576→    else if (next === 'month') key = clampMonthKey(cur.slice(0, 7))
+   577→    else {
+   578→      const y = Number(cur.slice(0, 4))
+   579→      const minY = Number(range.from.slice(0, 4))
+   580→      const maxY = Number(range.to.slice(0, 4))
+   581→      key = String(Math.max(minY, Math.min(maxY, y)))
+   582→    }
+   583→    setScope(next)
+   584→    setDateKey(key)
+   585→  }
+   586→
+   587→  const step = (dir: 1 | -1) => {
+   588→    const cur = dateKey ?? range.to
+   589→    if (scope === 'day') setDateKey(clampDayKey(addDaysKey(cur, dir)))
+   590→    else if (scope === 'month') {
+   591→      const mk = addMonthsKey(cur, dir)
+   592→      setDateKey(mk < range.from.slice(0, 7) ? range.to.slice(0, 7) : mk > range.to.slice(0, 7) ? range.from.slice(0, 7) : mk)
+   593→    } else {
+   594→      const y = Number(cur) + dir
+   595→      const minY = Number(range.from.slice(0, 4))
+   596→      const maxY = Number(range.to.slice(0, 4))
+   597→      setDateKey(String(Math.max(minY, Math.min(maxY, y))))
+   598→    }
+   599→  }
+   600→
+   601→  const periodLabel = !dateKey
+   602→    ? 'Последние записи'
+   603→    : scope === 'day'
+   604→      ? fmtDateLabel(dateKey)
+   605→      : scope === 'month'
+   606→        ? fmtMonthLabel(dateKey)
+   607→        : `${dateKey} год`
+   608→
+   609→  const atStart = !dateKey
+   610→    ? false
+   611→    : scope === 'day'
+   612→      ? dateKey <= range.from
+   613→      : scope === 'month'
+   614→        ? dateKey <= range.from.slice(0, 7)
+   615→        : Number(dateKey) <= Number(range.from.slice(0, 4))
+   616→  const atEnd = !dateKey
+   617→    ? false
+   618→    : scope === 'day'
+   619→      ? dateKey >= range.to
+   620→      : scope === 'month'
+   621→        ? dateKey >= range.to.slice(0, 7)
+   622→        : Number(dateKey) >= Number(range.to.slice(0, 4))
+   623→
+   624→  const calendarMonth = useMemo(() => {
+   625→    const base = dateKey ?? range.to
+   626→    const key = scope === 'day' ? base : scope === 'month' ? `${base}-01` : `${base}-${range.to.slice(5, 7)}-01`
+   627→    return parseDayKey(key)
+   628→  }, [dateKey, scope, calOpen, range])
+   629→
+   630→  const hasSensorPoints = (data?.points.length ?? 0) > 0
+   631→  const showPop = pinnedPop ?? hoverPop
+   632→
+   633→  /* ---------------------------------------------------------------- */
+   634→
+   635→  return (
+   636→    <div className="mx-auto max-w-6xl space-y-5">
+   637→      {/* Стиль скроллбара журнала */}
+   638→      <style>{`
+   639→        .history-scroll::-webkit-scrollbar { width: 8px }
+   640→        .history-scroll::-webkit-scrollbar-thumb { background: #f0d5c8; border-radius: 999px }
+   641→        .history-scroll::-webkit-scrollbar-track { background: transparent }
+   642→        .dark .history-scroll::-webkit-scrollbar-thumb { background: #3a2a22 }
+   643→      `}</style>
+   644→
+   645→      {/* Заголовок */}
+   646→      <div className="flex flex-wrap items-center justify-between gap-2">
+   647→        <div>
+   648→          <h1 className="flex items-center gap-2 text-2xl font-extrabold tracking-tight text-[#2A1A12]">
+   649→            <History className="h-6 w-6 text-red-600" /> История событий
+   650→          </h1>
+   651→          <p className="mt-1 max-w-2xl text-sm text-gray-500">
+   652→            Журнал датчиков ульев: температура, влажность и масса фиксируются каждый час.
+   653→            Наведите на запись — всплывёт таблица изменений за период.
+   654→          </p>
+   655→        </div>
+   656→        <span className="inline-flex items-center gap-1.5 rounded-full border border-red-100 bg-white px-3 py-1.5 text-[11px] font-semibold text-gray-400 shadow-sm dark:bg-[#221814]">
+   657→          <MousePointerClick className="h-3.5 w-3.5 text-red-500" /> клик закрепляет таблицу
+   658→        </span>
+   659→      </div>
+   660→
+   661→      {/* Панель периодов */}
+   662→      <Card className="border-red-100 dark:bg-[#221814]">
+   663→        <CardContent className="flex flex-wrap items-center gap-2.5 p-3.5">
+   664→          {/* День / Месяц / Год */}
+   665→          <div className="flex rounded-full border border-red-100 bg-red-50/50 p-1 dark:border-[#2C211C] dark:bg-[#2C211C]">
+   666→            {([
+   667→              { id: 'day', label: 'День' },
+   668→              { id: 'month', label: 'Месяц' },
+   669→              { id: 'year', label: 'Год' },
+   670→            ] as const).map((t) => (
+   671→              <button
+   672→                key={t.id}
+   673→                onClick={() => switchScope(t.id)}
+   674→                aria-pressed={scope === t.id}
+   675→                className={cn(
+   676→                  'rounded-full px-4 py-1.5 text-xs font-extrabold transition-all',
+   677→                  scope === t.id
+   678→                    ? 'bg-gradient-to-r from-red-600 to-orange-500 text-white shadow-md shadow-red-100'
+   679→                    : 'text-gray-500 hover:text-red-600',
+   680→                )}
+   681→              >
+   682→                {t.label}
+   683→              </button>
+   684→            ))}
+   685→          </div>
+   686→
+   687→          {/* Шаг назад/вперёд */}
+   688→          <div className="flex items-center gap-1">
+   689→            <Button
+   690→              size="icon"
+   691→              variant="outline"
+   692→              className="h-9 w-9 rounded-full border-red-100"
+   693→              disabled={atStart}
+   694→              onClick={() => step(-1)}
+   695→              aria-label="Предыдущий период"
+   696→            >
+   697→              <ChevronLeft className="h-4 w-4" />
+   698→            </Button>
+   699→            <span className="min-w-[170px] text-center text-sm font-extrabold tabular-nums text-[#2A1A12] dark:text-[#E8D9CF]">
+   700→              {periodLabel}
+   701→            </span>
+   702→            <Button
+   703→              size="icon"
+   704→              variant="outline"
+   705→              className="h-9 w-9 rounded-full border-red-100"
+   706→              disabled={atEnd}
+   707→              onClick={() => step(1)}
+   708→              aria-label="Следующий период"
+   709→            >
+   710→              <ChevronRight className="h-4 w-4" />
+   711→            </Button>
+   712→          </div>
+   713→
+   714→          {/* Календарь */}
+   715→          <Popover open={calOpen} onOpenChange={setCalOpen}>
+   716→            <PopoverTrigger asChild>
+   717→              <Button variant="outline" className="h-9 gap-1.5 rounded-full border-red-100 text-xs font-bold">
+   718→                <CalendarDays className="h-4 w-4 text-red-600" /> Календарь
+   719→              </Button>
+   720→            </PopoverTrigger>
+   721→            <PopoverContent align="start" className="w-auto p-0">
+   722→              <Calendar
+   723→                mode="single"
+   724→                locale={ru}
+   725→                captionLayout="dropdown"
+   726→                formatters={{
+   727→                  // подпись месяца в выпадающем списке — по-русски (в компоненте
+   728→                  // календаря локаль по умолчанию — «default» браузера)
+   729→                  formatMonthDropdown: (m) => MONTHS_NOM[m.getMonth()],
+   730→                }}
+   731→                defaultMonth={calendarMonth}
+   732→                selected={scope === 'day' && dateKey ? parseDayKey(dateKey) : undefined}
+   733→                onSelect={(d) => {
+   734→                  if (!d) return
+   735→                  setScope('day')
+   736→                  setDateKey(dayKeyOf(d))
+   737→                  setCalOpen(false)
+   738→                }}
+   739→                disabled={[{ before: parseDayKey(range.from), after: parseDayKey(range.to) }]}
+   740→              />
+   741→              <p className="border-t border-red-50 px-3 py-2 text-[10px] leading-relaxed text-gray-400 dark:border-[#2C211C]">
+   742→                Журнал ведётся с 1 июля по 29 августа 2026 — клик по числу открывает этот день.
+   743→              </p>
+   744→            </PopoverContent>
+   745→          </Popover>
+   746→
+   747→          {/* Фильтр по улью */}
+   748→          {hasSensorPoints && (
+   749→            <div className="ml-auto flex flex-wrap items-center gap-1.5">
+   750→              <button
+   751→                onClick={() => setPointFilter('all')}
+   752→                className={cn(
+   753→                  'rounded-full px-3 py-1.5 text-[11px] font-bold transition',
+   754→                  pointFilter === 'all'
+   755→                    ? 'bg-red-600 text-white shadow-sm'
+   756→                    : 'bg-red-50 text-gray-500 hover:text-red-600 dark:bg-[#2C211C]',
+   757→                )}
+   758→              >
+   759→                Все ульи
+   760→              </button>
+   761→              {data?.points.map((p) => (
+   762→                <button
+   763→                  key={p.id}
+   764→                  onClick={() => setPointFilter(pointFilter === p.id ? 'all' : p.id)}
+   765→                  className={cn(
+   766→                    'rounded-full px-3 py-1.5 text-[11px] font-bold transition',
+   767→                    pointFilter === p.id
+   768→                      ? 'bg-red-600 text-white shadow-sm'
+   769→                      : 'bg-red-50 text-gray-500 hover:text-red-600 dark:bg-[#2C211C]',
+   770→                  )}
+   771→                >
+   772→                  {p.name}
+   773→                </button>
+   774→              ))}
+   775→            </div>
+   776→          )}
+   777→        </CardContent>
+   778→      </Card>
+   779→
+   780→      {/* Состояния */}
+   781→      {error && (
+   782→        <Card className="border-red-200">
+   783→          <CardContent className="flex flex-col items-start gap-3 p-5">
+   784→            <p className="text-sm font-semibold text-red-600">Не удалось загрузить журнал: {error}</p>
+   785→            <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setReloadTick((t) => t + 1)}>
+   786→              <RefreshCcw className="h-3.5 w-3.5" /> Повторить
+   787→            </Button>
+   788→          </CardContent>
+   789→        </Card>
+   790→      )}
+   791→
+   792→      {!error && !data && loading && (
+   793→        <div className="space-y-3">
+   794→          {[0, 1, 2, 3].map((i) => (
+   795→            <div key={i} className="h-16 animate-pulse rounded-2xl bg-red-100/50" />
+   796→          ))}
+   797→        </div>
+   798→      )}
+   799→
+   800→      {!error && data && !hasSensorPoints && (
+   801→        <Card className="border-dashed border-red-200 bg-red-50/30 dark:bg-[#221814]">
+   802→          <CardContent className="flex flex-col items-center gap-2 p-8 text-center">
+   803→            <History className="h-8 w-8 text-red-300" />
+   804→            <p className="font-bold text-[#2A1A12]">Журнала пока нет</p>
+   805→            <p className="max-w-sm text-sm text-gray-500">
+   806→              История пишется по ульям с датчиками. Откройте «Карта пасеки», привяжите улей по коду
+   807→              датчика — и почасовые записи появятся здесь.
+   808→            </p>
+   809→          </CardContent>
+   810→        </Card>
+   811→      )}
+   812→
+   813→      {!error && data && hasSensorPoints && (
+   814→        <>
+   815→          {/* Сводка периода */}
+   816→          <div className="flex flex-wrap gap-2">
+   817→            {scope === 'day' && daySummary && (
+   818→              <>
+   819→                <SummaryChip icon={<Thermometer className="h-3.5 w-3.5" />} label="средняя за день" value={`${daySummary.avgT.toFixed(1)}°C`} />
+   820→                <SummaryChip icon={<Droplets className="h-3.5 w-3.5" />} label="средняя влажность" value={`${Math.round(daySummary.avgH)}%`} />
+   821→                <SummaryChip icon={<Weight className="h-3.5 w-3.5" />} label="набор веса за сутки" value={`${daySummary.gain >= 0 ? '+' : ''}${daySummary.gain.toFixed(1)} кг`} />
+   822→                <SummaryChip icon={<Clock3 className="h-3.5 w-3.5" />} label="почасовых записей" value={daySummary.logs} />
+   823→                <SummaryChip
+   824→                  icon={<TriangleAlert className="h-3.5 w-3.5" />}
+   825→                  label="тревожных событий"
+   826→                  value={<span className={daySummary.alarms > 0 ? 'text-red-600' : ''}>{daySummary.alarms}</span>}
+   827→                />
+   828→              </>
+   829→            )}
+   830→            {scope === 'month' && monthSummary && (
+   831→              <>
+   832→                <SummaryChip icon={<CalendarDays className="h-3.5 w-3.5" />} label="дней с записями" value={monthSummary.days} />
+   833→                <SummaryChip icon={<Thermometer className="h-3.5 w-3.5" />} label="средняя за месяц" value={`${monthSummary.avgT.toFixed(1)}°C`} />
+   834→                <SummaryChip icon={<Droplets className="h-3.5 w-3.5" />} label="средняя влажность" value={`${Math.round(monthSummary.avgH)}%`} />
+   835→                <SummaryChip icon={<Weight className="h-3.5 w-3.5" />} label="набор веса за месяц" value={`${monthSummary.gain >= 0 ? '+' : ''}${monthSummary.gain.toFixed(1)} кг`} />
+   836→                <SummaryChip
+   837→                  icon={<TriangleAlert className="h-3.5 w-3.5" />}
+   838→                  label="тревожных событий"
+   839→                  value={<span className={monthSummary.alarms > 0 ? 'text-red-600' : ''}>{monthSummary.alarms}</span>}
+   840→                />
+   841→              </>
+   842→            )}
+   843→            {scope === 'year' && yearSummary && (
+   844→              <>
+   845→                <SummaryChip icon={<CalendarDays className="h-3.5 w-3.5" />} label="месяцев с записями" value={yearSummary.months} />
+   846→                <SummaryChip icon={<Thermometer className="h-3.5 w-3.5" />} label="средняя за год" value={`${yearSummary.avgT.toFixed(1)}°C`} />
+   847→                <SummaryChip icon={<Weight className="h-3.5 w-3.5" />} label="набор веса за год" value={`${yearSummary.gain >= 0 ? '+' : ''}${yearSummary.gain.toFixed(1)} кг`} />
+   848→                <SummaryChip icon={<Clock3 className="h-3.5 w-3.5" />} label="записей в журнале" value={yearSummary.logs} />
+   849→                <SummaryChip
+   850→                  icon={<TriangleAlert className="h-3.5 w-3.5" />}
+   851→                  label="тревожных событий"
+   852→                  value={<span className={yearSummary.alarms > 0 ? 'text-red-600' : ''}>{yearSummary.alarms}</span>}
+   853→                />
+   854→              </>
+   855→            )}
+   856→            {(scope === 'day' && !daySummary) || (scope === 'month' && !monthSummary) || (scope === 'year' && !yearSummary) ? (
+   857→              <span className="inline-flex items-center gap-2 rounded-full border border-dashed border-red-200 bg-white px-3.5 py-2 text-xs font-bold text-gray-400 dark:bg-[#221814]">
+   858→                Записей за выбранный период нет
+   859→              </span>
+   860→            ) : null}
+   861→          </div>
+   862→
+   863→          {/* Пустой период */}
+   864→          {((scope === 'day' && filteredLogs.length === 0) ||
+   865→            (scope === 'month' && monthSummary === null) ||
+   866→            (scope === 'year' && yearSummary === null)) && (
+   867→            <Card className="border-dashed border-red-200 bg-red-50/30 dark:bg-[#221814]">
+   868→              <CardContent className="flex flex-col items-center gap-3 p-8 text-center">
+   869→                <Clock3 className="h-8 w-8 text-red-300" />
+   870→                <p className="font-bold text-[#2A1A12]">За этот период записей нет</p>
+   871→                <p className="max-w-sm text-sm text-gray-500">
+   872→                  Журнал ведётся с 1 июля по 29 августа 2026. Стрелками или календарём выберите дату
+   873→                  внутри этого диапазона.
+   874→                </p>
+   875→                <Button
+   876→                  size="sm"
+   877→                  className="bg-gradient-to-r from-red-600 to-orange-500 font-bold"
+   878→                  onClick={() => {
+   879→                    setScope('day')
+   880→                    setDateKey(range.to)
+   881→                  }}
+   882→                >
+   883→                  К последним записям
+   884→                </Button>
+   885→              </CardContent>
+   886→            </Card>
+   887→          )}
+   888→
+   889→          {/* ДЕНЬ: почасовой таймлайн */}
+   890→          {scope === 'day' && dayHours.length > 0 && (
+   891→            <Card className="border-red-100 dark:bg-[#221814]">
+   892→              <CardContent className="p-4">
+   893→                <p className="mb-3 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-gray-400">
+   894→                  <Clock3 className="h-3.5 w-3.5 text-red-500" />
+   895→                  Почасовые фиксации — {fmtDateLabel(data.date)}
+   896→                  <span className="font-semibold normal-case text-gray-400">· наведите на карточку улья</span>
+   897→                </p>
+   898→                <div className="history-scroll max-h-[540px] space-y-2 overflow-y-auto pr-1">
+   899→                  {dayHours.map(([hour, logs]) => (
+   900→                    <motion.div
+   901→                      key={hour}
+   902→                      initial={{ opacity: 0, y: 8 }}
+   903→                      animate={{ opacity: 1, y: 0 }}
+   904→                      transition={ease}
+   905→                      className="flex items-stretch gap-2.5"
+   906→                    >
+   907→                      <button
+   908→                        onMouseEnter={(e) =>
+   909→                          openPop(e.currentTarget, `${pad2(hour)}:00 — все ульи`, `Снимок на ${fmtDateLabel(data.date)}`, hourSnapshotTable(hour))
+   910→                        }
+   911→                        onMouseLeave={closePopSoon}
+   912→                        onClick={(e) =>
+   913→                          pinPop(e.currentTarget, `${pad2(hour)}:00 — все ульи`, `Снимок на ${fmtDateLabel(data.date)}`, hourSnapshotTable(hour))
+   914→                        }
+   915→                        className="flex w-14 shrink-0 flex-col items-center justify-center rounded-xl bg-white shadow-sm ring-1 ring-red-100 transition hover:ring-red-300 dark:bg-[#2C211C] dark:ring-[#2C211C]"
+   916→                        aria-label={`Снимок всех ульев в ${pad2(hour)}:00`}
+   917→                      >
+   918→                        <span className="text-sm font-extrabold tabular-nums text-[#2A1A12] dark:text-[#E8D9CF]">
+   919→                          {pad2(hour)}:00
+   920→                        </span>
+   921→                        <span className="text-[9px] font-semibold text-gray-400">каждый час</span>
+   922→                      </button>
+   923→                      <div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+   924→                        {logs.map((l) => (
+   925→                          <HourCard
+   926→                            key={`${l.pointId}-${l.recordedAt}`}
+   927→                            name={pointName.get(l.pointId) ?? 'Улей'}
+   928→                            log={l}
+   929→                            alarm={l.alarm}
+   930→                            onHover={(el) =>
+   931→                              openPop(
+   932→                                el,
+   933→                                `${pointName.get(l.pointId) ?? 'Улей'} — изменения за день`,
+   934→                                `${fmtDateLabel(data.date)} · час ${pad2(hour)}:00 выделен`,
+   935→                                dayHiveTable(l.pointId, hour),
+   936→                              )
+   937→                            }
+   938→                            onLeave={closePopSoon}
+   939→                            onClick={(el) =>
+   940→                              pinPop(
+   941→                                el,
+   942→                                `${pointName.get(l.pointId) ?? 'Улей'} — изменения за день`,
+   943→                                `${fmtDateLabel(data.date)} · час ${pad2(hour)}:00 выделен`,
+   944→                                dayHiveTable(l.pointId, hour),
+   945→                              )
+   946→                            }
+   947→                          />
+   948→                        ))}
+   949→                      </div>
+   950→                    </motion.div>
+   951→                  ))}
+   952→                </div>
+   953→              </CardContent>
+   954→            </Card>
+   955→          )}
+   956→
+   957→          {/* МЕСЯЦ: сетка дней */}
+   958→          {scope === 'month' && monthSummary !== null && (
+   959→            <Card className="border-red-100 dark:bg-[#221814]">
+   960→              <CardContent className="p-4">
+   961→                <p className="mb-3 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-gray-400">
+   962→                  <CalendarDays className="h-3.5 w-3.5 text-red-500" />
+   963→                  Дни месяца — {fmtMonthLabel(data.date)}
+   964→                  <span className="font-semibold normal-case text-gray-400">· наведите на день, клик открывает его</span>
+   965→                </p>
+   966→                <div className="grid grid-cols-7 gap-1 text-center">
+   967→                  {WEEKDAYS.map((w) => (
+   968→                    <span key={w} className="pb-1 text-[10px] font-bold uppercase text-gray-400">
+   969→                      {w}
+   970→                    </span>
+   971→                  ))}
+   972→                  {(() => {
+   973→                    const [y, m] = data.date.split('-').map(Number)
+   974→                    const first = new Date(Date.UTC(y, m - 1, 1))
+   975→                    const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate()
+   976→                    const shift = (first.getUTCDay() + 6) % 7
+   977→                    const byDay = new Map((data.days ?? []).map((d) => [d.date, d]))
+   978→                    const cells: React.ReactNode[] = []
+   979→                    for (let i = 0; i < shift; i++) cells.push(<span key={`e${i}`} />)
+   980→                    for (let d = 1; d <= daysInMonth; d++) {
+   981→                      const key = `${data.date}-${pad2(d)}`
+   982→                      const summary = byDay.get(key)
+   983→                      const per = (summary?.perPoint ?? []).filter((p) => pointFilter === 'all' || p.pointId === pointFilter)
+   984→                      const gain = per.reduce((s, p) => s + p.deltaWeightKg, 0)
+   985→                      const avgT = per.length > 0 ? per.reduce((s, p) => s + p.avgTempC * p.logs, 0) / per.reduce((s, p) => s + p.logs, 0) : null
+   986→                      const alarms = per.reduce((s, p) => s + p.alarms, 0)
+   987→                      cells.push(
+   988→                        <div
+   989→                          key={key}
+   990→                          onMouseEnter={(e) =>
+   991→                            per.length > 0 &&
+   992→                            openPop(e.currentTarget, fmtDateLabel(key), 'Сводка по ульям за день', monthDayTable(key))
+   993→                          }
+   994→                          onMouseLeave={closePopSoon}
+   995→                          onClick={() => {
+   996→                            if (per.length === 0) return
+   997→                            setScope('day')
+   998→                            setDateKey(key)
+   999→                          }}
+  1000→                          className={cn(
+  1001→                            'min-h-[76px] rounded-xl border p-1.5 text-left transition',
+  1002→                            per.length > 0
+  1003→                              ? 'cursor-pointer border-red-100 bg-white shadow-sm hover:border-red-300 hover:shadow-md dark:bg-[#2C211C]'
+  1004→                              : 'border-transparent bg-red-50/30 dark:bg-transparent',
+  1005→                          )}
+  1006→                          role={per.length > 0 ? 'button' : undefined}
+  1007→                        >
+  1008→                          <p className="flex items-center justify-between text-[11px] font-extrabold tabular-nums">
+  1009→                            <span className={per.length > 0 ? 'text-[#2A1A12] dark:text-[#E8D9CF]' : 'text-gray-300'}>{d}</span>
+  1010→                            {alarms > 0 && <TriangleAlert className="h-3 w-3 text-red-500" />}
+  1011→                          </p>
+  1012→                          {per.length > 0 && (
+  1013→                            <div className="mt-1 space-y-0.5 text-[10px] font-bold tabular-nums">
+  1014→                              <p className={gain >= 0 ? 'text-emerald-600' : 'text-red-600'}>
+  1015→                                {gain >= 0 ? '+' : ''}{gain.toFixed(1)} кг
+  1016→                              </p>
+  1017→                              {avgT !== null && <p className="text-red-500">{avgT.toFixed(1)}°C</p>}
+  1018→                              <p className="text-gray-400">{per.reduce((s, p) => s + p.logs, 0)} зап.</p>
+  1019→                            </div>
+  1020→                          )}
+  1021→                        </div>,
+  1022→                      )
+  1023→                    }
+  1024→                    return cells
+  1025→                  })()}
+  1026→                </div>
+  1027→              </CardContent>
+  1028→            </Card>
+  1029→          )}
+  1030→
+  1031→          {/* ГОД: карточки месяцев */}
+  1032→          {scope === 'year' && yearSummary !== null && (
+  1033→            <Card className="border-red-100 dark:bg-[#221814]">
+  1034→              <CardContent className="p-4">
+  1035→                <p className="mb-3 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-gray-400">
+  1036→                  <CalendarDays className="h-3.5 w-3.5 text-red-500" />
+  1037→                  Месяцы года — {data.date}
+  1038→                  <span className="font-semibold normal-case text-gray-400">· наведите на месяц, клик открывает его</span>
+  1039→                </p>
+  1040→                <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+  1041→                  {MONTHS_NOM.map((name, idx) => {
+  1042→                    const mk = `${data.date}-${pad2(idx + 1)}`
+  1043→                    const m = (data.months ?? []).find((x) => x.month === mk)
+  1044→                    const per = (m?.perPoint ?? []).filter((p) => pointFilter === 'all' || p.pointId === pointFilter)
+  1045→                    const has = per.length > 0
+  1046→                    const avgT = has ? per.reduce((s, p) => s + p.avgTempC * p.logs, 0) / per.reduce((s, p) => s + p.logs, 0) : null
+  1047→                    const avgH = has ? per.reduce((s, p) => s + p.avgHumidityPct * p.logs, 0) / per.reduce((s, p) => s + p.logs, 0) : null
+  1048→                    const gain = per.reduce((s, p) => s + p.deltaWeightKg, 0)
+  1049→                    const alarms = per.reduce((s, p) => s + p.alarms, 0)
+  1050→                    const logs = per.reduce((s, p) => s + p.logs, 0)
+  1051→                    return (
+  1052→                      <div
+  1053→                        key={mk}
+  1054→                        onMouseEnter={(e) =>
+  1055→                          has && openPop(e.currentTarget, `${name} ${data.date}`, 'Сводка по ульям за месяц', yearMonthTable(mk))
+  1056→                        }
+  1057→                        onMouseLeave={closePopSoon}
+  1058→                        onClick={() => {
+  1059→                          if (!has) return
+  1060→                          setScope('month')
+  1061→                          setDateKey(mk)
+  1062→                        }}
+  1063→                        className={cn(
+  1064→                          'rounded-2xl border p-3 transition',
+  1065→                          has
+  1066→                            ? 'cursor-pointer border-red-100 bg-white shadow-sm hover:border-red-300 hover:shadow-md dark:bg-[#2C211C]'
+  1067→                            : 'border-dashed border-red-100 bg-red-50/30 dark:bg-transparent',
+  1068→                        )}
+  1069→                        role={has ? 'button' : undefined}
+  1070→                      >
+  1071→                        <p className="flex items-center justify-between text-sm font-extrabold text-[#2A1A12] dark:text-[#E8D9CF]">
+  1072→                          {name}
+  1073→                          {alarms > 0 && <TriangleAlert className="h-3.5 w-3.5 text-red-500" />}
+  1074→                        </p>
+  1075→                        {has ? (
+  1076→                          <div className="mt-2 grid grid-cols-2 gap-x-2 gap-y-1 text-[11px] font-bold tabular-nums">
+  1077→                            <span className="text-red-500">{avgT!.toFixed(1)}°C ср.</span>
+  1078→                            <span className="text-sky-500">{Math.round(avgH!)}% влажн.</span>
+  1079→                            <span className={gain >= 0 ? 'text-emerald-600' : 'text-red-600'}>
+  1080→                              {gain >= 0 ? '+' : ''}{gain.toFixed(1)} кг
+  1081→                            </span>
+  1082→                            <span className="text-gray-400">{logs} записей</span>
+  1083→                          </div>
+  1084→                        ) : (
+  1085→                          <p className="mt-2 text-[11px] font-semibold text-gray-300">нет записей</p>
+  1086→                        )}
+  1087→                      </div>
+  1088→                    )
+  1089→                  })}
+  1090→                </div>
+  1091→              </CardContent>
+  1092→            </Card>
+  1093→          )}
+  1094→
+  1095→          <p className="text-xs leading-relaxed text-gray-400">
+  1096→            Записи журнала формируются по телеметрии ульев: в 8:00 и 20:00 — контрольные замеры,
+  1097→            между ними значения фиксируются каждый час. Тревожные события: перегрев или переохлаждение
+  1098→            семьи, слишком сухой или сырой воздух, резкое падение массы улья.
+  1099→          </p>
+  1100→        </>
+  1101→      )}
+  1102→
+  1103→      {/* Закреплённая таблица: клик по фону закрывает */}
+  1104→      {pinnedPop && <div className="fixed inset-0 z-[60]" onClick={() => setPinnedPop(null)} aria-hidden />}
+  1105→
+  1106→      {/* Всплывающая таблица изменений */}
+  1107→      <AnimatePresence>
+  1108→        {showPop && (
+  1109→          <DetailPopup
+  1110→            key={`pop-${showPop.title}-${showPop.rect.top}`}
+  1111→            pop={showPop}
+  1112→            pinned={pinnedPop !== null}
+  1113→            onEnter={keepPop}
+  1114→            onLeave={pinnedPop ? undefined : closePopSoon}
+  1115→            onClose={() => setPinnedPop(null)}
+  1116→          />
+  1117→        )}
+  1118→      </AnimatePresence>
+  1119→    </div>
+  1120→  )
+  1121→}
+  1122→

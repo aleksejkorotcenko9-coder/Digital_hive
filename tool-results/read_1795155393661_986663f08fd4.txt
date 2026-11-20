@@ -1,0 +1,974 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Экран «ИИ-агент»: чат пчеловода с цифровым помощником.
+     5→ * Агент отвечает сразу по всем ульям пасеки: телеметрия из базы, датчики точек
+     6→ * на карте (температура, вес, влажность, шум) и реальная погода из интернета.
+     7→ * Темы строго ограничены: погода и ульи — отвечает, всё остальное — вежливо
+     8→ * отказывается. Модель, на которой работает агент, пользователю не показывается.
+     9→ * Голосовой ввод работает как рация (push-to-talk): кнопку микрофона нужно
+    10→ * зажать и говорить — пока она удерживается, идёт запись; при отпускании запись
+    11→ * завершается, речь распознаётся (Web Speech или сервер /api/asr) и текст
+    12→ * подставляется в поле ввода.
+    13→ * Улии и показания синхронизированы с картой: агент говорит по тем же точкам
+    14→ * и датчикам, что видит пчеловод на карте и дашборде.
+    15→ * Чаты изолированы по пользователям: у каждого свой список чатов (SQLite),
+    16→ * первый вопрос даёт чату заголовок.
+    17→ */
+    18→import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+    19→import { Bot, CircleAlert, Gauge, Loader2, MessagesSquare, Mic, Plus, Send, Sparkles, Square, Trash2 } from 'lucide-react'
+    20→import { Button } from '@/components/ui/button'
+    21→import { Card, CardContent } from '@/components/ui/card'
+    22→import { Textarea } from '@/components/ui/textarea'
+    23→import { useToast } from '@/hooks/use-toast'
+    24→import { HexChip } from './decor'
+    25→import { tr, useT } from '@/lib/i18n'
+    26→import { useAppState } from '@/lib/store'
+    27→import { cn } from '@/lib/utils'
+    28→import { askAgent, makeContext, QUICK_QUESTIONS, URGENCY_META, type AgentContext, type AgentCropField, type AgentMessage, type AgentPoint } from '@/lib/agent'
+    29→import { pointsCenter, pointsToHives } from '@/lib/hive-sync'
+    30→import { siteDtoToSite, useRealData } from '@/lib/real-data'
+    31→import { DEFAULT_PLACE } from '@/lib/sensor-catalog'
+    32→import { blobToWavBase64, getSpeechRecognition, VOICE_LANG, VOICE_MAX_SECONDS, voiceInputSupported, type SpeechRecognitionLike } from '@/lib/voice-input'
+    33→import { weatherResponseToDays } from '@/lib/weather-days'
+    34→import type { MapPointDto, WeatherResponse } from '@/lib/api-types'
+    35→import type { ChatHistoryItem } from '@/lib/api-types'
+    36→
+    37→interface ChatItem {
+    38→  role: 'user' | 'agent'
+    39→  text: string
+    40→  agent?: AgentMessage
+    41→}
+    42→
+    43→/** Чат в списке «Мои чаты»: заголовок + превью последнего вопроса. */
+    44→interface ChatSessionInfo {
+    45→  id: string
+    46→  title: string
+    47→  preview: string
+    48→  createdAt: string
+    49→  updatedAt: string
+    50→}
+    51→
+    52→/** Состояние голосового ввода: покой / запись / распознавание. */
+    53→type VoiceState = 'idle' | 'recording' | 'transcribing'
+    54→
+    55→const SCENARIO_ICON: Record<string, string> = {
+    56→  swarm: '🐝',
+    57→  pesticide: '☣️',
+    58→  weather: '⛅',
+    59→  migration: '🚚',
+    60→  status: '📊',
+    61→  care: '🩺',
+    62→  offtopic: '🚫',
+    63→  bloom: '🌸',
+    64→  guide: '🧭',
+    65→}
+    66→
+    67→export function AgentChatView() {
+    68→  const user = useAppState((s) => s.user)
+    69→  const t = useT()
+    70→  const { toast } = useToast()
+    71→  const { status: realStatus, data } = useRealData()
+    72→
+    73→  // Погода по фактическому центру пасеки (среднее координат точек), те же
+    74→  // координаты, что на дашборде, чтобы агент называл те же числа, что видит
+    75→  // пчеловод. Ключ по набору точек — пересчёт только при изменении привязок.
+    76→  const [wResp, setWResp] = useState<WeatherResponse | null>(null)
+    77→  const [apiaryPoints, setApiaryPoints] = useState<MapPointDto[] | null>(null)
+    78→  // Поля Минсельхоза для контекста агента (п. 4 ТЗ)
+    79→  const [cropFields, setCropFields] = useState<AgentCropField[]>([])
+    80→  useEffect(() => {
+    81→    let alive = true
+    82→    const load = async () => {
+    83→      try {
+    84→        const res = await fetch('/api/crop-fields', { cache: 'no-store' })
+    85→        if (!res.ok) return
+    86→        const j = (await res.json()) as { fields: Array<{
+    87→          name: string
+    88→          culture: string
+    89→          cultureName: string
+    90→          areaHa: number
+    91→          district: string
+    92→          distanceKm: number
+    93→          sowingDate: string | null
+    94→          bloomText: string
+    95→          bloomStart: string | null
+    96→          bloomEnd: string | null
+    97→          recommend: { min: number; max: number; optimal: number } | null
+    98→          treatments: Array<{ date: string; drug: string; hazardClass: string }>
+    99→          isMinselhoz: boolean
+   100→        }> }
+   101→        if (alive) setCropFields(j.fields)
+   102→      } catch {
+   103→        // справочник подтянется при следующем открытии чата
+   104→      }
+   105→    }
+   106→    void load()
+   107→    return () => {
+   108→      alive = false
+   109→    }
+   110→  }, [])
+   111→
+   112→  useEffect(() => {
+   113→    let alive = true
+   114→    const load = async () => {
+   115→      try {
+   116→        const res = await fetch('/api/map-points', { cache: 'no-store' })
+   117→        if (!res.ok) return
+   118→        const j = (await res.json()) as { points: MapPointDto[] }
+   119→        if (alive) setApiaryPoints(j.points)
+   120→      } catch {
+   121→        // датчики подтянутся на следующем опросе
+   122→      }
+   123→    }
+   124→    void load()
+   125→    const timer = setInterval(() => void load(), 5000)
+   126→    return () => {
+   127→      alive = false
+   128→      clearInterval(timer)
+   129→    }
+   130→  }, [])
+   131→
+   132→  // Погода по фактическому центру пасеки (среднее координат точек), те же
+   133→  // координаты, что на дашборде, чтобы агент называл те же числа, что видит
+   134→  // пчеловод. Эффект зависит от ЧИСЕЛ координат: опрос точек каждые 5 с
+   135→  // не вызывает перезапрос погоды, пока координаты не изменились.
+   136→  const center = useMemo<[number, number]>(
+   137→    () =>
+   138→      (apiaryPoints && apiaryPoints.length > 0 ? pointsCenter(apiaryPoints) : null) ??
+   139→      DEFAULT_PLACE.center,
+   140→    [apiaryPoints],
+   141→  )
+   142→  const [wLat, wLon] = center
+   143→  useEffect(() => {
+   144→    let cancelled = false
+   145→    const sp = new URLSearchParams({ lat: String(wLat), lon: String(wLon), place: 'Моя пасека' })
+   146→    const load = async () => {
+   147→      try {
+   148→        const res = await fetch(`/api/weather?${sp.toString()}`, { cache: 'no-store' })
+   149→        if (!res.ok) throw new Error('weather')
+   150→        const j = (await res.json()) as WeatherResponse
+   151→        if (!cancelled) setWResp(j)
+   152→      } catch {
+   153→        // погода не критична: агент честно скажет, если данных нет
+   154→      }
+   155→    }
+   156→    void load()
+   157→    const timer = setInterval(() => void load(), 10 * 60 * 1000)
+   158→    return () => {
+   159→      cancelled = true
+   160→      clearInterval(timer)
+   161→    }
+   162→  }, [wLat, wLon])
+   163→  const agentWeather = useMemo(() => (wResp ? weatherResponseToDays(wResp) : null), [wResp])
+   164→
+   165→  // Ульи и показания — те же точки, что на карте (синхронизация с /api/map-points)
+   166→  const pointsCtx = useMemo<AgentContext | null>(() => {
+   167→    if (!apiaryPoints) return null
+   168→    const points: AgentPoint[] = apiaryPoints.map((p) => ({
+   169→      id: p.id,
+   170→      name: p.name,
+   171→      lat: p.lat,
+   172→      lon: p.lon,
+   173→      hiveCount: p.hiveCount,
+   174→      hasSensor: p.hasSensor,
+   175→      sensorOn: p.sensorOn,
+   176→      sensor: p.sensor,
+   177→    }))
+   178→    return makeContext(pointsToHives(apiaryPoints), {
+   179→      weather: agentWeather?.days ?? null,
+   180→      weatherNow: agentWeather?.now ?? null,
+   181→      pesticide: null, // реестр обработок не подключён — агент честно об этом скажет
+   182→      sites: data ? data.sites.map(siteDtoToSite) : [],
+   183→      points,
+   184→      cropFields,
+   185→      apiaryName: 'Моя пасека',
+   186→      lang: useAppState.getState().lang,
+   187→    })
+   188→  }, [apiaryPoints, agentWeather, data, cropFields])
+   189→
+   190→  // контекст мемоизирован, чтобы не пересоздаваться на каждом рендере
+   191→  // (иначе эффекты с ctx в зависимостях зацикливаются)
+   192→  const ctx: AgentContext | null = pointsCtx
+   193→
+   194→  const [items, setItems] = useState<ChatItem[]>([])
+   195→  const [input, setInput] = useState('')
+   196→  const [thinking, setThinking] = useState(false)
+   197→  const thinkingRef = useRef(false)
+   198→  const scrollRef = useRef<HTMLDivElement>(null)
+   199→
+   200→  /* ---------- чаты пользователя: у каждого свой список ---------- */
+   201→  const [sessions, setSessions] = useState<ChatSessionInfo[]>([])
+   202→  const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
+   203→  // актуальные значения для колбэков: sendUser пишет в текущий чат
+   204→  const activeSessionRef = useRef<string | null>(null)
+   205→  activeSessionRef.current = activeSessionId
+   206→  const ctxRef = useRef<AgentContext | null>(null)
+   207→  useEffect(() => {
+   208→    ctxRef.current = ctx
+   209→  }, [ctx])
+   210→
+   211→  /* ---------- голосовой ввод: микрофон → текст в поле ввода ---------- */
+   212→  // Основной путь — Web Speech API (Chrome/Edge/Яндекс.Браузер, ru-RU): текст
+   213→  // появляется в поле ввода прямо во время разговора. Запасной путь (браузеры
+   214→  // без нативного распознавания) — запись MediaRecorder → WAV → /api/asr.
+   215→  const srClass = useMemo(() => getSpeechRecognition(), [])
+   216→  const voiceOk = useMemo(() => !!srClass || voiceInputSupported(), [srClass])
+   217→  const [voice, setVoice] = useState<VoiceState>('idle')
+   218→  const speechRef = useRef<SpeechRecognitionLike | null>(null)
+   219→  const recorderRef = useRef<MediaRecorder | null>(null)
+   220→  const streamRef = useRef<MediaStream | null>(null)
+   221→  const chunksRef = useRef<Blob[]>([])
+   222→  const autoStopRef = useRef<number | null>(null)
+   223→  const baseInputRef = useRef('')
+   224→  // push-to-talk: кнопка микрофона зажата и момент начала удержания
+   225→  // (по длительности отличаем намеренное удержание от случайного тапа)
+   226→  const holdActiveRef = useRef(false)
+   227→  const holdStartedAtRef = useRef(0)
+   228→
+   229→  const clearAutoStop = () => {
+   230→    if (autoStopRef.current !== null) {
+   231→      window.clearTimeout(autoStopRef.current)
+   232→      autoStopRef.current = null
+   233→    }
+   234→  }
+   235→
+   236→  const stopVoice = useCallback(() => {
+   237→    clearAutoStop()
+   238→    if (speechRef.current) {
+   239→      try {
+   240→        speechRef.current.stop()
+   241→      } catch {
+   242→        // уже остановлен
+   243→      }
+   244→      return
+   245→    }
+   246→    const rec = recorderRef.current
+   247→    if (rec && rec.state !== 'inactive') rec.stop()
+   248→  }, [])
+   249→
+   250→  /** Отпускание кнопки (push-to-talk): завершаем запись. */
+   251→  const releaseHold = useCallback(() => {
+   252→    if (!holdActiveRef.current) return
+   253→    holdActiveRef.current = false
+   254→    const wasRecording = voice === 'recording'
+   255→    const heldMs = Date.now() - holdStartedAtRef.current
+   256→    stopVoice()
+   257→    // мгновенный тап вместо удержания — вежливо подсказываем, как пользоваться
+   258→    if (wasRecording && heldMs < 600) {
+   259→      toast({
+   260→        title: 'Короткое нажатие',
+   261→        description: 'Зажмите кнопку микрофона и говорите, отпустите — вопрос появится в поле ввода.',
+   262→      })
+   263→    }
+   264→  }, [stopVoice, voice, toast])
+   265→
+   266→  /** Запасной путь: собранный blob → WAV → /api/asr → текст. */
+   267→  const finishVoice = useCallback(async () => {
+   268→    // поток больше не нужен
+   269→    streamRef.current?.getTracks().forEach((t) => t.stop())
+   270→    streamRef.current = null
+   271→    recorderRef.current = null
+   272→    const blob = new Blob(chunksRef.current, { type: chunksRef.current[0]?.type || 'audio/webm' })
+   273→    chunksRef.current = []
+   274→    if (blob.size < 2048) {
+   275→      setVoice('idle')
+   276→      toast({ title: 'Запись пустая', description: 'Зажмите кнопку микрофона и скажите вопрос голосом.' })
+   277→      return
+   278→    }
+   279→    setVoice('transcribing')
+   280→    try {
+   281→      const wav = await blobToWavBase64(blob)
+   282→      const res = await fetch('/api/asr', {
+   283→        method: 'POST',
+   284→        headers: { 'Content-Type': 'application/json' },
+   285→        body: JSON.stringify({ audio: wav }),
+   286→      })
+   287→      const j = (await res.json().catch(() => ({}))) as { text?: string; error?: string }
+   288→      if (!res.ok || !j.text?.trim()) {
+   289→        toast({ title: 'Речь не распознана', description: j.error ?? 'Попробуйте сказать чуть чётче.', variant: 'destructive' })
+   290→        return
+   291→      }
+   292→      // текст подставляем в поле ввода — пчеловод может поправить и отправить
+   293→      const base = baseInputRef.current
+   294→      const text = j.text.trim()
+   295→      setInput(base ? `${base} ${text}` : text)
+   296→      toast({ title: 'Голос распознан', description: text })
+   297→    } catch {
+   298→      toast({ title: 'Не получилось', description: 'Не удалось распознать запись — попробуйте ещё раз.', variant: 'destructive' })
+   299→    } finally {
+   300→      setVoice('idle')
+   301→    }
+   302→  }, [toast])
+   303→
+   304→  const startVoice = useCallback(async () => {
+   305→    // запись уже идёт — второй старт (второй палец/указатель) не нужен
+   306→    if (speechRef.current || recorderRef.current) return
+   307→    clearAutoStop()
+   308→    baseInputRef.current = input.trim()
+   309→
+   310→    // 1) нативное распознавание в браузере — русский отлично работает в Chrome/Яндексе
+   311→    if (srClass) {
+   312→      const rec = new srClass()
+   313→      rec.lang = VOICE_LANG
+   314→      rec.continuous = true
+   315→      rec.interimResults = true
+   316→      rec.maxAlternatives = 1
+   317→      let finalText = ''
+   318→      rec.onresult = (e) => {
+   319→        let interim = ''
+   320→        for (let i = e.resultIndex; i < e.results.length; i++) {
+   321→          const r = e.results[i]
+   322→          const t = r[0]?.transcript ?? ''
+   323→          if (r.isFinal) finalText = finalText ? `${finalText} ${t.trim()}` : t.trim()
+   324→          else interim += t
+   325→        }
+   326→        const text = (finalText + (interim ? ` ${interim}` : '')).trim()
+   327→        if (text) {
+   328→          const base = baseInputRef.current
+   329→          setInput(base ? `${base} ${text}` : text)
+   330→        }
+   331→      }
+   332→      rec.onerror = (ev) => {
+   333→        const code = ev.error ?? ''
+   334→        if (code === 'not-allowed' || code === 'service-not-allowed') {
+   335→          toast({ title: 'Микрофон недоступен', description: 'Разрешите доступ к микрофону в браузере и попробуйте ещё раз.', variant: 'destructive' })
+   336→        } else if (code === 'no-speech') {
+   337→          toast({ title: 'Речи не слышно', description: 'Скажите вопрос чуть ближе к микрофону.' })
+   338→        } else if (code !== 'aborted') {
+   339→          toast({ title: 'Распознавание прервано', description: 'Скажите вопрос ещё раз.', variant: 'destructive' })
+   340→        }
+   341→      }
+   342→      rec.onend = () => {
+   343→        speechRef.current = null
+   344→        clearAutoStop()
+   345→        setVoice('idle')
+   346→      }
+   347→      speechRef.current = rec
+   348→      try {
+   349→        rec.start()
+   350→      } catch {
+   351→        toast({ title: 'Не получилось начать', description: 'Зажмите кнопку микрофона ещё раз.', variant: 'destructive' })
+   352→        return
+   353→      }
+   354→      setVoice('recording')
+   355→      autoStopRef.current = window.setTimeout(() => stopVoice(), VOICE_MAX_SECONDS * 1000)
+   356→      // кнопку отпустили раньше, чем распознавание успело стартовать
+   357→      if (!holdActiveRef.current) stopVoice()
+   358→      return
+   359→    }
+   360→
+   361→    // 2) запасной путь: запись с микрофона → серверное распознавание
+   362→    try {
+   363→      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+   364→      streamRef.current = stream
+   365→      chunksRef.current = []
+   366→      const rec = new MediaRecorder(stream)
+   367→      rec.ondataavailable = (e) => {
+   368→        if (e.data.size > 0) chunksRef.current.push(e.data)
+   369→      }
+   370→      rec.onstop = () => void finishVoice()
+   371→      rec.start()
+   372→      recorderRef.current = rec
+   373→      setVoice('recording')
+   374→      autoStopRef.current = window.setTimeout(() => stopVoice(), VOICE_MAX_SECONDS * 1000)
+   375→      // кнопку отпустили, пока запрашивался доступ к микрофону
+   376→      if (!holdActiveRef.current) stopVoice()
+   377→    } catch {
+   378→      toast({
+   379→        title: 'Микрофон недоступен',
+   380→        description: 'Разрешите доступ к микрофону в браузере и попробуйте ещё раз.',
+   381→        variant: 'destructive',
+   382→      })
+   383→    }
+   384→  }, [srClass, input, finishVoice, stopVoice, toast])
+   385→
+   386→  // при размонтировании прерываем распознавание и закрываем поток
+   387→  useEffect(
+   388→    () => () => {
+   389→      if (autoStopRef.current !== null) window.clearTimeout(autoStopRef.current)
+   390→      try {
+   391→        speechRef.current?.abort()
+   392→      } catch {
+   393→        // нет активного распознавания
+   394→      }
+   395→      streamRef.current?.getTracks().forEach((t) => t.stop())
+   396→    },
+   397→    [],
+   398→  )
+   399→
+   400→  /* ---------- чаты: список пользователя + сообщения выбранного ---------- */
+   401→  const ctxReady = !!ctx && ctx.hives.length > 0
+   402→
+   403→  // Список чатов текущего пользователя; если пусто — создаём первый.
+   404→  useEffect(() => {
+   405→    if (!user || realStatus !== 'ready') return
+   406→    let cancelled = false
+   407→    void (async () => {
+   408→      try {
+   409→        const res = await fetch('/api/chat/sessions', { cache: 'no-store' })
+   410→        if (!res.ok) throw new Error('sessions')
+   411→        let list = ((await res.json()) as { sessions: ChatSessionInfo[] }).sessions
+   412→        if (list.length === 0) {
+   413→          const created = await fetch('/api/chat/sessions', { method: 'POST' })
+   414→          if (created.ok) {
+   415→            const j = (await created.json()) as { session: ChatSessionInfo }
+   416→            list = [j.session]
+   417→          }
+   418→        }
+   419→        if (!cancelled) {
+   420→          setSessions(list)
+   421→          setActiveSessionId((prev) => (prev && list.some((s) => s.id === prev) ? prev : (list[0]?.id ?? null)))
+   422→        }
+   423→      } catch {
+   424→        // без списка чатов чат всё равно работает — история подтянется позже
+   425→      }
+   426→    })()
+   427→    return () => {
+   428→      cancelled = true
+   429→    }
+   430→  }, [user, realStatus])
+   431→
+   432→  // Сообщения выбранного чата: история из базы или приветствие в новом.
+   433→  useEffect(() => {
+   434→    if (!user || realStatus !== 'ready' || !activeSessionId || !ctxReady) return
+   435→    let cancelled = false
+   436→    void (async () => {
+   437→      try {
+   438→        const res = await fetch(`/api/chat?sessionId=${encodeURIComponent(activeSessionId)}`, { cache: 'no-store' })
+   439→        if (!res.ok) throw new Error('history')
+   440→        const j = (await res.json()) as { items: ChatHistoryItem[] }
+   441→        if (cancelled) return
+   442→        const restored: ChatItem[] = j.items.map((m) => ({
+   443→          role: m.role,
+   444→          text: m.text,
+   445→          ...(m.role === 'agent' && m.agentJson
+   446→            ? { agent: JSON.parse(m.agentJson) as AgentMessage }
+   447→            : {}),
+   448→        }))
+   449→        if (restored.length === 0) {
+   450→          setItems([{ role: 'agent', text: '', agent: askAgent('привет', ctxRef.current?.hives[0]?.id ?? 1, ctxRef.current!) }])
+   451→        } else {
+   452→          setItems(restored.slice(-30))
+   453→        }
+   454→      } catch {
+   455→        if (!cancelled) {
+   456→          setItems([{ role: 'agent', text: '', agent: askAgent('привет', ctxRef.current?.hives[0]?.id ?? 1, ctxRef.current!) }])
+   457→        }
+   458→      }
+   459→    })()
+   460→    return () => {
+   461→      cancelled = true
+   462→    }
+   463→  }, [user, realStatus, activeSessionId, ctxReady])
+   464→
+   465→  const sendUser = useCallback(
+   466→    (rawText: string) => {
+   467→      const trimmed = rawText.trim()
+   468→      if (!trimmed || thinkingRef.current) return
+   469→      // отправка текста прерывает голосовой ввод (кнопка могла быть ещё зажата)
+   470→      if (holdActiveRef.current) {
+   471→        holdActiveRef.current = false
+   472→        stopVoice()
+   473→      }
+   474→      const context = ctx
+   475→      if (!context) return
+   476→      thinkingRef.current = true
+   477→      setItems((prev) => [...prev, { role: 'user', text: trimmed }])
+   478→      setInput('')
+   479→      setThinking(true)
+   480→      const started = Date.now()
+   481→
+   482→      const run = async () => {
+   483→        let answer: AgentMessage
+   484→        try {
+   485→          // настоящий LLM-агент на сервере; при сбое — встроенные правила
+   486→          const res = await fetch('/api/agent', {
+   487→            method: 'POST',
+   488→            headers: { 'Content-Type': 'application/json' },
+   489→            body: JSON.stringify({ question: trimmed }),
+   490→          })
+   491→          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+   492→          const j = (await res.json()) as { answer: AgentMessage }
+   493→          answer = j.answer
+   494→        } catch {
+   495→          answer = askAgent(trimmed, context.hives[0]?.id ?? 1, context)
+   496→        }
+   497→        // лёгкая пауза, чтобы индикатор «думает» не мигал при быстрых ответах
+   498→        const elapsed = Date.now() - started
+   499→        if (elapsed < 600) await new Promise((r) => setTimeout(r, 600 - elapsed))
+   500→        setItems((prev) => [...prev, { role: 'agent', text: '', agent: answer }])
+   501→        thinkingRef.current = false
+   502→        setThinking(false)
+   503→        // сохраняем переписку в базу — в текущий чат пользователя
+   504→        if (useAppState.getState().user) {
+   505→          const sid = activeSessionRef.current
+   506→          void fetch('/api/chat', {
+   507→            method: 'POST',
+   508→            headers: { 'Content-Type': 'application/json' },
+   509→            body: JSON.stringify({
+   510→              sessionId: sid,
+   511→              userText: trimmed,
+   512→              agentText: answer.text,
+   513→              agent: answer,
+   514→            }),
+   515→          })
+   516→            .then((r) => (r.ok ? (r.json() as Promise<{ title?: string | null }>) : null))
+   517→            .then((j) => {
+   518→              // первый вопрос даёт чату заголовок — обновляем список
+   519→              if (j?.title && sid) {
+   520→                setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, title: j.title as string } : s)))
+   521→              }
+   522→            })
+   523→            .catch(() => undefined)
+   524→        }
+   525→      }
+   526→      void run()
+   527→    },
+   528→    [ctx, stopVoice],
+   529→  )
+   530→
+   531→  /* ---------- управление чатами: новый / переключение / удаление ---------- */
+   532→  const newChat = useCallback(async () => {
+   533→    try {
+   534→      const res = await fetch('/api/chat/sessions', { method: 'POST' })
+   535→      if (!res.ok) throw new Error('create')
+   536→      const j = (await res.json()) as { session: ChatSessionInfo }
+   537→      setSessions((prev) => [j.session, ...prev])
+   538→      setActiveSessionId(j.session.id)
+   539→      setItems([])
+   540→      setInput('')
+   541→    } catch {
+   542→      toast({ title: 'Не получилось', description: 'Не удалось создать новый чат — попробуйте ещё раз.', variant: 'destructive' })
+   543→    }
+   544→  }, [toast])
+   545→
+   546→  const switchChat = useCallback((id: string) => {
+   547→    if (id === activeSessionRef.current) return
+   548→    setActiveSessionId(id)
+   549→    setItems([])
+   550→  }, [])
+   551→
+   552→  const deleteChat = useCallback(
+   553→    async (id: string) => {
+   554→      try {
+   555→        const res = await fetch(`/api/chat/sessions/${id}`, { method: 'DELETE' })
+   556→        if (!res.ok) throw new Error('delete')
+   557→        const next = sessions.filter((s) => s.id !== id)
+   558→        setSessions(next)
+   559→        if (id === activeSessionRef.current) {
+   560→          setActiveSessionId(next[0]?.id ?? null)
+   561→          if (next.length === 0) setItems([])
+   562→        }
+   563→        toast({ title: 'Чат удалён' })
+   564→      } catch {
+   565→        toast({ title: 'Не получилось', description: 'Не удалось удалить чат.', variant: 'destructive' })
+   566→      }
+   567→    },
+   568→    [sessions, toast],
+   569→  )
+   570→
+   571→  // consume prefill, заданного до монтирования + подписка на новые вопросы из дашборда
+   572→  useEffect(() => {
+   573→    useAppState.setState({ chatPrefill: null })
+   574→    const unsub = useAppState.subscribe((state, prev) => {
+   575→      if (state.chatPrefill && state.chatPrefill !== prev.chatPrefill) {
+   576→        useAppState.setState({ chatPrefill: null })
+   577→        sendUser(state.chatPrefill)
+   578→      }
+   579→    })
+   580→    return unsub
+   581→  }, [sendUser])
+   582→
+   583→  useEffect(() => {
+   584→    const el = scrollRef.current
+   585→    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+   586→  }, [items, thinking])
+   587→
+   588→  /* Контекст ещё не готов — экран загрузки; пустая карта — честная подсказка */
+   589→  if (!ctx || ctx.hives.length === 0) {
+   590→    const noPoints = apiaryPoints !== null && apiaryPoints.length === 0
+   591→    return (
+   592→      <Card className="border-red-100">
+   593→        <CardContent className="p-10 text-center">
+   594→          <HexChip className="mx-auto h-12 w-12 animate-pulse bg-red-100">
+   595→            <Bot className="h-6 w-6 text-red-600" />
+   596→          </HexChip>
+   597→          <p className="mt-3 text-sm text-gray-500">
+   598→            {noPoints
+   599→              ? 'На карте пасеки ещё нет ульев — привяжите улей по коду с корпуса датчика, и агент начнёт отвечать по его показаниям.'
+   600→              : 'Агент загружается…'}
+   601→          </p>
+   602→        </CardContent>
+   603→      </Card>
+   604→    )
+   605→  }
+   606→
+   607→  return (
+   608→    <div className="grid gap-4 lg:grid-cols-[230px_minmax(0,1fr)_280px]">
+   609→      {/* Чаты пользователя: свой список у каждого */}
+   610→      <SessionsPanel
+   611→        sessions={sessions}
+   612→        activeId={activeSessionId}
+   613→        disabled={thinking}
+   614→        onNew={() => void newChat()}
+   615→        onSwitch={switchChat}
+   616→        onDelete={(id) => void deleteChat(id)}
+   617→      />
+   618→
+   619→      {/* Чат */}
+   620→      <Card className="flex min-w-0 flex-col border-red-100 shadow-sm lg:h-[calc(100vh-190px)] lg:min-h-[520px]">
+   621→        <CardContent className="flex min-h-0 flex-1 flex-col p-0">
+   622→          {/* шапка чата */}
+   623→          <div className="flex flex-wrap items-center gap-2 border-b border-red-100 px-4 py-3">
+   624→            <HexChip className="h-9 w-9 bg-gradient-to-br from-[#E93A2D] to-[#9B4DFF]">
+   625→              <Sparkles className="h-4.5 w-4.5" />
+   626→            </HexChip>
+   627→            <div>
+   628→              <p className="text-sm font-bold text-[#2A1A12]">ИИ-агент пасеки</p>
+   629→              <p className="text-[11px] text-gray-400">
+   630→                отвечает по телеметрии из базы данных
+   631→              </p>
+   632→            </div>
+   633→            <div className="ml-auto flex items-center gap-1.5">
+   634→              <span className="rounded-lg border border-red-100 bg-white px-2.5 py-1 text-xs font-semibold text-gray-600">
+   635→                все ульи пасеки ({ctx.hives.length})
+   636→              </span>
+   637→            </div>
+   638→          </div>
+   639→
+   640→          {/* лента сообщений */}
+   641→          <div ref={scrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 md:px-5">
+   642→            {items.map((item, idx) =>
+   643→              item.role === 'user' ? (
+   644→                <div key={idx} className="flex justify-end">
+   645→                  <div className="max-w-[85%] rounded-2xl rounded-br-md bg-gradient-to-br from-[#E93A2D] to-[#8B2AFF] px-4 py-2.5 text-sm leading-relaxed text-white shadow-md shadow-red-200">
+   646→                    {item.text}
+   647→                  </div>
+   648→                </div>
+   649→              ) : (
+   650→                <AgentBubble key={idx} msg={item.agent!} />
+   651→              ),
+   652→            )}
+   653→            {thinking && (
+   654→              <div className="flex items-center gap-2 pl-1">
+   655→                <HexChip className="h-8 w-8 animate-pulse bg-red-100">
+   656→                  <Bot className="h-4 w-4 text-red-600" />
+   657→                </HexChip>
+   658→                <span className="text-sm text-gray-400">Агент смотрит данные пасеки…</span>
+   659→              </div>
+   660→            )}
+   661→          </div>
+   662→
+   663→          {/* быстрые вопросы + ввод */}
+   664→          <div className="border-t border-red-100 px-4 py-3 md:px-5">
+   665→            <div className="mb-2.5 flex gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+   666→              {QUICK_QUESTIONS.map((q) => (
+   667→                <button
+   668→                  key={q}
+   669→                  onClick={() => sendUser(tr('ru', q))}
+   670→                  disabled={thinking}
+   671→                  className="shrink-0 rounded-full border border-red-200 bg-red-50/60 px-3 py-1.5 text-xs font-medium text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50"
+   672→                >
+   673→                  {t(q)}
+   674→                </button>
+   675→              ))}
+   676→            </div>
+   677→            <form
+   678→              className="flex items-end gap-2"
+   679→              onSubmit={(e) => {
+   680→                e.preventDefault()
+   681→                sendUser(input)
+   682→              }}
+   683→            >
+   684→              {voiceOk && (
+   685→                <Button
+   686→                  type="button"
+   687→                  size="icon"
+   688→                  /* push-to-talk: зажать кнопку и говорить — отпустить, чтобы завершить */
+   689→                  onPointerDown={(e) => {
+   690→                    if (holdActiveRef.current || voice === 'transcribing' || thinking) return
+   691→                    e.preventDefault() // без выделения текста и «призрачных» кликов при удержании
+   692→                    holdActiveRef.current = true
+   693→                    holdStartedAtRef.current = Date.now()
+   694→                    try {
+   695→                      // захват указателя: отпустят в любом месте — событие всё равно придёт сюда
+   696→                      e.currentTarget.setPointerCapture(e.pointerId)
+   697→                    } catch {
+   698→                      // без захвата остаются подстраховки: автостоп и клавиатурные события
+   699→                    }
+   700→                    void startVoice()
+   701→                  }}
+   702→                  onPointerUp={releaseHold}
+   703→                  onPointerCancel={releaseHold}
+   704→                  onLostPointerCapture={releaseHold}
+   705→                  onKeyDown={(e) => {
+   706→                    // доступность: Space/Enter зажимает кнопку так же, как мышь
+   707→                    if (
+   708→                      (e.code === 'Space' || e.code === 'Enter') &&
+   709→                      !e.repeat &&
+   710→                      !holdActiveRef.current &&
+   711→                      voice !== 'transcribing' &&
+   712→                      !thinking
+   713→                    ) {
+   714→                      e.preventDefault()
+   715→                      holdActiveRef.current = true
+   716→                      holdStartedAtRef.current = Date.now()
+   717→                      void startVoice()
+   718→                    }
+   719→                  }}
+   720→                  onKeyUp={(e) => {
+   721→                    if (e.code === 'Space' || e.code === 'Enter') releaseHold()
+   722→                  }}
+   723→                  onContextMenu={(e) => e.preventDefault()}
+   724→                  disabled={voice === 'transcribing' || thinking}
+   725→                  aria-label={voice === 'recording' ? 'Отпустите, чтобы завершить запись' : 'Голосовой ввод: зажмите и говорите'}
+   726→                  title={
+   727→                    voice === 'recording'
+   728→                      ? 'Говорите… отпустите кнопку, чтобы завершить'
+   729→                      : 'Голосовой ввод: зажмите кнопку и скажите вопрос'
+   730→                  }
+   731→                  className={cn(
+   732→                    'h-[46px] w-[46px] shrink-0 touch-none select-none border transition-all active:scale-95',
+   733→                    voice === 'recording'
+   734→                      ? 'animate-pulse border-red-400 bg-red-600 text-white'
+   735→                      : 'border-red-200 bg-white text-red-600 hover:bg-red-50 dark:bg-[#221814]',
+   736→                  )}
+   737→                >
+   738→                  {voice === 'recording' ? <Square className="h-4 w-4" /> : <Mic className="h-4.5 w-4.5" />}
+   739→                </Button>
+   740→              )}
+   741→              <Textarea
+   742→                value={input}
+   743→                onChange={(e) => setInput(e.target.value)}
+   744→                onKeyDown={(e) => {
+   745→                  if (e.key === 'Enter' && !e.shiftKey) {
+   746→                    e.preventDefault()
+   747→                    sendUser(input)
+   748→                  }
+   749→                }}
+   750→                placeholder="Спросите о погоде или ульях: «Как дела на пасеке?»"
+   751→                className="min-h-[46px] resize-none border-red-200 focus-visible:ring-red-300"
+   752→                rows={1}
+   753→              />
+   754→              <Button
+   755→                type="submit"
+   756→                size="icon"
+   757→                className="h-[46px] w-[46px] shrink-0 bg-red-600 hover:bg-red-700"
+   758→                disabled={thinking || !input.trim()}
+   759→                aria-label="Отправить вопрос"
+   760→              >
+   761→                <Send className="h-4.5 w-4.5" />
+   762→              </Button>
+   763→            </form>
+   764→            {(voice === 'recording' || voice === 'transcribing') && (
+   765→              <p className="mt-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-red-600">
+   766→                {voice === 'recording' ? (
+   767→                  <>
+   768→                    <span className="relative flex h-2 w-2">
+   769→                      <span className="absolute h-full w-full animate-ping rounded-full bg-red-500 opacity-60" />
+   770→                      <span className="relative h-2 w-2 rounded-full bg-red-600" />
+   771→                    </span>
+   772→                    Слушаю… говорите, держите кнопку зажатой — отпустите, и текст появится в поле ввода
+   773→                  </>
+   774→                ) : (
+   775→                  <>
+   776→                    <Loader2 className="h-3 w-3 animate-spin" /> Распознаю речь…
+   777→                  </>
+   778→                )}
+   779→              </p>
+   780→            )}
+   781→          </div>
+   782→        </CardContent>
+   783→      </Card>
+   784→
+   785→      {/* Панель «что я умею» */}
+   786→      <div className="min-w-0 space-y-3 lg:pt-0">
+   787→        <Card className="border-red-100 bg-gradient-to-b from-red-50/70 to-white shadow-sm">
+   788→          <CardContent className="p-4">
+   789→            <p className="flex items-center gap-2 text-sm font-bold text-[#2A1A12]">
+   790→              <Gauge className="h-4 w-4 text-red-600" /> Что я анализирую
+   791→            </p>
+   792→            <ul className="mt-2 space-y-1.5 text-xs leading-relaxed text-gray-600">
+   793→              <li>• телеметрию из вашей базы: вес, температуру, влажность</li>
+   794→              <li>• датчики точек на карте: температура, вес, влажность, шум</li>
+   795→              <li>• погоду по координатам пасеки</li>
+   796→              <li>• справочник площадок для кочёвки</li>
+   797→              <li>• справочник здоровья пчёл: болезни, лечение, уход</li>
+   798→            </ul>
+   799→          </CardContent>
+   800→        </Card>
+   801→        <Card className="border-red-100 shadow-sm">
+   802→          <CardContent className="p-4">
+   803→            <p className="flex items-center gap-2 text-sm font-bold text-[#2A1A12]">
+   804→              <CircleAlert className="h-4 w-4 text-orange-500" /> Принципы работы
+   805→            </p>
+   806→            <ul className="mt-2 space-y-1.5 text-xs leading-relaxed text-gray-600">
+   807→              <li>• отвечаю сразу по всем ульям пасеки</li>
+   808→              <li>• говорю о погоде, ульях и здоровье пчёл — остальное не моя тема</li>
+   809→              <li>• совет опирается на показатели — всегда показываю, какие</li>
+   810→              <li>• датчика нет или он выключен — данных об улье нет</li>
+   811→              <li>• показываю вероятность и риск, а не 100 % прогноз</li>
+   812→            </ul>
+   813→          </CardContent>
+   814→        </Card>
+   815→        <Card className="border-red-100 shadow-sm">
+   816→          <CardContent className="p-4">
+   817→            <p className="text-sm font-bold text-[#2A1A12]">Текущий контекст</p>
+   818→            <p className="mt-2 text-xs leading-relaxed text-gray-600">
+   819→              Агент отвечает сразу по всем ульям пасеки: телеметрия, датчики точек на карте и погода.{' '}
+   820→              У каждого пользователя свой список чатов: «Новый чат», переключение и удаление — в панели «Мои чаты».
+   821→            </p>
+   822→          </CardContent>
+   823→        </Card>
+   824→      </div>
+   825→    </div>
+   826→  )
+   827→}
+   828→
+   829→/** Панель «Мои чаты»: список чатов пользователя + кнопка «Новый чат».
+   830→ *  На мобильном — горизонтальная лента чипсов, на десктопе — колонка слева. */
+   831→function SessionsPanel({
+   832→  sessions,
+   833→  activeId,
+   834→  disabled,
+   835→  onNew,
+   836→  onSwitch,
+   837→  onDelete,
+   838→}: {
+   839→  sessions: ChatSessionInfo[]
+   840→  activeId: string | null
+   841→  disabled: boolean
+   842→  onNew: () => void
+   843→  onSwitch: (id: string) => void
+   844→  onDelete: (id: string) => void
+   845→}) {
+   846→  return (
+   847→    <Card className="min-w-0 border-red-100 shadow-sm">
+   848→      <CardContent className="min-w-0 p-3">
+   849→        <div className="flex items-center justify-between gap-2">
+   850→          <p className="flex shrink-0 items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   851→            <MessagesSquare className="h-4 w-4 text-red-600" /> Мои чаты
+   852→          </p>
+   853→          <button
+   854→            onClick={onNew}
+   855→            disabled={disabled}
+   856→            className="flex shrink-0 items-center gap-1 rounded-lg border border-red-200 bg-red-50/60 px-2 py-1 text-[11px] font-bold text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50"
+   857→            aria-label="Новый чат с ИИ-агентом"
+   858→          >
+   859→            <Plus className="h-3.5 w-3.5" /> Новый
+   860→          </button>
+   861→        </div>
+   862→        {sessions.length === 0 ? (
+   863→          <p className="mt-2 text-[11px] leading-relaxed text-gray-400">
+   864→            Чатов пока нет — нажмите «Новый», чтобы начать разговор.
+   865→          </p>
+   866→        ) : (
+   867→          <ul
+   868→            className={cn(
+   869→              'mt-2 flex gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
+   870→              'lg:max-h-[430px] lg:flex-col lg:overflow-x-visible lg:overflow-y-auto lg:pb-0',
+   871→            )}
+   872→          >
+   873→            {sessions.map((s) => (
+   874→              <li
+   875→                key={s.id}
+   876→                className={cn(
+   877→                  'group flex shrink-0 items-center gap-1 rounded-xl border px-2.5 py-1.5 text-xs transition-colors lg:w-full lg:shrink',
+   878→                  s.id === activeId
+   879→                    ? 'border-red-300 bg-red-50 text-red-700 dark:bg-[#2C211C]'
+   880→                    : 'border-red-100 bg-white text-gray-600 hover:bg-red-50/50 dark:bg-[#221814]',
+   881→                )}
+   882→              >
+   883→                <button onClick={() => onSwitch(s.id)} className="min-w-0 flex-1 text-left" aria-label={`Открыть чат: ${s.title}`}>
+   884→                  <p className="max-w-[150px] truncate font-semibold lg:max-w-[160px]">{s.title}</p>
+   885→                  {s.preview && (
+   886→                    <p className="hidden max-w-[160px] truncate text-[10px] text-gray-400 lg:block">{s.preview}</p>
+   887→                  )}
+   888→                </button>
+   889→                <button
+   890→                  onClick={() => onDelete(s.id)}
+   891→                  className="rounded p-0.5 text-gray-300 transition-colors hover:text-red-600"
+   892→                  aria-label={`Удалить чат: ${s.title}`}
+   893→                  title="Удалить чат"
+   894→                >
+   895→                  <Trash2 className="h-3 w-3" />
+   896→                </button>
+   897→              </li>
+   898→            ))}
+   899→          </ul>
+   900→        )}
+   901→      </CardContent>
+   902→    </Card>
+   903→  )
+   904→}
+   905→
+   906→function AgentBubble({ msg }: { msg: AgentMessage }) {
+   907→  const t = useT()
+   908→  const meta = URGENCY_META[msg.urgency]
+   909→  return (
+   910→    <div className="flex justify-start">
+   911→      <div className="max-w-[92%] rounded-2xl rounded-bl-md border border-red-100 bg-white px-4 py-3 shadow-md shadow-red-100/60 md:max-w-[88%]">
+   912→        <div className="flex flex-wrap items-center gap-2">
+   913→          <HexChip className="h-7 w-7 bg-gradient-to-br from-[#E93A2D] to-[#9B4DFF]">
+   914→            <span className="text-[10px] font-bold">{SCENARIO_ICON[msg.scenario] ?? '📊'}</span>
+   915→          </HexChip>
+   916→          {msg.scenario !== 'offtopic' && (
+   917→            <span
+   918→              className={cn(
+   919→                'rounded-full border px-2.5 py-0.5 text-xs font-bold',
+   920→                meta.cls,
+   921→              )}
+   922→            >
+   923→              {t(meta.labelKey)}
+   924→            </span>
+   925→          )}
+   926→          {msg.scenario === 'offtopic' && (
+   927→            <span className="rounded-full border border-gray-200 bg-gray-100 px-2.5 py-0.5 text-xs font-bold text-gray-600">
+   928→              Не по теме
+   929→            </span>
+   930→          )}
+   931→          {msg.urgencyNote && (
+   932→            <span className="text-xs font-semibold text-gray-500">{msg.urgencyNote}</span>
+   933→          )}
+   934→        </div>
+   935→
+   936→        <p className="mt-2.5 whitespace-pre-line text-sm leading-relaxed text-gray-700">
+   937→          {msg.text}
+   938→        </p>
+   939→
+   940→        {msg.metrics.length > 0 && (
+   941→          <div className="mt-3 grid grid-cols-3 gap-2">
+   942→            {msg.metrics.map((m) => (
+   943→              <div key={m.label} className="rounded-xl bg-red-50/70 px-2.5 py-2">
+   944→                <p className="truncate text-[10px] uppercase tracking-wide text-gray-400">{m.label}</p>
+   945→                <p className="mt-0.5 text-sm font-extrabold text-[#2A1A12]">{m.value}</p>
+   946→              </div>
+   947→            ))}
+   948→          </div>
+   949→        )}
+   950→
+   951→        {msg.basis.length > 0 && (
+   952→          <div className="mt-3">
+   953→            <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Основание</p>
+   954→            <div className="mt-1 flex flex-wrap gap-1.5">
+   955→              {msg.basis.map((b) => (
+   956→                <span key={b} className="rounded-full bg-gray-100 px-2.5 py-1 text-xs text-gray-600">
+   957→                  {b}
+   958→                </span>
+   959→              ))}
+   960→            </div>
+   961→          </div>
+   962→        )}
+   963→
+   964→        {msg.probability && (
+   965→          <p className="mt-2.5 text-xs font-semibold text-red-700">{msg.probability}</p>
+   966→        )}
+   967→        <p className="mt-2 border-t border-dashed border-red-100 pt-2 text-[11px] text-gray-400">
+   968→          Вероятностная оценка — решение принимает пчеловод
+   969→        </p>
+   970→      </div>
+   971→    </div>
+   972→  )
+   973→}
+   974→

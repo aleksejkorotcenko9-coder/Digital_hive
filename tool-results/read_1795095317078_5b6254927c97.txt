@@ -1,0 +1,1706 @@
+     1→/**
+     2→ * Логика ИИ-агента «Цифровой улей» (правиловая версия).
+     3→ *
+     4→ * Принципы из кейса:
+     5→ *  1. Data Driven — совет опирается на показатели, агент показывает, какие данные использовал.
+     6→ *  2. Честность — если данных не хватает, агент прямо об этом говорит.
+     7→ *  3. Вероятность и уровень риска, а не 100% прогноз; решение принимает пчеловод.
+     8→ *
+     9→ * Агент работает через AgentContext: один и тот же набор правил применяется
+    10→ * к данным пасеки — с датчиков на карте (точки ApiaryPoint) или из загруженной
+    11→ * телеметрии (/api/data). Контекст собирают callers: экран агента и /api/agent.
+    12→ */
+    13→import {
+    14→  fmtNum,
+    15→  fmtSigned,
+    16→  hiveStatus,
+    17→  weightDeltaOver,
+    18→  type Hive,
+    19→  type MigrationSite,
+    20→  type PesticideAlert,
+    21→  type WeatherDay,
+    22→} from './hive-model'
+    23→import type { SensorReading } from './api-types'
+    24→import type { AgentWeatherNow } from './weather-days'
+    25→import { tr, type Lang } from './i18n'
+    26→
+    27→/* ------------------------------------------------------------------ */
+    28→/* Типы                                                                */
+    29→/* ------------------------------------------------------------------ */
+    30→
+    31→export type Urgency = 'act-now' | 'today' | 'this-week' | 'ok'
+    32→export type Scenario = 'pesticide' | 'swarm' | 'weather' | 'migration' | 'status' | 'care' | 'offtopic'
+    33→
+    34→export const URGENCY_META: Record<Urgency, { labelKey: string; cls: string }> = {
+    35→  'act-now': { labelKey: 'agent.urgency.act-now', cls: 'bg-red-100 text-red-700 border-red-200' },
+    36→  today: { labelKey: 'agent.urgency.today', cls: 'bg-orange-100 text-orange-700 border-orange-200' },
+    37→  'this-week': { labelKey: 'agent.urgency.this-week', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+    38→  ok: { labelKey: 'agent.urgency.ok', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+    39→}
+    40→
+    41→export const SCENARIO_META: Record<Scenario, { labelKey: string }> = {
+    42→  pesticide: { labelKey: 'agent.scenario.pesticide' },
+    43→  swarm: { labelKey: 'agent.scenario.swarm' },
+    44→  weather: { labelKey: 'agent.scenario.weather' },
+    45→  migration: { labelKey: 'agent.scenario.migration' },
+    46→  status: { labelKey: 'agent.scenario.status' },
+    47→  care: { labelKey: 'agent.scenario.care' },
+    48→  offtopic: { labelKey: 'agent.scenario.offtopic' },
+    49→}
+    50→
+    51→export interface AgentMetric {
+    52→  label: string
+    53→  value: string
+    54→}
+    55→
+    56→export interface AgentMessage {
+    57→  scenario: Scenario
+    58→  text: string
+    59→  basis: string[]
+    60→  urgency: Urgency
+    61→  urgencyNote?: string
+    62→  probability?: string
+    63→  metrics: AgentMetric[]
+    64→  hiveId: number | null
+    65→  /** Кто ответил: LLM или встроенный правиловый движок (fallback). Модель не раскрывается. */
+    66→  engine?: 'llm' | 'rules'
+    67→}
+    68→
+    69→export interface AgentFinding extends AgentMessage {
+    70→  id: string
+    71→  title: string
+    72→  prefill: string
+    73→}
+    74→
+    75→/** Точка пасеки на карте (ульи с датчиком) — тот же DTO, что отдаёт /api/map-points. */
+    76→export interface AgentPoint {
+    77→  id: string
+    78→  name: string
+    79→  lat: number
+    80→  lon: number
+    81→  hiveCount: number
+    82→  hasSensor: boolean
+    83→  sensorOn: boolean
+    84→  sensor: SensorReading
+    85→}
+    86→
+    87→/** Контекст данных, по которым агент отвечает: телеметрия и точки карты. */
+    88→export interface AgentContext {
+    89→  hives: Hive[]
+    90→  weather: WeatherDay[] | null
+    91→  /** Погода «прямо сейчас» (метеосервис); если недоступна — null. */
+    92→  weatherNow?: AgentWeatherNow | null
+    93→  pesticide: PesticideAlert | null
+    94→  sites: MigrationSite[]
+    95→  /** Точки пасеки на карте с датчиками (температура, вес, влажность, шум). */
+    96→  points?: AgentPoint[]
+    97→  apiaryName: string
+    98→  /** Язык ответов агента (словарь i18n-extra-agent); по умолчанию — русский. */
+    99→  lang?: Lang
+   100→}
+   101→
+   102→/** Собирает контекст агента: недостающее — честные null/пустые списки. */
+   103→export function makeContext(hives_: Hive[], opts?: Partial<Omit<AgentContext, 'hives'>>): AgentContext {
+   104→  return {
+   105→    hives: hives_,
+   106→    weather: opts?.weather ?? null,
+   107→    weatherNow: opts?.weatherNow ?? null,
+   108→    pesticide: opts?.pesticide ?? null,
+   109→    sites: opts?.sites ?? [],
+   110→    points: opts?.points,
+   111→    apiaryName: opts?.apiaryName ?? 'Моя пасека',
+   112→    lang: opts?.lang ?? 'ru',
+   113→  }
+   114→}
+   115→
+   116→/* ------------------------------------------------------------------ */
+   117→/* Метрики по рядам (безопасны к пропускам значений)                   */
+   118→/* ------------------------------------------------------------------ */
+   119→
+   120→function lastPoint(h: Hive) {
+   121→  return h.series[h.series.length - 1] ?? null
+   122→}
+   123→
+   124→function lastWeight(h: Hive): number | null {
+   125→  return lastPoint(h)?.weightKg ?? null
+   126→}
+   127→
+   128→/** Изменение веса за `backDays` календарных дней; null, если точек не хватает.
+   129→ *  Календарный поиск с допуском ±1,5 дня — корректен при пропусках дней. */
+   130→function weightDelta(h: Hive, backDays: number): number | null {
+   131→  const s = h.series
+   132→  if (s.length === 0) return null
+   133→  const lastPoint = s[s.length - 1]
+   134→  if (lastPoint.weightKg === null) return null
+   135→  const target = new Date(lastPoint.date).getTime() - backDays * 86400000
+   136→  let best: number | null = null
+   137→  let bestDiff = Infinity
+   138→  for (const p of s) {
+   139→    if (p.weightKg === null || p === lastPoint) continue
+   140→    const diff = Math.abs(new Date(p.date).getTime() - target)
+   141→    if (diff <= 1.5 * 86400000 && diff < bestDiff) {
+   142→      bestDiff = diff
+   143→      best = p.weightKg
+   144→    }
+   145→  }
+   146→  if (best === null) return null
+   147→  return Math.round((lastPoint.weightKg - best) * 10) / 10
+   148→}
+   149→
+   150→const delta2d = (h: Hive) => weightDelta(h, 2)
+   151→const delta30d = (h: Hive) => weightDelta(h, Math.min(29, Math.max(1, spanDays(h) - 1)))
+   152→
+   153→function maxTempRecent(h: Hive, n = 3): number | null {
+   154→  const temps = h.series.slice(-n).map((p) => p.tempInC).filter((t): t is number => t !== null)
+   155→  return temps.length ? Math.max(...temps) : null
+   156→}
+   157→
+   158→function lastHumidity(h: Hive): number | null {
+   159→  return lastPoint(h)?.humidityPct ?? null
+   160→}
+   161→
+   162→/** Лидер пасеки по 30-дневному привесу. */
+   163→function leaderOf(list: Hive[]): Hive | null {
+   164→  const withW = list.filter((x) => delta30d(x) !== null)
+   165→  if (!withW.length) return null
+   166→  return [...withW].sort((a, b) => (delta30d(b) ?? 0) - (delta30d(a) ?? 0))[0]
+   167→}
+   168→
+   169→/** Сколько дней охватывает ряд (для честных подписей «за N дн.»). */
+   170→function spanDays(h: Hive): number {
+   171→  if (h.series.length < 2) return h.series.length
+   172→  const a = new Date(h.series[0].date).getTime()
+   173→  const b = new Date(h.series[h.series.length - 1].date).getTime()
+   174→  if (Number.isNaN(a) || Number.isNaN(b)) return h.series.length
+   175→  return Math.round((b - a) / 86400000) + 1
+   176→}
+   177→
+   178→function periodLabel(h: Hive, lang: Lang): string {
+   179→  const d = spanDays(h)
+   180→  if (d >= 25) return tr(lang, 'agent.period.month')
+   181→  if (d === 1) return tr(lang, 'agent.period.day')
+   182→  if (d === 0) return tr(lang, 'agent.period.dash')
+   183→  return tr(lang, 'agent.period.days', { n: d })
+   184→}
+   185→
+   186→/** Первая буква — заглавная (метрики вида «За месяц» и причины находок). */
+   187→function cap(s: string): string {
+   188→  return s.charAt(0).toUpperCase() + s.slice(1)
+   189→}
+   190→
+   191→/** Порог срабатывания «падения веса» (признак возможного роения). */
+   192→const SWARM_DROP = -1.0
+   193→
+   194→function swarmProbability(drop: number, lang: Lang): string {
+   195→  const p = drop <= -3 ? 80 : drop <= -2 ? 70 : drop <= -1.5 ? 62 : 55
+   196→  return tr(lang, 'agent.swarm.prob', { p })
+   197→}
+   198→
+   199→/* ------------------------------------------------------------------ */
+   200→/* Находки агента (карточки на дашборде)                               */
+   201→/* ------------------------------------------------------------------ */
+   202→
+   203→/** Ярлыки статуса hiveStatus (hive-model.ts) → ключи перевода. */
+   204→const STATUS_LABEL_KEYS: Record<string, string> = {
+   205→  'Нет данных': 'agent.level.nodata',
+   206→  'Риск роения': 'agent.level.risk',
+   207→  'Слабый привес': 'agent.level.watchGain',
+   208→  'Датчик молчит': 'agent.level.sensorSilent',
+   209→  'Штатный режим': 'agent.level.ok',
+   210→}
+   211→
+   212→function hiveFinding(h: Hive, ctx: AgentContext): AgentFinding {
+   213→  const l = ctx.lang ?? 'ru'
+   214→  const status = hiveStatus(h, ctx.hives)
+   215→  const d2 = delta2d(h)
+   216→  const d30 = delta30d(h)
+   217→  const t = lastPoint(h)?.tempInC ?? null
+   218→  const hum = lastHumidity(h)
+   219→
+   220→  if (h.series.length === 0 || (lastWeight(h) === null && t === null)) {
+   221→    return {
+   222→      id: `nodata-${h.id}`,
+   223→      scenario: 'status',
+   224→      hiveId: h.id,
+   225→      title: tr(l, 'agent.find.nodata.title', { n: h.id }),
+   226→      text: tr(l, 'agent.find.nodata.text', { n: h.id }),
+   227→      basis: [tr(l, 'agent.basis.db'), tr(l, 'agent.basis.measurements', { n: h.id })],
+   228→      urgency: 'this-week',
+   229→      urgencyNote: tr(l, 'agent.note.loadData'),
+   230→      probability: tr(l, 'agent.prob.nodata'),
+   231→      metrics: [{ label: tr(l, 'agent.metric.measurements'), value: String(h.series.length) }],
+   232→      prefill: tr(l, 'agent.prefill.what', { n: h.id }),
+   233→    }
+   234→  }
+   235→
+   236→  if (status.level === 'risk' && d2 !== null) {
+   237→    const peak = Math.max(...h.series.slice(-3).map((p) => p.weightKg ?? -Infinity))
+   238→    const now = lastWeight(h) ?? peak
+   239→    return {
+   240→      id: `swarm-${h.id}`,
+   241→      scenario: 'swarm',
+   242→      hiveId: h.id,
+   243→      title: tr(l, 'agent.find.swarm.title'),
+   244→      text: tr(l, 'agent.find.swarm.text', {
+   245→        n: h.id,
+   246→        w: fmtNum(Math.abs(d2)),
+   247→        peak: fmtNum(peak),
+   248→        now: fmtNum(now),
+   249→        temp: t !== null ? tr(l, 'agent.find.swarm.temp', { t: fmtNum(t) }) : '',
+   250→        hum: hum !== null ? tr(l, 'agent.find.swarm.hum', { h: fmtNum(hum, 0) }) : '',
+   251→      }),
+   252→      basis: [
+   253→        tr(l, 'agent.basis.weightChart', { n: h.id }),
+   254→        tr(l, 'agent.basis.weight2d', { w: fmtSigned(d2) }),
+   255→        ...(t !== null ? [tr(l, 'agent.basis.tempNormCheck', { t: fmtNum(t) })] : []),
+   256→        tr(l, 'agent.basis.seasonJuly'),
+   257→      ],
+   258→      urgency: 'today',
+   259→      urgencyNote: tr(l, 'agent.note.inspectTodayEvening'),
+   260→      probability: swarmProbability(d2, l),
+   261→      metrics: [
+   262→        { label: tr(l, 'agent.metric.weight2d'), value: tr(l, 'agent.value.kg', { w: fmtSigned(d2) }) },
+   263→        ...(t !== null ? [{ label: tr(l, 'agent.metric.tempIn'), value: tr(l, 'agent.value.tempC', { t: fmtNum(t) }) }] : []),
+   264→        ...(hum !== null ? [{ label: tr(l, 'agent.metric.humidity'), value: tr(l, 'agent.value.pct', { h: fmtNum(hum, 0) }) }] : []),
+   265→      ],
+   266→      prefill: tr(l, 'agent.prefill.what', { n: h.id }),
+   267→    }
+   268→  }
+   269→
+   270→  if (status.level === 'watch' && h.label !== undefined) {
+   271→    const leader = leaderOf(ctx.hives)
+   272→    const reason = !h.humiditySensorOk && h.humidityOfflineFrom
+   273→      ? tr(l, 'agent.find.slow.reasonSensor')
+   274→      : tr(l, 'agent.find.slow.reasonLeader')
+   275→    return {
+   276→      id: `slow-${h.id}`,
+   277→      scenario: 'status',
+   278→      hiveId: h.id,
+   279→      title: tr(l, 'agent.find.slow.title'),
+   280→      text: tr(l, 'agent.find.slow.text', {
+   281→        n: h.id,
+   282→        w: fmtSigned(d30 ?? 0),
+   283→        period: periodLabel(h, l),
+   284→        leader:
+   285→          leader && leader.id !== h.id
+   286→            ? tr(l, 'agent.find.slow.leader', { n: leader.id, w: fmtSigned(delta30d(leader) ?? 0) })
+   287→            : '',
+   288→        temp: t !== null ? tr(l, 'agent.inline.temp', { t: fmtNum(t) }) : '',
+   289→        reason: cap(reason),
+   290→        extra: h.humidityOfflineFrom
+   291→          ? tr(l, 'agent.find.slow.offline', { date: h.humidityOfflineFrom })
+   292→          : tr(l, 'agent.find.slow.compare'),
+   293→      }),
+   294→      basis: [
+   295→        tr(l, 'agent.basis.gainCompare'),
+   296→        tr(l, 'agent.basis.slowGain', { n: h.id, w: fmtSigned(d30 ?? 0) }),
+   297→        ...(h.humidityOfflineFrom ? [tr(l, 'agent.basis.humOffline', { date: h.humidityOfflineFrom })] : []),
+   298→      ],
+   299→      urgency: 'this-week',
+   300→      urgencyNote: tr(l, 'agent.note.checkSensorDays'),
+   301→      probability: tr(l, 'agent.prob.indirect'),
+   302→      metrics: [
+   303→        { label: tr(l, 'agent.metric.gainPeriod', { period: periodLabel(h, l) }), value: tr(l, 'agent.value.kg', { w: fmtSigned(d30 ?? 0) }) },
+   304→        ...(leader && leader.id !== h.id
+   305→          ? [{ label: tr(l, 'agent.metric.leaderN', { n: leader.id }), value: tr(l, 'agent.value.kg', { w: fmtSigned(delta30d(leader) ?? 0) }) }]
+   306→          : []),
+   307→        ...(hum !== null
+   308→          ? [{ label: tr(l, 'agent.metric.humidity'), value: tr(l, 'agent.value.pct', { h: fmtNum(hum, 0) }) }]
+   309→          : [{ label: tr(l, 'agent.metric.humidity'), value: tr(l, 'agent.metric.nodata') }]),
+   310→      ],
+   311→      prefill: tr(l, 'agent.prefill.slowGain', { n: h.id }),
+   312→    }
+   313→  }
+   314→
+   315→  return {
+   316→    id: `ok-${h.id}`,
+   317→    scenario: 'status',
+   318→    hiveId: h.id,
+   319→    title: tr(l, 'agent.find.ok.title'),
+   320→    text: tr(l, 'agent.find.ok.text', {
+   321→      n: h.id,
+   322→      w: fmtNum(lastWeight(h) ?? 0),
+   323→      g: fmtSigned(d30 ?? 0),
+   324→      period: periodLabel(h, l),
+   325→      d2: fmtSigned(d2 ?? 0),
+   326→      temp: t !== null ? tr(l, 'agent.find.ok.temp', { t: fmtNum(t) }) : '',
+   327→    }),
+   328→    basis: [
+   329→      tr(l, 'agent.basis.weightChart', { n: h.id }),
+   330→      tr(l, 'agent.basis.gain', { w: fmtSigned(d30 ?? 0) }),
+   331→      tr(l, 'agent.basis.tempOkFamily'),
+   332→    ],
+   333→    urgency: 'ok',
+   334→    urgencyNote: tr(l, 'agent.note.observe'),
+   335→    metrics: [
+   336→      { label: tr(l, 'agent.metric.gainPeriod', { period: periodLabel(h, l) }), value: tr(l, 'agent.value.kg', { w: fmtSigned(d30 ?? 0) }) },
+   337→      ...(t !== null ? [{ label: tr(l, 'agent.metric.tempIn'), value: tr(l, 'agent.value.tempC', { t: fmtNum(t) }) }] : []),
+   338→      ...(hum !== null ? [{ label: tr(l, 'agent.metric.humidity'), value: tr(l, 'agent.value.pct', { h: fmtNum(hum, 0) }) }] : []),
+   339→    ],
+   340→    prefill: tr(l, 'agent.prefill.whatOk', { n: h.id }),
+   341→  }
+   342→}
+   343→
+   344→function pesticideFindingOf(ctx: AgentContext): AgentFinding | null {
+   345→  const a = ctx.pesticide
+   346→  if (!a) return null
+   347→  const l = ctx.lang ?? 'ru'
+   348→  return {
+   349→    id: 'pesticide',
+   350→    scenario: 'pesticide',
+   351→    hiveId: null,
+   352→    title: tr(l, 'agent.find.pest.title', { d: fmtNum(a.distanceKm) }),
+   353→    text: tr(l, 'agent.find.pest.text', {
+   354→      date: a.dateLabel,
+   355→      crop: a.crop,
+   356→      field: a.field,
+   357→      d: fmtNum(a.distanceKm),
+   358→      wind: a.windNote,
+   359→    }),
+   360→    basis: [
+   361→      tr(l, 'agent.basis.gisCoords'),
+   362→      tr(l, 'agent.basis.sourceDate', { source: cap(a.source), date: a.dateLabel }),
+   363→      tr(l, 'agent.basis.distInside', { d: fmtNum(a.distanceKm) }),
+   364→      tr(l, 'agent.basis.windForecast'),
+   365→    ],
+   366→    urgency: 'act-now',
+   367→    urgencyNote: tr(l, 'agent.find.pest.note'),
+   368→    probability: tr(l, 'agent.prob.riskHigh'),
+   369→    metrics: [
+   370→      { label: tr(l, 'agent.metric.distance'), value: tr(l, 'agent.value.km', { d: fmtNum(a.distanceKm) }) },
+   371→      { label: tr(l, 'agent.metric.treatDate'), value: a.dateLabel },
+   372→      { label: tr(l, 'agent.metric.flightRadius'), value: tr(l, 'agent.value.radiusFlight') },
+   373→    ],
+   374→    prefill: tr(l, 'agent.prefill.pest'),
+   375→  }
+   376→}
+   377→
+   378→function weatherFindingOf(ctx: AgentContext): AgentFinding | null {
+   379→  const w = ctx.weather
+   380→  if (!w || w.length === 0) return null
+   381→  const good = w.filter((d) => d.flight === 'good')
+   382→  const bad = w.filter((d) => d.flight === 'bad')
+   383→  const tMax = Math.max(...w.map((d) => d.tMax))
+   384→  const rainProb = bad.length ? Math.max(...bad.map((d) => d.precipProb)) : 0
+   385→  const l = ctx.lang ?? 'ru'
+   386→  return {
+   387→    id: 'weather',
+   388→    scenario: 'weather',
+   389→    hiveId: null,
+   390→    title: good.length
+   391→      ? tr(l, 'agent.find.weather.title', { days: good.map((d) => dayMonth(d.date, l)).join(', ').slice(0, 80) })
+   392→      : tr(l, 'agent.find.weather.titleBad'),
+   393→    text: good.length
+   394→      ? tr(l, 'agent.find.weather.textGood', {
+   395→          list: good.map((d) => d.full).join(', '),
+   396→          tmax: fmtSigned(tMax, 0),
+   397→          wind: Math.max(...good.map((d) => d.windMs)),
+   398→          bad: bad.length
+   399→            ? tr(l, 'agent.find.weather.bad', {
+   400→                days: bad.map((d) => d.full).join(tr(l, 'agent.misc.and')),
+   401→                p: rainProb,
+   402→                wind: Math.max(...bad.map((d) => d.windMs)),
+   403→              })
+   404→            : '',
+   405→        })
+   406→      : tr(l, 'agent.find.weather.textBad'),
+   407→    basis: [tr(l, 'agent.basis.weather'), tr(l, 'agent.basis.bloomCalendar')],
+   408→    urgency: 'ok',
+   409→    urgencyNote: good.length ? tr(l, 'agent.note.useFlightWindow') : tr(l, 'agent.note.watchWeather'),
+   410→    metrics: [
+   411→      { label: tr(l, 'agent.metric.max'), value: tr(l, 'agent.value.tempC', { t: fmtSigned(tMax, 0) }) },
+   412→      ...(bad.length ? [{ label: tr(l, 'agent.metric.rain'), value: tr(l, 'agent.value.uptoPct', { p: rainProb }) }] : []),
+   413→      ...(ctx.sites.length
+   414→        ? [{ label: tr(l, 'agent.metric.migrationCandidates'), value: String(ctx.sites.length) }]
+   415→        : []),
+   416→    ],
+   417→    prefill: tr(l, 'agent.prefill.weather'),
+   418→  }
+   419→}
+   420→
+   421→/** «2026-07-20» → «20 июля» — форма «число + месяц» для заголовка находки. */
+   422→function dayMonth(date: string, lang: Lang): string {
+   423→  const m = Number(date.slice(5, 7))
+   424→  return tr(lang, 'agent.date.dayMonth', {
+   425→    d: Number(date.slice(8)),
+   426→    m: m >= 1 && m <= 12 ? tr(lang, `agent.month.${m}`) : '',
+   427→  })
+   428→}
+   429→
+   430→function migrationFindingOf(ctx: AgentContext): AgentFinding | null {
+   431→  const sites = [...ctx.sites].sort((a, b) => b.score - a.score)
+   432→  if (!sites.length) return null
+   433→  const best = sites[0]
+   434→  const worst = sites[sites.length - 1]
+   435→  const l = ctx.lang ?? 'ru'
+   436→  const counted = `${sites.length} ${tr(
+   437→    l,
+   438→    sites.length === 1 ? 'agent.unit.site.one' : sites.length < 5 ? 'agent.unit.site.few' : 'agent.unit.site.many',
+   439→  )}`
+   440→  return {
+   441→    id: 'migration',
+   442→    scenario: 'migration',
+   443→    hiveId: null,
+   444→    title: tr(l, 'agent.find.mig.title', { name: best.name }),
+   445→    text: tr(l, 'agent.find.mig.text', {
+   446→      counted,
+   447→      name: best.name,
+   448→      plant: best.honeyPlant.toLowerCase(),
+   449→      bloom: best.bloomWindow,
+   450→      d: fmtNum(best.distanceKm),
+   451→      weather: best.weatherNote.toLowerCase(),
+   452→      risks: best.risks ? tr(l, 'agent.find.mig.risks', { r: best.risks.toLowerCase() }) : '',
+   453→      avoid:
+   454→        sites.length > 1 && worst.verdict === 'avoid'
+   455→          ? tr(l, 'agent.find.mig.avoid', {
+   456→              name: worst.name.replace(/^Донниковое поле \(/, '').replace(/\)$/, ''),
+   457→              r: worst.risks.toLowerCase() || tr(l, 'agent.find.mig.lowScore'),
+   458→            })
+   459→          : '',
+   460→    }),
+   461→    basis: [tr(l, 'agent.basis.gisPlants'), tr(l, 'agent.basis.weatherSites'), tr(l, 'agent.basis.pestRegistry')],
+   462→    urgency: 'this-week',
+   463→    urgencyNote: tr(l, 'agent.note.decideBeforeBloom'),
+   464→    metrics: [
+   465→      { label: tr(l, 'agent.metric.bestSite'), value: tr(l, 'agent.value.score10', { s: fmtNum(best.score) }) },
+   466→      { label: tr(l, 'agent.metric.distance'), value: tr(l, 'agent.value.km', { d: fmtNum(best.distanceKm) }) },
+   467→      { label: tr(l, 'agent.metric.bloom'), value: best.bloomWindow },
+   468→    ],
+   469→    prefill: tr(l, 'agent.prefill.migration'),
+   470→  }
+   471→}
+   472→
+   473→/** Список находок: по выбранному улью + глобальные сценарии, отсортированы по срочности. */
+   474→export function findingsFor(hiveId: number, ctx: AgentContext): AgentFinding[] {
+   475→  const hive = ctx.hives.find((x) => x.id === hiveId) ?? ctx.hives[0]
+   476→  const list: AgentFinding[] = []
+   477→  if (hive) list.push(hiveFinding(hive, ctx))
+   478→  const pesticide = pesticideFindingOf(ctx)
+   479→  if (pesticide) list.push(pesticide)
+   480→  const weatherF = weatherFindingOf(ctx)
+   481→  if (weatherF) list.push(weatherF)
+   482→  const migrationF = migrationFindingOf(ctx)
+   483→  if (migrationF) list.push(migrationF)
+   484→  const rank: Record<Urgency, number> = { 'act-now': 0, today: 1, 'this-week': 2, ok: 3 }
+   485→  return list.sort((a, b) => rank[a.urgency] - rank[b.urgency])
+   486→}
+   487→
+   488→/* ------------------------------------------------------------------ */
+   489→/* Ответы на вопросы пчеловода                                         */
+   490→/* ------------------------------------------------------------------ */
+   491→
+   492→function norm(s: string): string {
+   493→  return s.toLowerCase().replace(/ё/g, 'е')
+   494→}
+   495→
+   496→function extractHiveId(q: string, ctx: AgentContext): number | null {
+   497→  const m = q.match(/(?:№|улье|улья|улью|улье|hive)\s*№?\s*(\d+)/)
+   498→  if (!m) return null
+   499→  const id = Number(m[1])
+   500→  return ctx.hives.some((h) => h.id === id) ? id : null
+   501→}
+   502→
+   503→function swarmAnswer(h: Hive, ctx: AgentContext): AgentMessage {
+   504→  const l = ctx.lang ?? 'ru'
+   505→  const status = hiveStatus(h, ctx.hives)
+   506→  const d2 = delta2d(h)
+   507→  const t = lastPoint(h)?.tempInC ?? null
+   508→  const hum = lastHumidity(h)
+   509→
+   510→  if (h.series.length === 0 || (lastWeight(h) === null && d2 === null)) {
+   511→    return {
+   512→      scenario: 'swarm',
+   513→      hiveId: h.id,
+   514→      text: tr(l, 'agent.swarm.nodata.text', { n: h.id }),
+   515→      basis: [tr(l, 'agent.basis.db'), tr(l, 'agent.basis.measurements', { n: h.id })],
+   516→      urgency: 'this-week',
+   517→      urgencyNote: tr(l, 'agent.note.loadData'),
+   518→      probability: tr(l, 'agent.prob.nodata'),
+   519→      metrics: [{ label: tr(l, 'agent.metric.weightData'), value: tr(l, 'agent.value.no') }],
+   520→    }
+   521→  }
+   522→
+   523→  if (status.level === 'risk' && d2 !== null) {
+   524→    const peak = Math.max(...h.series.slice(-3).map((p) => p.weightKg ?? -Infinity))
+   525→    const now = lastWeight(h) ?? peak
+   526→    return {
+   527→      scenario: 'swarm',
+   528→      hiveId: h.id,
+   529→      text: tr(l, 'agent.swarm.risk.text', {
+   530→        n: h.id,
+   531→        w: fmtNum(Math.abs(d2)),
+   532→        peak: fmtNum(peak),
+   533→        now: fmtNum(now),
+   534→        temp: t !== null ? tr(l, 'agent.swarm.risk.temp', { t: fmtNum(t) }) : '',
+   535→        hum: hum !== null ? tr(l, 'agent.swarm.risk.hum', { h: fmtNum(hum, 0) }) : '',
+   536→      }),
+   537→      basis: [
+   538→        tr(l, 'agent.basis.weightChart', { n: h.id }),
+   539→        tr(l, 'agent.basis.weight2d', { w: fmtSigned(d2) }),
+   540→        ...(t !== null ? [tr(l, 'agent.basis.tempNormValue', { t: fmtNum(t) })] : []),
+   541→        tr(l, 'agent.basis.seasonJuly'),
+   542→      ],
+   543→      urgency: 'today',
+   544→      urgencyNote: tr(l, 'agent.note.inspectToday'),
+   545→      probability: swarmProbability(d2, l),
+   546→      metrics: [
+   547→        { label: tr(l, 'agent.metric.weight2d'), value: tr(l, 'agent.value.kg', { w: fmtSigned(d2) }) },
+   548→        ...(t !== null ? [{ label: tr(l, 'agent.metric.tempIn'), value: tr(l, 'agent.value.tempC', { t: fmtNum(t) }) }] : []),
+   549→        ...(hum !== null ? [{ label: tr(l, 'agent.metric.humidity'), value: tr(l, 'agent.value.pct', { h: fmtNum(hum, 0) }) }] : []),
+   550→      ],
+   551→    }
+   552→  }
+   553→
+   554→  return {
+   555→    scenario: 'swarm',
+   556→    hiveId: h.id,
+   557→    text: tr(l, 'agent.swarm.ok.text', {
+   558→      n: h.id,
+   559→      d2: fmtSigned(d2 ?? 0),
+   560→      temp: t !== null ? tr(l, 'agent.inline.temp', { t: fmtNum(t) }) : '',
+   561→    }),
+   562→    basis: [
+   563→      tr(l, 'agent.basis.weightChart', { n: h.id }),
+   564→      tr(l, 'agent.basis.swarmSignsCompare'),
+   565→      tr(l, 'agent.basis.tempOkFamily'),
+   566→    ],
+   567→    urgency: 'ok',
+   568→    urgencyNote: tr(l, 'agent.note.observeSignal'),
+   569→    probability: tr(l, 'agent.prob.noSwarmSigns'),
+   570→    metrics: [
+   571→      { label: tr(l, 'agent.metric.weight2d'), value: tr(l, 'agent.value.kg', { w: fmtSigned(d2 ?? 0) }) },
+   572→      ...(t !== null ? [{ label: tr(l, 'agent.metric.tempIn'), value: tr(l, 'agent.value.tempC', { t: fmtNum(t) }) }] : []),
+   573→      { label: tr(l, 'agent.metric.humidity'), value: hum !== null ? tr(l, 'agent.value.pct', { h: fmtNum(hum, 0) }) : tr(l, 'agent.metric.nodata') },
+   574→    ],
+   575→  }
+   576→}
+   577→
+   578→function statusAnswer(h: Hive, ctx: AgentContext): AgentMessage {
+   579→  const l = ctx.lang ?? 'ru'
+   580→  const status = hiveStatus(h, ctx.hives)
+   581→  const d2 = delta2d(h)
+   582→  const d30 = delta30d(h)
+   583→  const t = lastPoint(h)?.tempInC ?? null
+   584→  const hum = lastHumidity(h)
+   585→  const w = lastWeight(h)
+   586→
+   587→  if (h.series.length === 0) {
+   588→    return {
+   589→      scenario: 'status',
+   590→      hiveId: h.id,
+   591→      text: tr(l, 'agent.status.nodata.text', { n: h.id }),
+   592→      basis: [tr(l, 'agent.basis.db')],
+   593→      urgency: 'this-week',
+   594→      urgencyNote: tr(l, 'agent.note.loadData'),
+   595→      probability: tr(l, 'agent.prob.insufficient'),
+   596→      metrics: [{ label: tr(l, 'agent.metric.measurements'), value: '0' }],
+   597→    }
+   598→  }
+   599→
+   600→  if (status.level === 'risk' && d2 !== null) {
+   601→    const peak = Math.max(...h.series.slice(-3).map((p) => p.weightKg ?? -Infinity))
+   602→    return {
+   603→      scenario: 'swarm',
+   604→      hiveId: h.id,
+   605→      text: tr(l, 'agent.status.risk.text', {
+   606→        n: h.id,
+   607→        peak: fmtNum(peak),
+   608→        w: fmtNum(w ?? 0),
+   609→        drop: fmtNum(Math.abs(d2)),
+   610→        temp: t !== null ? tr(l, 'agent.status.risk.temp', { t: fmtNum(t) }) : '',
+   611→      }),
+   612→      basis: [
+   613→        tr(l, 'agent.basis.weightChart', { n: h.id }),
+   614→        tr(l, 'agent.basis.weight2d', { w: fmtSigned(d2) }),
+   615→        ...(t !== null ? [tr(l, 'agent.basis.tempHigh')] : []),
+   616→        tr(l, 'agent.basis.seasonJuly'),
+   617→      ],
+   618→      urgency: 'today',
+   619→      urgencyNote: tr(l, 'agent.note.inspectShort'),
+   620→      probability: swarmProbability(d2, l),
+   621→      metrics: [
+   622→        { label: tr(l, 'agent.metric.weightNow'), value: tr(l, 'agent.value.kg', { w: fmtNum(w ?? 0) }) },
+   623→        { label: tr(l, 'agent.metric.weight2d'), value: tr(l, 'agent.value.kg', { w: fmtSigned(d2) }) },
+   624→        ...(t !== null ? [{ label: tr(l, 'agent.metric.tempIn'), value: tr(l, 'agent.value.tempC', { t: fmtNum(t) }) }] : []),
+   625→      ],
+   626→    }
+   627→  }
+   628→
+   629→  if (status.level === 'watch') {
+   630→    const leader = leaderOf(ctx.hives)
+   631→    return {
+   632→      scenario: 'status',
+   633→      hiveId: h.id,
+   634→      text: tr(l, 'agent.status.watch.text', {
+   635→        n: h.id,
+   636→        w: fmtSigned(d30 ?? 0),
+   637→        period: periodLabel(h, l),
+   638→        leader:
+   639→          leader && leader.id !== h.id
+   640→            ? tr(l, 'agent.status.watch.leader', { n: leader.id, w: fmtSigned(delta30d(leader) ?? 0) })
+   641→            : '',
+   642→        temp: t !== null ? tr(l, 'agent.inline.temp', { t: fmtNum(t) }) : '',
+   643→        extra:
+   644→          !h.humiditySensorOk && h.humidityOfflineFrom
+   645→            ? tr(l, 'agent.status.watch.extraSensor', { date: h.humidityOfflineFrom })
+   646→            : tr(l, 'agent.status.watch.extraVisit'),
+   647→      }),
+   648→      basis: [
+   649→        tr(l, 'agent.basis.gainCompare'),
+   650→        ...(h.humidityOfflineFrom ? [tr(l, 'agent.basis.humOffline', { date: h.humidityOfflineFrom })] : []),
+   651→        tr(l, 'agent.basis.tempOk'),
+   652→      ],
+   653→      urgency: 'this-week',
+   654→      urgencyNote: tr(l, 'agent.note.checkFamily'),
+   655→      probability: tr(l, 'agent.prob.indirectShort'),
+   656→      metrics: [
+   657→        { label: tr(l, 'agent.metric.gainPeriod', { period: periodLabel(h, l) }), value: tr(l, 'agent.value.kg', { w: fmtSigned(d30 ?? 0) }) },
+   658→        ...(leader && leader.id !== h.id
+   659→          ? [{ label: tr(l, 'agent.metric.leaderN', { n: leader.id }), value: tr(l, 'agent.value.kg', { w: fmtSigned(delta30d(leader) ?? 0) }) }]
+   660→          : []),
+   661→        { label: tr(l, 'agent.metric.humidity'), value: hum !== null ? tr(l, 'agent.value.pct', { h: fmtNum(hum, 0) }) : tr(l, 'agent.metric.nodata') },
+   662→      ],
+   663→    }
+   664→  }
+   665→
+   666→  return {
+   667→    scenario: 'status',
+   668→    hiveId: h.id,
+   669→    text: tr(l, 'agent.status.ok.text', {
+   670→      n: h.id,
+   671→      w: fmtNum(w ?? 0),
+   672→      g: fmtSigned(d30 ?? 0),
+   673→      period: periodLabel(h, l),
+   674→      d2: fmtSigned(d2 ?? 0),
+   675→      temp: t !== null ? tr(l, 'agent.inline.temp', { t: fmtNum(t) }) : '',
+   676→      hum: hum !== null ? tr(l, 'agent.inline.hum', { h: fmtNum(hum, 0) }) : '',
+   677→    }),
+   678→    basis: [
+   679→      tr(l, 'agent.basis.weightChart', { n: h.id }),
+   680→      tr(l, 'agent.basis.gain', { w: fmtSigned(d30 ?? 0) }),
+   681→      tr(l, 'agent.basis.tempHumOk'),
+   682→    ],
+   683→    urgency: 'ok',
+   684→    urgencyNote: tr(l, 'agent.note.observe'),
+   685→    metrics: [
+   686→      { label: tr(l, 'agent.metric.weightNow'), value: tr(l, 'agent.value.kg', { w: fmtNum(w ?? 0) }) },
+   687→      { label: tr(l, 'agent.metric.gainMonth'), value: tr(l, 'agent.value.kg', { w: fmtSigned(d30 ?? 0) }) },
+   688→      ...(t !== null ? [{ label: tr(l, 'agent.metric.tempIn'), value: tr(l, 'agent.value.tempC', { t: fmtNum(t) }) }] : []),
+   689→    ],
+   690→  }
+   691→}
+   692→
+   693→function weightAnswer(h: Hive, ctx: AgentContext): AgentMessage {
+   694→  const l = ctx.lang ?? 'ru'
+   695→  const d2 = delta2d(h)
+   696→  const d30 = delta30d(h)
+   697→  const w = lastWeight(h)
+   698→  const risky = d2 !== null && d2 <= SWARM_DROP
+   699→
+   700→  if (h.series.length === 0 || w === null) {
+   701→    return {
+   702→      scenario: 'status',
+   703→      hiveId: h.id,
+   704→      text: tr(l, 'agent.weight.nodata.text', { n: h.id }),
+   705→      basis: [tr(l, 'agent.basis.db')],
+   706→      urgency: 'this-week',
+   707→      urgencyNote: tr(l, 'agent.note.loadData'),
+   708→      probability: tr(l, 'agent.prob.insufficient'),
+   709→      metrics: [{ label: tr(l, 'agent.metric.weight'), value: tr(l, 'agent.metric.nodata') }],
+   710→    }
+   711→  }
+   712→
+   713→  const others = ctx.hives
+   714→    .map((x) => ({ x, d: delta30d(x) }))
+   715→    .filter((o): o is { x: Hive; d: number } => o.d !== null)
+   716→    .map((o) => tr(l, 'agent.item.hiveGain', { n: o.x.id, w: fmtSigned(o.d) }))
+   717→    .join(', ')
+   718→
+   719→  return {
+   720→    scenario: 'status',
+   721→    hiveId: h.id,
+   722→    text: tr(l, 'agent.weight.text', {
+   723→      n: h.id,
+   724→      w: fmtNum(w),
+   725→      d2: fmtSigned(d2 ?? 0),
+   726→      period: periodLabel(h, l),
+   727→      d30: fmtSigned(d30 ?? 0),
+   728→      risky: risky ? tr(l, 'agent.weight.risky') : '',
+   729→      others: others || tr(l, 'agent.weight.noOthers'),
+   730→    }),
+   731→    basis: [
+   732→      tr(l, 'agent.basis.weightChart', { n: h.id }),
+   733→      tr(l, 'agent.basis.gainAll'),
+   734→      tr(l, 'agent.basis.ruleGain'),
+   735→    ],
+   736→    urgency: risky ? 'today' : 'ok',
+   737→    urgencyNote: risky ? tr(l, 'agent.note.checkToday') : tr(l, 'agent.note.observe'),
+   738→    probability: risky ? tr(l, 'agent.prob.matchesSwarm') : undefined,
+   739→    metrics: [
+   740→      { label: tr(l, 'agent.metric.weightNow'), value: tr(l, 'agent.value.kg', { w: fmtNum(w) }) },
+   741→      { label: tr(l, 'agent.metric.days2'), value: tr(l, 'agent.value.kg', { w: fmtSigned(d2 ?? 0) }) },
+   742→      { label: cap(periodLabel(h, l)), value: tr(l, 'agent.value.kg', { w: fmtSigned(d30 ?? 0) }) },
+   743→    ],
+   744→  }
+   745→}
+   746→
+   747→function humidityAnswer(h: Hive, ctx: AgentContext): AgentMessage {
+   748→  const l = ctx.lang ?? 'ru'
+   749→  const hum = lastHumidity(h)
+   750→  const offline = !h.humiditySensorOk && h.humidityOfflineFrom
+   751→
+   752→  if (h.series.length === 0) {
+   753→    return {
+   754→      scenario: 'status',
+   755→      hiveId: h.id,
+   756→      text: tr(l, 'agent.humidity.nodata.text', { n: h.id }),
+   757→      basis: [tr(l, 'agent.basis.db')],
+   758→      urgency: 'this-week',
+   759→      urgencyNote: tr(l, 'agent.note.loadData'),
+   760→      probability: tr(l, 'agent.prob.insufficient'),
+   761→      metrics: [{ label: tr(l, 'agent.metric.humidity'), value: tr(l, 'agent.metric.nodata') }],
+   762→    }
+   763→  }
+   764→
+   765→  if (offline || hum === null) {
+   766→    const t = lastPoint(h)?.tempInC
+   767→    const d30 = delta30d(h)
+   768→    return {
+   769→      scenario: 'status',
+   770→      hiveId: h.id,
+   771→      text: tr(l, 'agent.humidity.offline.text', {
+   772→        n: h.id,
+   773→        since: h.humidityOfflineFrom ? tr(l, 'agent.inline.since', { date: h.humidityOfflineFrom }) : '',
+   774→        w: fmtSigned(delta30d(h) ?? 0),
+   775→        period: periodLabel(h, l),
+   776→        temp: t != null ? tr(l, 'agent.inline.temp', { t: fmtNum(t) }) : '',
+   777→      }),
+   778→      basis: [
+   779→        tr(l, 'agent.basis.humSensorNodata', {
+   780→          n: h.id,
+   781→          since: h.humidityOfflineFrom ? tr(l, 'agent.inline.since', { date: h.humidityOfflineFrom }) : '',
+   782→        }),
+   783→        tr(l, 'agent.basis.gainPeriod', { w: fmtSigned(d30 ?? 0), period: periodLabel(h, l) }),
+   784→      ],
+   785→      urgency: 'this-week',
+   786→      urgencyNote: tr(l, 'agent.note.checkSensor'),
+   787→      probability: tr(l, 'agent.prob.insufficientHonest'),
+   788→      metrics: [
+   789→        { label: tr(l, 'agent.metric.humidity'), value: tr(l, 'agent.metric.nodata') },
+   790→        { label: tr(l, 'agent.metric.gainMonth'), value: tr(l, 'agent.value.kg', { w: fmtSigned(d30 ?? 0) }) },
+   791→        ...(t != null ? [{ label: tr(l, 'agent.metric.tempIn'), value: tr(l, 'agent.value.tempC', { t: fmtNum(t) }) }] : []),
+   792→      ],
+   793→    }
+   794→  }
+   795→
+   796→  const verdict =
+   797→    hum > 70
+   798→      ? tr(l, 'agent.humidity.verdictWet')
+   799→      : hum > 64
+   800→        ? tr(l, 'agent.humidity.verdictUpper')
+   801→        : tr(l, 'agent.humidity.verdictOk')
+   802→  return {
+   803→    scenario: 'status',
+   804→    hiveId: h.id,
+   805→    text: tr(l, 'agent.humidity.text', { n: h.id, h: fmtNum(hum, 0), verdict }),
+   806→    basis: [tr(l, 'agent.basis.humSensor', { n: h.id }), tr(l, 'agent.basis.normHum')],
+   807→    urgency: hum > 70 ? 'today' : 'ok',
+   808→    urgencyNote: hum > 70 ? tr(l, 'agent.note.ventilation') : tr(l, 'agent.note.observe'),
+   809→    metrics: [
+   810→      { label: tr(l, 'agent.metric.humidity'), value: tr(l, 'agent.value.pct', { h: fmtNum(hum, 0) }) },
+   811→      { label: tr(l, 'agent.metric.norm'), value: tr(l, 'agent.value.humNorm') },
+   812→    ],
+   813→  }
+   814→}
+   815→
+   816→function climateAnswer(h: Hive, ctx: AgentContext): AgentMessage {
+   817→  const l = ctx.lang ?? 'ru'
+   818→  const t = lastPoint(h)?.tempInC ?? null
+   819→  const risky = hiveStatus(h, hiveStatusArgFallback(h)).level === 'risk'
+   820→
+   821→  if (t === null) {
+   822→    return {
+   823→      scenario: 'status',
+   824→      hiveId: h.id,
+   825→      text: tr(l, 'agent.climate.nodata.text', { n: h.id }),
+   826→      basis: [tr(l, 'agent.basis.db')],
+   827→      urgency: 'this-week',
+   828→      urgencyNote: tr(l, 'agent.note.loadData'),
+   829→      probability: tr(l, 'agent.prob.insufficient'),
+   830→      metrics: [{ label: tr(l, 'agent.metric.tempIn'), value: tr(l, 'agent.metric.nodata') }],
+   831→    }
+   832→  }
+   833→
+   834→  return {
+   835→    scenario: risky ? 'swarm' : 'status',
+   836→    hiveId: h.id,
+   837→    text: risky
+   838→      ? tr(l, 'agent.climate.risk.text', { n: h.id, t: fmtNum(t), dt: fmtNum(t - 34.5) })
+   839→      : tr(l, 'agent.climate.ok.text', { n: h.id, t: fmtNum(t) }),
+   840→    basis: [
+   841→      tr(l, 'agent.basis.tempSensor', { n: h.id }),
+   842→      tr(l, 'agent.basis.normTemp'),
+   843→      ...(risky ? [tr(l, 'agent.basis.joint')] : []),
+   844→    ],
+   845→    urgency: risky ? 'today' : 'ok',
+   846→    urgencyNote: risky ? tr(l, 'agent.note.inspectShort') : tr(l, 'agent.note.observe'),
+   847→    probability: risky ? tr(l, 'agent.prob.joint') : undefined,
+   848→    metrics: [
+   849→      { label: tr(l, 'agent.metric.tempNow'), value: tr(l, 'agent.value.tempC', { t: fmtNum(t) }) },
+   850→      { label: tr(l, 'agent.metric.norm'), value: tr(l, 'agent.value.tempNorm') },
+   851→    ],
+   852→  }
+   853→}
+   854→
+   855→/** Для climateAnswer статус проверяется по одному улью без сравнения с пасекой. */
+   856→function hiveStatusArgFallback(h: Hive): Hive[] {
+   857→  return [h]
+   858→}
+   859→
+   860→function pesticideAnswer(ctx: AgentContext): AgentMessage {
+   861→  const l = ctx.lang ?? 'ru'
+   862→  const a = ctx.pesticide
+   863→  if (!a) {
+   864→    return {
+   865→      scenario: 'pesticide',
+   866→      hiveId: null,
+   867→      text: tr(l, 'agent.pest.none.text'),
+   868→      basis: [tr(l, 'agent.basis.pestOff')],
+   869→      urgency: 'ok',
+   870→      urgencyNote: tr(l, 'agent.note.sourceOff'),
+   871→      probability: tr(l, 'agent.prob.insufficient'),
+   872→      metrics: [{ label: tr(l, 'agent.metric.pestRegistry'), value: tr(l, 'agent.metric.nodata') }],
+   873→    }
+   874→  }
+   875→  return {
+   876→    scenario: 'pesticide',
+   877→    hiveId: null,
+   878→    text: tr(l, 'agent.pest.alert.text', {
+   879→      date: a.dateLabel,
+   880→      crop: a.crop,
+   881→      field: a.field,
+   882→      d: fmtNum(a.distanceKm),
+   883→      wind: a.windNote,
+   884→    }),
+   885→    basis: [
+   886→      tr(l, 'agent.basis.gisCoords'),
+   887→      tr(l, 'agent.basis.sourceDate', { source: cap(a.source), date: a.dateLabel }),
+   888→      tr(l, 'agent.basis.radiusFlight'),
+   889→      tr(l, 'agent.basis.windForecast'),
+   890→    ],
+   891→    urgency: 'act-now',
+   892→    urgencyNote: tr(l, 'agent.pest.alert.note', { date: a.dateShort }),
+   893→    probability: tr(l, 'agent.prob.riskHigh'),
+   894→    metrics: [
+   895→      { label: tr(l, 'agent.metric.field'), value: tr(l, 'agent.value.cropKm', { crop: a.crop, d: fmtNum(a.distanceKm) }) },
+   896→      { label: tr(l, 'agent.metric.treatment'), value: a.dateLabel },
+   897→      { label: tr(l, 'agent.metric.wind'), value: tr(l, 'agent.value.towardApiary') },
+   898→    ],
+   899→  }
+   900→}
+   901→
+   902→function weatherAnswer(ctx: AgentContext): AgentMessage {
+   903→  const l = ctx.lang ?? 'ru'
+   904→  const w = ctx.weather
+   905→  if (!w || w.length === 0) {
+   906→    return {
+   907→      scenario: 'weather',
+   908→      hiveId: null,
+   909→      text: tr(l, 'agent.weather.none.text'),
+   910→      basis: [tr(l, 'agent.basis.weatherOff'), tr(l, 'agent.basis.weightIndirect')],
+   911→      urgency: 'ok',
+   912→      urgencyNote: tr(l, 'agent.note.sourceOff'),
+   913→      probability: tr(l, 'agent.prob.insufficient'),
+   914→      metrics: [{ label: tr(l, 'agent.metric.forecast'), value: tr(l, 'agent.metric.nodata') }],
+   915→    }
+   916→  }
+   917→  const good = w.filter((d) => d.flight === 'good')
+   918→  const bad = w.filter((d) => d.flight === 'bad')
+   919→  const days = (arr: WeatherDay[]) => arr.map((d) => d.full).join(', ')
+   920→  return {
+   921→    scenario: 'weather',
+   922→    hiveId: null,
+   923→    text: good.length
+   924→      ? tr(l, 'agent.weather.good.text', {
+   925→          good: days(good),
+   926→          tmax: fmtSigned(Math.max(...good.map((d) => d.tMax)), 0),
+   927→          wind: Math.max(...good.map((d) => d.windMs)),
+   928→          bad: bad.length
+   929→            ? tr(l, 'agent.weather.badPart', {
+   930→                days: days(bad),
+   931→                p: Math.max(...bad.map((d) => d.precipProb)),
+   932→                wind: Math.max(...bad.map((d) => d.windMs)),
+   933→              })
+   934→            : '',
+   935→        })
+   936→      : tr(l, 'agent.weather.bad.text'),
+   937→    basis: [
+   938→      tr(l, 'agent.basis.weather'),
+   939→      tr(l, 'agent.basis.bloomCalendar'),
+   940→      tr(l, 'agent.basis.ruleFlight'),
+   941→    ],
+   942→    urgency: 'ok',
+   943→    urgencyNote: good.length ? tr(l, 'agent.note.useFlightWindow') : tr(l, 'agent.note.observe'),
+   944→    metrics: [
+   945→      ...(good.length ? [{ label: tr(l, 'agent.metric.flightWindow'), value: good[0].full }] : []),
+   946→      ...(bad.length
+   947→        ? [{ label: tr(l, 'agent.metric.rain'), value: tr(l, 'agent.value.uptoPct', { p: Math.max(...bad.map((d) => d.precipProb)) }) }]
+   948→        : []),
+   949→    ],
+   950→  }
+   951→}
+   952→
+   953→function migrationAnswer(ctx: AgentContext): AgentMessage {
+   954→  const l = ctx.lang ?? 'ru'
+   955→  const sites = [...ctx.sites].sort((a, b) => b.score - a.score)
+   956→  if (!sites.length) {
+   957→    return {
+   958→      scenario: 'migration',
+   959→      hiveId: null,
+   960→      text: tr(l, 'agent.mig.none.text'),
+   961→      basis: [tr(l, 'agent.basis.sitesEmpty')],
+   962→      urgency: 'this-week',
+   963→      urgencyNote: tr(l, 'agent.note.addSites'),
+   964→      probability: tr(l, 'agent.prob.insufficient'),
+   965→      metrics: [{ label: tr(l, 'agent.metric.sites'), value: '0' }],
+   966→    }
+   967→  }
+   968→  const best = sites[0]
+   969→  const worst = sites[sites.length - 1]
+   970→  const counted = `${sites.length} ${tr(
+   971→    l,
+   972→    sites.length === 1 ? 'agent.unit.site.one' : sites.length < 5 ? 'agent.unit.site.few' : 'agent.unit.site.many',
+   973→  )}`
+   974→  return {
+   975→    scenario: 'migration',
+   976→    hiveId: null,
+   977→    text: tr(l, 'agent.mig.text', {
+   978→      counted,
+   979→      name: best.name,
+   980→      plant: best.honeyPlant.toLowerCase(),
+   981→      bloom: best.bloomWindow,
+   982→      d: fmtNum(best.distanceKm),
+   983→      weather: best.weatherNote.toLowerCase(),
+   984→      risk: best.risks ? tr(l, 'agent.mig.risk', { r: best.risks.toLowerCase() }) : '',
+   985→      list:
+   986→        sites.length > 1
+   987→          ? `\n\n${sites
+   988→              .slice(1)
+   989→              .map(
+   990→                (s) =>
+   991→                  tr(l, 'agent.mig.item', { name: s.name, score: fmtNum(s.score) }) +
+   992→                  (s.verdict === 'avoid' ? tr(l, 'agent.mig.itemAvoid') : ''),
+   993→              )
+   994→              .join('; ')}.`
+   995→          : '',
+   996→      worst:
+   997→        worst.verdict === 'avoid' && worst.risks
+   998→          ? tr(l, 'agent.mig.worst', {
+   999→              name: worst.name.replace(/^Донниковое поле \(/, '').replace(/\)$/, ''),
+  1000→              r: worst.risks.toLowerCase(),
+  1001→            })
+  1002→          : '',
+  1003→    }),
+  1004→    basis: [
+  1005→      tr(l, 'agent.basis.gisPlants'),
+  1006→      tr(l, 'agent.basis.weatherSites'),
+  1007→      tr(l, 'agent.basis.pestRegistry'),
+  1008→    ],
+  1009→    urgency: 'this-week',
+  1010→    urgencyNote: tr(l, 'agent.note.decideBeforeBloom'),
+  1011→    metrics: [
+  1012→      { label: tr(l, 'agent.metric.bestSite'), value: `«${best.name}»` },
+  1013→      { label: tr(l, 'agent.metric.score'), value: tr(l, 'agent.value.score10', { s: fmtNum(best.score) }) },
+  1014→      { label: tr(l, 'agent.metric.bloom'), value: best.bloomWindow },
+  1015→    ],
+  1016→  }
+  1017→}
+  1018→
+  1019→function greetingAnswer(ctx: AgentContext): AgentMessage {
+  1020→  const l = ctx.lang ?? 'ru'
+  1021→  const name = ctx.apiaryName ? tr(l, 'agent.inline.apiary', { name: ctx.apiaryName }) : ''
+  1022→  const withData = ctx.hives.filter((h) => h.series.length > 0).length
+  1023→  if (ctx.hives.length === 0 || withData === 0) {
+  1024→    return {
+  1025→      scenario: 'status',
+  1026→      hiveId: null,
+  1027→      text: tr(l, 'agent.greet.nodata.text', { name }),
+  1028→      basis: [tr(l, 'agent.basis.db')],
+  1029→      urgency: 'ok',
+  1030→      urgencyNote: tr(l, 'agent.note.waitingData'),
+  1031→      metrics: [{ label: tr(l, 'agent.metric.hivesData'), value: tr(l, 'agent.value.outof', { a: 0, b: ctx.hives.length || 0 }) }],
+  1032→    }
+  1033→  }
+  1034→  return {
+  1035→    scenario: 'status',
+  1036→    hiveId: null,
+  1037→    text: tr(l, 'agent.greet.text', {
+  1038→      name,
+  1039→      n: ctx.hives.length,
+  1040→      hives: tr(l, ctx.hives.length === 1 ? 'agent.unit.hive.one' : 'agent.unit.hive.many'),
+  1041→      weather: ctx.weather ? tr(l, 'agent.greet.withWeather') : '',
+  1042→      pesticide: ctx.pesticide ? tr(l, 'agent.greet.withPesticide') : '',
+  1043→    }),
+  1044→    basis: [
+  1045→      tr(l, 'agent.basis.telemetry', { a: withData, b: ctx.hives.length }),
+  1046→      ...(ctx.weather ? [tr(l, 'agent.basis.weatherShort')] : []),
+  1047→      ...(ctx.pesticide ? [tr(l, 'agent.basis.pestShort')] : []),
+  1048→      ...(ctx.sites.length ? [tr(l, 'agent.basis.sitesCount', { n: ctx.sites.length })] : []),
+  1049→    ],
+  1050→    urgency: 'ok',
+  1051→    urgencyNote: tr(l, 'agent.note.ready'),
+  1052→    metrics: [{ label: tr(l, 'agent.metric.hivesData'), value: tr(l, 'agent.value.outof', { a: withData, b: ctx.hives.length }) }],
+  1053→  }
+  1054→}
+  1055→
+  1056→/** Короткая фраза про активные датчики точек на карте (для общих ответов). */
+  1057→function pointsSummary(ctx: AgentContext): string | null {
+  1058→  const l = ctx.lang ?? 'ru'
+  1059→  const pts = (ctx.points ?? []).filter((p) => p.sensor.on && p.sensor.tempC !== null)
+  1060→  if (!pts.length) return null
+  1061→  return pts
+  1062→    .map(
+  1063→      (p) =>
+  1064→        tr(l, 'agent.pts.summary', {
+  1065→          name: p.name,
+  1066→          count: p.hiveCount,
+  1067→          t: fmtNum(p.sensor.tempC ?? 0),
+  1068→          h: fmtNum(p.sensor.humidityPct ?? 0, 0),
+  1069→          w: fmtNum(p.sensor.weightKg ?? 0),
+  1070→          n: fmtNum(p.sensor.noiseDb ?? 0, 0),
+  1071→        }),
+  1072→    )
+  1073→    .join('; ')
+  1074→}
+  1075→
+  1076→/** Сводка сразу по всем ульям — ответ на общий вопрос о пасеке. */
+  1077→function allHivesAnswer(ctx: AgentContext): AgentMessage {
+  1078→  const l = ctx.lang ?? 'ru'
+  1079→  const withData = ctx.hives.filter((h) => h.series.length > 0).length
+  1080→  const lines = ctx.hives.map((h) => {
+  1081→    const st = hiveStatus(h, ctx.hives)
+  1082→    const w = lastWeight(h)
+  1083→    const t = lastPoint(h)?.tempInC ?? null
+  1084→    const hum = lastHumidity(h)
+  1085→    const parts = [
+  1086→      w !== null ? tr(l, 'agent.value.kg', { w: fmtNum(w) }) : null,
+  1087→      t !== null ? tr(l, 'agent.all.tempIn', { t: fmtNum(t) }) : null,
+  1088→      hum !== null ? tr(l, 'agent.all.hum', { h: fmtNum(hum, 0) }) : !h.humiditySensorOk ? tr(l, 'agent.all.humSilent') : null,
+  1089→    ].filter(Boolean)
+  1090→    return tr(l, 'agent.all.line', {
+  1091→      n: h.id,
+  1092→      status: tr(l, STATUS_LABEL_KEYS[st.label] ?? 'agent.level.ok'),
+  1093→      parts: parts.join(', ') || tr(l, 'agent.metric.nodata'),
+  1094→    })
+  1095→  })
+  1096→  const leader = leaderOf(ctx.hives)
+  1097→  const w0 = ctx.weather?.[0]
+  1098→  const now = ctx.weatherNow
+  1099→  const pts = pointsSummary(ctx)
+  1100→  return {
+  1101→    scenario: 'status',
+  1102→    hiveId: null,
+  1103→    text: tr(l, 'agent.all.text', {
+  1104→      n: ctx.hives.length,
+  1105→      lines: lines.join('\n'),
+  1106→      leader: leader
+  1107→        ? tr(l, 'agent.all.leader', { n: leader.id, w: fmtSigned(delta30d(leader) ?? 0), period: periodLabel(leader, l) })
+  1108→        : '',
+  1109→      weather:
+  1110→        now || w0
+  1111→          ? tr(l, 'agent.all.weather', {
+  1112→              now: now
+  1113→                ? tr(l, 'agent.all.now', { t: fmtSigned(now.tempC, 0), text: now.text.toLowerCase(), wind: now.windKmh })
+  1114→                : '',
+  1115→              today: w0
+  1116→                ? tr(l, 'agent.all.today', {
+  1117→                    flight: tr(
+  1118→                      l,
+  1119→                      w0.flight === 'good' ? 'agent.all.flightGood' : w0.flight === 'bad' ? 'agent.all.flightBad' : 'agent.all.flightMid',
+  1120→                    ),
+  1121→                    min: fmtSigned(w0.tMin, 0),
+  1122→                    max: fmtSigned(w0.tMax, 0),
+  1123→                    p: w0.precipProb,
+  1124→                  })
+  1125→                : '',
+  1126→            })
+  1127→          : '',
+  1128→      pts: pts ? tr(l, 'agent.all.pts', { pts }) : '',
+  1129→    }),
+  1130→    basis: [
+  1131→      tr(l, 'agent.basis.telemetry', { a: withData, b: ctx.hives.length }),
+  1132→      ...(ctx.weather ? [tr(l, 'agent.basis.weatherShort')] : []),
+  1133→      ...(pts ? [tr(l, 'agent.basis.mapSensors')] : []),
+  1134→    ],
+  1135→    urgency: 'ok',
+  1136→    urgencyNote: tr(l, 'agent.note.summaryAll'),
+  1137→    metrics: [
+  1138→      { label: tr(l, 'agent.metric.hivesData'), value: tr(l, 'agent.value.outof', { a: withData, b: ctx.hives.length }) },
+  1139→      ...(leader
+  1140→        ? [{ label: tr(l, 'agent.metric.leader'), value: tr(l, 'agent.value.leaderGain', { n: leader.id, w: fmtSigned(delta30d(leader) ?? 0) }) }]
+  1141→        : []),
+  1142→      ...(now ? [{ label: tr(l, 'agent.metric.weatherNow'), value: tr(l, 'agent.value.tempC', { t: fmtSigned(now.tempC, 0) }) }] : []),
+  1143→    ],
+  1144→  }
+  1145→}
+  1146→
+  1147→/** Риск роения сразу по всем ульям. */
+  1148→function swarmAllAnswer(ctx: AgentContext): AgentMessage {
+  1149→  const l = ctx.lang ?? 'ru'
+  1150→  const risky = ctx.hives.filter((h) => {
+  1151→    const d2 = delta2d(h)
+  1152→    return d2 !== null && d2 <= SWARM_DROP
+  1153→  })
+  1154→  if (risky.length) {
+  1155→    const details = risky.map((h) => {
+  1156→      const d2 = delta2d(h) ?? 0
+  1157→      const t = lastPoint(h)?.tempInC ?? null
+  1158→      return tr(l, 'agent.swarmall.detail', {
+  1159→        n: h.id,
+  1160→        w: fmtNum(Math.abs(d2)),
+  1161→        temp: t !== null ? tr(l, 'agent.swarmall.detailTemp', { t: fmtNum(t) }) : '',
+  1162→      })
+  1163→    })
+  1164→    return {
+  1165→      scenario: 'swarm',
+  1166→      hiveId: null,
+  1167→      text: tr(l, 'agent.swarmall.risk.text', {
+  1168→        total: ctx.hives.length,
+  1169→        where: risky.length === 1 ? tr(l, 'agent.swarmall.whereOne') : tr(l, 'agent.swarmall.whereMany', { n: risky.length }),
+  1170→        ids: risky.map((h) => `№${h.id}`).join(', '),
+  1171→        details: details.join('.\n'),
+  1172→      }),
+  1173→      basis: risky.map((h) => tr(l, 'agent.basis.weightChart', { n: h.id })),
+  1174→      urgency: 'today',
+  1175→      urgencyNote: tr(l, 'agent.note.inspectAllToday'),
+  1176→      probability: swarmProbability(delta2d(risky[0]) ?? SWARM_DROP, l),
+  1177→      metrics: [
+  1178→        { label: tr(l, 'agent.metric.hivesRisk'), value: tr(l, 'agent.value.outof', { a: risky.length, b: ctx.hives.length }) },
+  1179→        { label: tr(l, 'agent.metric.weightDrop'), value: tr(l, 'agent.value.drop2d', { w: fmtNum(Math.abs(delta2d(risky[0]) ?? 0)) }) },
+  1180→      ],
+  1181→    }
+  1182→  }
+  1183→  const deltas = ctx.hives.map((h) => tr(l, 'agent.item.hiveGain', { n: h.id, w: fmtSigned(delta2d(h) ?? 0) })).join(', ')
+  1184→  return {
+  1185→    scenario: 'swarm',
+  1186→    hiveId: null,
+  1187→    text: tr(l, 'agent.swarmall.ok.text', { deltas }),
+  1188→    basis: [tr(l, 'agent.basis.gainCompareAll')],
+  1189→    urgency: 'ok',
+  1190→    urgencyNote: tr(l, 'agent.note.observeSignal'),
+  1191→    probability: tr(l, 'agent.prob.noSwarmSigns'),
+  1192→    metrics: [{ label: tr(l, 'agent.metric.hivesChecked'), value: String(ctx.hives.length) }],
+  1193→  }
+  1194→}
+  1195→
+  1196→/** Температура сразу по всем ульям + погода снаружи. */
+  1197→function climateAllAnswer(ctx: AgentContext): AgentMessage {
+  1198→  const l = ctx.lang ?? 'ru'
+  1199→  const lines = ctx.hives.map((h) => {
+  1200→    const t = lastPoint(h)?.tempInC ?? null
+  1201→    return tr(l, 'agent.climateall.line', {
+  1202→      n: h.id,
+  1203→      t: t !== null ? tr(l, 'agent.value.tempC', { t: fmtNum(t) }) : tr(l, 'agent.metric.nodata'),
+  1204→    })
+  1205→  })
+  1206→  const temps = ctx.hives
+  1207→    .map((h) => lastPoint(h)?.tempInC ?? null)
+  1208→    .filter((t): t is number => t !== null)
+  1209→  const maxT = temps.length ? Math.max(...temps) : null
+  1210→  const overheated = maxT !== null && maxT > 35.7
+  1211→  const now = ctx.weatherNow
+  1212→  const w0 = ctx.weather?.[0]
+  1213→  return {
+  1214→    scenario: overheated ? 'swarm' : 'status',
+  1215→    hiveId: null,
+  1216→    text: tr(l, 'agent.climateall.text', {
+  1217→      lines: lines.join(', '),
+  1218→      overheat: overheated && maxT !== null ? tr(l, 'agent.climateall.overheat', { t: fmtNum(maxT) }) : '',
+  1219→      ok: overheated ? '' : tr(l, 'agent.climateall.ok'),
+  1220→      outside: now
+  1221→        ? tr(l, 'agent.climateall.outside', {
+  1222→            t: fmtSigned(now.tempC, 0),
+  1223→            text: now.text.toLowerCase(),
+  1224→            today: w0 ? tr(l, 'agent.climateall.today', { min: fmtSigned(w0.tMin, 0), max: fmtSigned(w0.tMax, 0) }) : '',
+  1225→          })
+  1226→        : '',
+  1227→    }),
+  1228→    basis: [
+  1229→      tr(l, 'agent.basis.tempSensorsAll'),
+  1230→      ...(now ? [tr(l, 'agent.basis.weatherNow')] : []),
+  1231→      ...(overheated ? [tr(l, 'agent.basis.jointShort')] : []),
+  1232→    ],
+  1233→    urgency: overheated ? 'today' : 'ok',
+  1234→    urgencyNote: overheated ? tr(l, 'agent.note.checkWarmest') : tr(l, 'agent.note.climateOk'),
+  1235→    probability: overheated ? tr(l, 'agent.prob.joint') : undefined,
+  1236→    metrics: [
+  1237→      { label: tr(l, 'agent.metric.maxIn'), value: maxT !== null ? tr(l, 'agent.value.tempC', { t: fmtNum(maxT) }) : tr(l, 'agent.metric.nodata') },
+  1238→      ...(now ? [{ label: tr(l, 'agent.metric.outside'), value: tr(l, 'agent.value.tempC', { t: fmtSigned(now.tempC, 0) }) }] : []),
+  1239→      { label: tr(l, 'agent.metric.familyNorm'), value: tr(l, 'agent.value.tempNorm') },
+  1240→    ],
+  1241→  }
+  1242→}
+  1243→
+  1244→/** Влажность сразу по всем ульям, с честными пропусками по «молчащим» датчикам. */
+  1245→function humidityAllAnswer(ctx: AgentContext): AgentMessage {
+  1246→  const l = ctx.lang ?? 'ru'
+  1247→  const lines = ctx.hives.map((h) => {
+  1248→    const hum = lastHumidity(h)
+  1249→    if (hum !== null) return tr(l, 'agent.humall.lineOk', { n: h.id, h: fmtNum(hum, 0) })
+  1250→    if (!h.humiditySensorOk) {
+  1251→      return tr(l, 'agent.humall.lineSilent', {
+  1252→        n: h.id,
+  1253→        since: h.humidityOfflineFrom ? tr(l, 'agent.inline.since', { date: h.humidityOfflineFrom }) : '',
+  1254→      })
+  1255→    }
+  1256→    return tr(l, 'agent.humall.lineNodata', { n: h.id })
+  1257→  })
+  1258→  const wet = ctx.hives.filter((h) => (lastHumidity(h) ?? 0) > 70)
+  1259→  const pts = (ctx.points ?? []).filter((p) => p.sensor.on && p.sensor.humidityPct !== null)
+  1260→  return {
+  1261→    scenario: 'status',
+  1262→    hiveId: null,
+  1263→    text: tr(l, 'agent.humall.text', {
+  1264→      lines: lines.join('\n'),
+  1265→      wet: wet.length ? tr(l, 'agent.humall.wet', { ids: wet.map((h) => `№${h.id}`).join(', ') }) : '',
+  1266→      dry: wet.length ? '' : tr(l, 'agent.humall.dryOk'),
+  1267→      pts: pts.length
+  1268→        ? tr(l, 'agent.humall.pts', { pts: pts.map((p) => tr(l, 'agent.pts.hum', { name: p.name, h: fmtNum(p.sensor.humidityPct ?? 0, 0) })).join(', ') })
+  1269→        : '',
+  1270→    }),
+  1271→    basis: [
+  1272→      tr(l, 'agent.basis.humSensors'),
+  1273→      tr(l, 'agent.basis.normHum'),
+  1274→      ...(pts.length ? [tr(l, 'agent.basis.mapSensors')] : []),
+  1275→    ],
+  1276→    urgency: wet.length ? 'today' : 'ok',
+  1277→    urgencyNote: wet.length ? tr(l, 'agent.note.ventilation') : tr(l, 'agent.note.observe'),
+  1278→    metrics: [
+  1279→      {
+  1280→        label: tr(l, 'agent.metric.hivesData'),
+  1281→        value: tr(l, 'agent.value.outof', { a: ctx.hives.filter((h) => lastHumidity(h) !== null).length, b: ctx.hives.length }),
+  1282→      },
+  1283→      ...(wet.length ? [{ label: tr(l, 'agent.metric.wetHives'), value: wet.map((h) => `№${h.id}`).join(', ') }] : []),
+  1284→    ],
+  1285→  }
+  1286→}
+  1287→
+  1288→/** Вес и привес сразу по всем ульям + контрольные датчики на карте. */
+  1289→function weightAllAnswer(ctx: AgentContext): AgentMessage {
+  1290→  const l = ctx.lang ?? 'ru'
+  1291→  const rows = ctx.hives.map((h) => {
+  1292→    const w = lastWeight(h)
+  1293→    return tr(l, 'agent.weightall.row', {
+  1294→      n: h.id,
+  1295→      w: w !== null ? tr(l, 'agent.value.kg', { w: fmtNum(w) }) : tr(l, 'agent.metric.nodata'),
+  1296→      g: fmtSigned(delta30d(h) ?? 0),
+  1297→      period: periodLabel(h, l),
+  1298→    })
+  1299→  })
+  1300→  const leader = leaderOf(ctx.hives)
+  1301→  const pts = (ctx.points ?? []).filter((p) => p.sensor.on && p.sensor.weightKg !== null)
+  1302→  return {
+  1303→    scenario: 'status',
+  1304→    hiveId: null,
+  1305→    text: tr(l, 'agent.weightall.text', {
+  1306→      rows: rows.join('\n'),
+  1307→      leader: leader
+  1308→        ? tr(l, 'agent.weightall.leader', { n: leader.id, w: fmtSigned(delta30d(leader) ?? 0), period: periodLabel(leader, l) })
+  1309→        : '',
+  1310→      pts: pts.length
+  1311→        ? tr(l, 'agent.weightall.pts', { pts: pts.map((p) => tr(l, 'agent.pts.weight', { name: p.name, w: fmtNum(p.sensor.weightKg ?? 0) })).join(', ') })
+  1312→        : '',
+  1313→    }),
+  1314→    basis: [tr(l, 'agent.basis.weightChartsAll'), ...(pts.length ? [tr(l, 'agent.basis.mapSensors')] : [])],
+  1315→    urgency: 'ok',
+  1316→    urgencyNote: tr(l, 'agent.note.watchGain'),
+  1317→    metrics: [
+  1318→      ...(leader ? [{ label: tr(l, 'agent.metric.leader'), value: tr(l, 'agent.value.leaderGain', { n: leader.id, w: fmtSigned(delta30d(leader) ?? 0) }) }] : []),
+  1319→      {
+  1320→        label: tr(l, 'agent.metric.hivesWeights'),
+  1321→        value: tr(l, 'agent.value.outof', { a: ctx.hives.filter((h) => lastWeight(h) !== null).length, b: ctx.hives.length }),
+  1322→      },
+  1323→    ],
+  1324→  }
+  1325→}
+  1326→
+  1327→/** Шум по датчикам точек на карте. Нет датчика или он выключен — данных нет. */
+  1328→function noiseAnswer(ctx: AgentContext): AgentMessage {
+  1329→  const l = ctx.lang ?? 'ru'
+  1330→  const pts = (ctx.points ?? []).filter((p) => p.sensor.on && p.sensor.noiseDb !== null)
+  1331→  if (!pts.length) {
+  1332→    return {
+  1333→      scenario: 'status',
+  1334→      hiveId: null,
+  1335→      text: tr(l, 'agent.noise.none.text'),
+  1336→      basis: [tr(l, 'agent.basis.sensorsOff')],
+  1337→      urgency: 'this-week',
+  1338→      urgencyNote: tr(l, 'agent.note.enableSensors'),
+  1339→      probability: tr(l, 'agent.prob.insufficient'),
+  1340→      metrics: [{ label: tr(l, 'agent.metric.sensorsActive'), value: '0' }],
+  1341→    }
+  1342→  }
+  1343→  const rows = pts.map((p) => tr(l, 'agent.noise.row', { name: p.name, n: fmtNum(p.sensor.noiseDb ?? 0, 0) })).join(', ')
+  1344→  const loudest = [...pts].sort((a, b) => (b.sensor.noiseDb ?? 0) - (a.sensor.noiseDb ?? 0))[0]
+  1345→  const loud = (loudest.sensor.noiseDb ?? 0) > 60
+  1346→  return {
+  1347→    scenario: 'status',
+  1348→    hiveId: null,
+  1349→    text: tr(l, 'agent.noise.text', {
+  1350→      rows,
+  1351→      loud: loud ? tr(l, 'agent.noise.loud', { name: loudest.name }) : '',
+  1352→      calm: loud ? '' : tr(l, 'agent.noise.calm'),
+  1353→    }),
+  1354→    basis: [tr(l, 'agent.basis.sensorsCount', { n: pts.length })],
+  1355→    urgency: loud ? 'today' : 'ok',
+  1356→    urgencyNote: loud ? tr(l, 'agent.note.inspectNoisy') : tr(l, 'agent.note.noiseOk'),
+  1357→    metrics: [{ label: tr(l, 'agent.metric.maxNoise'), value: tr(l, 'agent.value.db', { n: fmtNum(loudest.sensor.noiseDb ?? 0, 0) }) }],
+  1358→  }
+  1359→}
+  1360→
+  1361→/** Обзор датчиков: точки на карте (температура, вес, влажность, шум) и датчики ульев. */
+  1362→function sensorsAnswer(ctx: AgentContext): AgentMessage {
+  1363→  const l = ctx.lang ?? 'ru'
+  1364→  const ptLines = (ctx.points ?? []).map((p) =>
+  1365→    p.sensor.on
+  1366→      ? tr(l, 'agent.sensors.pt.on', {
+  1367→          name: p.name,
+  1368→          count: p.hiveCount,
+  1369→          t: fmtNum(p.sensor.tempC ?? 0),
+  1370→          h: fmtNum(p.sensor.humidityPct ?? 0, 0),
+  1371→          w: fmtNum(p.sensor.weightKg ?? 0),
+  1372→          n: fmtNum(p.sensor.noiseDb ?? 0, 0),
+  1373→        })
+  1374→      : tr(l, 'agent.sensors.pt.off', {
+  1375→          name: p.name,
+  1376→          count: p.hiveCount,
+  1377→          off: p.hasSensor ? tr(l, 'agent.sensors.pt.offDisabled') : tr(l, 'agent.sensors.pt.offMissing'),
+  1378→        }),
+  1379→  )
+  1380→  const hiveLines = ctx.hives.map((h) =>
+  1381→    h.humiditySensorOk
+  1382→      ? tr(l, 'agent.sensors.hive.ok', { n: h.id })
+  1383→      : tr(l, 'agent.sensors.hive.bad', {
+  1384→          n: h.id,
+  1385→          since: h.humidityOfflineFrom ? tr(l, 'agent.inline.since', { date: h.humidityOfflineFrom }) : '',
+  1386→        }),
+  1387→  )
+  1388→  return {
+  1389→    scenario: 'status',
+  1390→    hiveId: null,
+  1391→    text: tr(l, 'agent.sensors.text', { lines: [...ptLines, ...hiveLines].join('\n') }),
+  1392→    basis: [tr(l, 'agent.basis.mapSensors'), tr(l, 'agent.basis.hiveSensors')],
+  1393→    urgency: 'ok',
+  1394→    urgencyNote: tr(l, 'agent.note.sensorsAllOk'),
+  1395→    metrics: [
+  1396→      {
+  1397→        label: tr(l, 'agent.metric.pointsSensors'),
+  1398→        value: tr(l, 'agent.value.outof', { a: (ctx.points ?? []).filter((p) => p.sensor.on).length, b: (ctx.points ?? []).length }),
+  1399→      },
+  1400→      { label: tr(l, 'agent.metric.hivesWatch'), value: String(ctx.hives.length) },
+  1401→    ],
+  1402→  }
+  1403→}
+  1404→
+  1405→/** Вопрос о самом агенте: модель и устройство не раскрываем. */
+  1406→function identityAnswer(ctx: AgentContext): AgentMessage {
+  1407→  const l = ctx.lang ?? 'ru'
+  1408→  return {
+  1409→    scenario: 'status',
+  1410→    hiveId: null,
+  1411→    text: tr(l, 'agent.identity.text'),
+  1412→    basis: [],
+  1413→    urgency: 'ok',
+  1414→    urgencyNote: tr(l, 'agent.note.ready'),
+  1415→    metrics: [],
+  1416→  }
+  1417→}
+  1418→
+  1419→function fallbackAnswer(ctx: AgentContext): AgentMessage {
+  1420→  const l = ctx.lang ?? 'ru'
+  1421→  return {
+  1422→    scenario: 'offtopic',
+  1423→    hiveId: null,
+  1424→    text: tr(l, 'agent.fallback.text'),
+  1425→    basis: [],
+  1426→    urgency: 'ok',
+  1427→    urgencyNote: tr(l, 'agent.note.offtopic'),
+  1428→    metrics: [],
+  1429→  }
+  1430→}
+  1431→
+  1432→/* ------------------------------------------------------------------ */
+  1433→/* Здоровье пчёл и уход: справочник правилового движка                  */
+  1434→/* ------------------------------------------------------------------ */
+  1435→
+  1436→interface CareTopic {
+  1437→  id: string
+  1438→  patterns: RegExp[]
+  1439→  /** Ключ перевода основного текста ответа (словарь i18n-extra-agent). */
+  1440→  textKey: string
+  1441→  urgency: Urgency
+  1442→  /** Ключ перевода предписания. */
+  1443→  noteKey: string
+  1444→  /** Ключ перевода вероятностной оценки (если есть). */
+  1445→  probKey?: string
+  1446→  /** Метрики: пары ключей «подпись / значение». */
+  1447→  metrics: Array<{ labelKey: string; valueKey: string }>
+  1448→  /** Ключи перевода оснований. */
+  1449→  basisKeys: string[]
+  1450→}
+  1451→
+  1452→/** Справочник болезней и сезонного ухода — для ответов без LLM (fallback).
+  1453→ *  Каждый ответ: признаки → порядок действий → правило о ветслужбе/диагнозе.
+  1454→ *  Все строки — ключи переводов, собираются в beeCareAnswer по ctx.lang. */
+  1455→const CARE_TOPICS: CareTopic[] = [
+  1456→  {
+  1457→    id: 'foulbrood',
+  1458→    patterns: [/гнил/, /гнилост/],
+  1459→    urgency: 'act-now',
+  1460→    textKey: 'agent.care.foulbrood.text',
+  1461→    noteKey: 'agent.care.foulbrood.note',
+  1462→    probKey: 'agent.care.foulbrood.prob',
+  1463→    metrics: [
+  1464→      { labelKey: 'agent.care.foulbrood.m1l', valueKey: 'agent.care.foulbrood.m1v' },
+  1465→      { labelKey: 'agent.care.foulbrood.m2l', valueKey: 'agent.care.foulbrood.m2v' },
+  1466→      { labelKey: 'agent.care.foulbrood.m3l', valueKey: 'agent.care.foulbrood.m3v' },
+  1467→    ],
+  1468→    basisKeys: ['agent.basis.diseases', 'agent.basis.vetRules'],
+  1469→  },
+  1470→  {
+  1471→    id: 'varroa',
+  1472→    patterns: [/варроа/, /клещ/, /бипин/, /апивар/, /акара/, /щавелев/, /оксал/, /заклещ/],
+  1473→    urgency: 'today',
+  1474→    textKey: 'agent.care.varroa.text',
+  1475→    noteKey: 'agent.care.varroa.note',
+  1476→    probKey: 'agent.care.varroa.prob',
+  1477→    metrics: [
+  1478→      { labelKey: 'agent.care.varroa.m1l', valueKey: 'agent.care.varroa.m1v' },
+  1479→      { labelKey: 'agent.care.varroa.m2l', valueKey: 'agent.care.varroa.m2v' },
+  1480→      { labelKey: 'agent.care.varroa.m3l', valueKey: 'agent.care.varroa.m3v' },
+  1481→    ],
+  1482→    basisKeys: ['agent.basis.diseases', 'agent.basis.autumnTreatments'],
+  1483→  },
+  1484→  {
+  1485→    id: 'nosema',
+  1486→    patterns: [/нозем/, /понос/, /испачкан/],
+  1487→    urgency: 'today',
+  1488→    textKey: 'agent.care.nosema.text',
+  1489→    noteKey: 'agent.care.nosema.note',
+  1490→    metrics: [
+  1491→      { labelKey: 'agent.care.nosema.m1l', valueKey: 'agent.care.nosema.m1v' },
+  1492→      { labelKey: 'agent.care.nosema.m2l', valueKey: 'agent.care.nosema.m2v' },
+  1493→    ],
+  1494→    basisKeys: ['agent.basis.diseases'],
+  1495→  },
+  1496→  {
+  1497→    id: 'chalkbrood',
+  1498→    patterns: [/аскосфер/, /известков/, /мумии/, /аспергилл/],
+  1499→    urgency: 'today',
+  1500→    textKey: 'agent.care.chalkbrood.text',
+  1501→    noteKey: 'agent.care.chalkbrood.note',
+  1502→    metrics: [
+  1503→      { labelKey: 'agent.care.chalkbrood.m1l', valueKey: 'agent.care.chalkbrood.m1v' },
+  1504→      { labelKey: 'agent.care.chalkbrood.m2l', valueKey: 'agent.care.chalkbrood.m2v' },
+  1505→    ],
+  1506→    basisKeys: ['agent.basis.diseases', 'agent.basis.humTelemetry'],
+  1507→  },
+  1508→  {
+  1509→    id: 'wax-moth',
+  1510→    patterns: [/восковая моль/, /(^|[^а-я])моль(?![а-я])/, /воск моль/],
+  1511→    urgency: 'this-week',
+  1512→    textKey: 'agent.care.wax-moth.text',
+  1513→    noteKey: 'agent.care.wax-moth.note',
+  1514→    metrics: [
+  1515→      { labelKey: 'agent.care.wax-moth.m1l', valueKey: 'agent.care.wax-moth.m1v' },
+  1516→      { labelKey: 'agent.care.wax-moth.m2l', valueKey: 'agent.care.wax-moth.m2v' },
+  1517→    ],
+  1518→    basisKeys: ['agent.basis.combStorage'],
+  1519→  },
+  1520→  {
+  1521→    id: 'queenless',
+  1522→    patterns: [/осирот/, /нет матк/, /безматоч/, /матка пропал/, /матка потерян/, /матка исчез/, /трутовк/],
+  1523→    urgency: 'today',
+  1524→    textKey: 'agent.care.queenless.text',
+  1525→    noteKey: 'agent.care.queenless.note',
+  1526→    metrics: [
+  1527→      { labelKey: 'agent.care.queenless.m1l', valueKey: 'agent.care.queenless.m1v' },
+  1528→      { labelKey: 'agent.care.queenless.m2l', valueKey: 'agent.care.queenless.m2v' },
+  1529→    ],
+  1530→    basisKeys: ['agent.basis.coloniesQueens'],
+  1531→  },
+  1532→  {
+  1533→    id: 'wintering',
+  1534→    patterns: [/зимов/, /к зиме/, /в зиму/, /весной осматр/, /омшаник/],
+  1535→    urgency: 'this-week',
+  1536→    textKey: 'agent.care.wintering.text',
+  1537→    noteKey: 'agent.care.wintering.note',
+  1538→    metrics: [
+  1539→      { labelKey: 'agent.care.wintering.m1l', valueKey: 'agent.care.wintering.m1v' },
+  1540→      { labelKey: 'agent.care.wintering.m2l', valueKey: 'agent.care.wintering.m2v' },
+  1541→      { labelKey: 'agent.care.wintering.m3l', valueKey: 'agent.care.wintering.m3v' },
+  1542→    ],
+  1543→    basisKeys: ['agent.basis.wintering'],
+  1544→  },
+  1545→  {
+  1546→    id: 'feeding',
+  1547→    patterns: [/подкорм/, /сироп/, /канди/, /сахарн/, /кормушк/],
+  1548→    urgency: 'ok',
+  1549→    textKey: 'agent.care.feeding.text',
+  1550→    noteKey: 'agent.care.feeding.note',
+  1551→    metrics: [
+  1552→      { labelKey: 'agent.care.feeding.m1l', valueKey: 'agent.care.feeding.m1v' },
+  1553→      { labelKey: 'agent.care.feeding.m2l', valueKey: 'agent.care.feeding.m2v' },
+  1554→      { labelKey: 'agent.care.feeding.m3l', valueKey: 'agent.care.feeding.m3v' },
+  1555→    ],
+  1556→    basisKeys: ['agent.basis.feeding'],
+  1557→  },
+  1558→]
+  1559→
+  1560→/** Общий ответ «пчёлы заболели — что делать», если конкретная болезнь не опознана. */
+  1561→function sickBeesGeneral(ctx: AgentContext): AgentMessage {
+  1562→  const l = ctx.lang ?? 'ru'
+  1563→  return {
+  1564→    scenario: 'care',
+  1565→    hiveId: null,
+  1566→    text: tr(l, 'agent.care.general.text'),
+  1567→    basis: [tr(l, 'agent.basis.diseases'), tr(l, 'agent.basis.vetRules')],
+  1568→    urgency: 'today',
+  1569→    urgencyNote: tr(l, 'agent.care.general.note'),
+  1570→    probability: tr(l, 'agent.care.general.prob'),
+  1571→    metrics: [
+  1572→      { label: tr(l, 'agent.care.general.m1l'), value: tr(l, 'agent.care.general.m1v') },
+  1573→      { label: tr(l, 'agent.care.general.m2l'), value: tr(l, 'agent.care.general.m2v') },
+  1574→      { label: tr(l, 'agent.care.general.m3l'), value: tr(l, 'agent.care.general.m3v') },
+  1575→    ],
+  1576→  }
+  1577→}
+  1578→
+  1579→/** Ответы о здоровье пчёл и уходе: болезни, лечение, подкормки, сезонный уход. */
+  1580→function beeCareAnswer(question: string, ctx: AgentContext): AgentMessage {
+  1581→  const l = ctx.lang ?? 'ru'
+  1582→  const q = norm(question)
+  1583→  for (const topic of CARE_TOPICS) {
+  1584→    if (topic.patterns.some((p) => p.test(q))) {
+  1585→      return {
+  1586→        scenario: 'care',
+  1587→        hiveId: null,
+  1588→        text: tr(l, topic.textKey),
+  1589→        basis: topic.basisKeys.map((k) => tr(l, k)),
+  1590→        urgency: topic.urgency,
+  1591→        urgencyNote: tr(l, topic.noteKey),
+  1592→        probability: topic.probKey ? tr(l, topic.probKey) : undefined,
+  1593→        metrics: topic.metrics.map((m) => ({ label: tr(l, m.labelKey), value: tr(l, m.valueKey) })),
+  1594→      }
+  1595→    }
+  1596→  }
+  1597→  return sickBeesGeneral(ctx)
+  1598→}
+  1599→
+  1600→function thanksAnswer(ctx: AgentContext): AgentMessage {
+  1601→  const l = ctx.lang ?? 'ru'
+  1602→  return {
+  1603→    scenario: 'status',
+  1604→    hiveId: null,
+  1605→    text: tr(l, 'agent.thanks.text'),
+  1606→    basis: [],
+  1607→    urgency: 'ok',
+  1608→    urgencyNote: tr(l, 'agent.note.observe'),
+  1609→    metrics: [],
+  1610→  }
+  1611→}
+  1612→
+  1613→/** Главная функция: вопрос пчеловода → структурированный ответ агента. */
+  1614→export function askAgent(
+  1615→  question: string,
+  1616→  currentHiveId: number,
+  1617→  ctx: AgentContext,
+  1618→): AgentMessage {
+  1619→  const q = norm(question)
+  1620→  const hiveId = extractHiveId(q, ctx)
+  1621→  const hive = ctx.hives.find((x) => x.id === (hiveId ?? currentHiveId)) ?? ctx.hives[0]
+  1622→
+  1623→  const has = (...patterns: RegExp[]) => patterns.some((p) => p.test(q))
+  1624→
+  1625→  // Приветствие и сервисные фразы
+  1626→  if (has(/привет|здравств|добрый день|добрый вечер|доброе утро|что ты умеешь|чем ты можешь|помощь|справк/)) {
+  1627→    return greetingAnswer(ctx)
+  1628→  }
+  1629→  // Вопрос о самом агенте: модель и устройство не раскрываем
+  1630→  if (has(/кто ты|кто такой|как тебя зовут|ты бот|чат ?бот|какая (ты )?модель|какой (ты )?модель|на (чем|чём) ты (работаешь|сделан|написан)|что ты за|нейросет|искусственн|\bllm\b|\bgpt\b/)) {
+  1631→    return identityAnswer(ctx)
+  1632→  }
+  1633→  if (has(/спасибо|благодар|класс|супер|отлично/)) {
+  1634→    return thanksAnswer(ctx)
+  1635→  }
+  1636→
+  1637→  // Здоровье пчёл и уход: болезни, лечение, профилактика, подкормки, сезонный уход.
+  1638→  // Ветка стоит ДО пестицидов: «обработать от клеща» — про лечение пчёл, а не про поле.
+  1639→  if (
+  1640→    has(
+  1641→      /боле[етн]|болезн|заболел|недуг|варроа|клещ|нозем|аскосфер|известков|мумии|гнил|восковая моль|(^|[^а-я])моль(?![а-я])|лечен|лечит|вылеч|бипин|апивар|акара|щавелев|оксал|заклещ|полоск|подкорм|сироп|канди|сахарн|кормушк|ветеринар|ветврач|ветстанц|ветслужб|ветлабор|дезинфекц|осирот|нет матк|безматоч|матка пропал|матка потерян|матка исчез|трутовк|понос|испачкан|зим(ов|н)|к зиме|в зиму|омшаник|пчел.{0,14}(умира|погиб|гибнут)/,
+  1642→    )
+  1643→  ) {
+  1644→    return beeCareAnswer(question, ctx)
+  1645→  }
+  1646→
+  1647→  // Сценарий пестицидов
+  1648→  if (has(/пестицид|обработк|хими|опрыск|травят|фунгицид|инсектицид/)) {
+  1649→    return pesticideAnswer(ctx)
+  1650→  }
+  1651→
+  1652→  // Кочёвка
+  1653→  if (has(/кочев|перевез|перевоз|переех|перемест|новое место|куда (вывезти|ехать|ставить)|где лучше|выбор места|участк/)) {
+  1654→    return migrationAnswer(ctx)
+  1655→  }
+  1656→
+  1657→  // Погода и медосбор (включая температуру ВОЗДЕУХА — не путать с температурой улья)
+  1658→  if (has(/погод|медосбор|взятк|летат|лёт|лету|дожд|ветер|осадк|цветен|медонос|снег|мороз|когда вывоз|когда летать|температура (воздуха|за окном|на улице|снаружи)/)) {
+  1659→    return weatherAnswer(ctx)
+  1660→  }
+  1661→
+  1662→  if (!hive) {
+  1663→    return fallbackAnswer(ctx)
+  1664→  }
+  1665→
+  1666→  // Темы по ульям: если номер улья не назван — отвечаем сразу по ВСЕМ ульям
+  1667→  if (has(/влажн|сырост|сыро/)) {
+  1668→    return hiveId ? humidityAnswer(hive, ctx) : humidityAllAnswer(ctx)
+  1669→  }
+  1670→  if (has(/шум|децибел|гул(?![а-я])/)) {
+  1671→    return noiseAnswer(ctx)
+  1672→  }
+  1673→  if (has(/ро(ение|иться|й|и(?![а-я]))|риск роения|делит|делени/)) {
+  1674→    return hiveId ? swarmAnswer(hive, ctx) : swarmAllAnswer(ctx)
+  1675→  }
+  1676→  if (has(/температ|жар|тепло внутри|градус/)) {
+  1677→    return hiveId ? climateAnswer(hive, ctx) : climateAllAnswer(ctx)
+  1678→  }
+  1679→  if (has(/вес|мед(?![а-я])|меда|привес|набор|тяже|лидер/)) {
+  1680→    return hiveId ? weightAnswer(hive, ctx) : weightAllAnswer(ctx)
+  1681→  }
+  1682→  if (has(/датчик|сенсор/)) {
+  1683→    return sensorsAnswer(ctx)
+  1684→  }
+  1685→  if (has(/все.{0,8}уль|всех ульев|всей пасек|пасек|обзор|сводк|итог|общее состояни|как дела|как себя|что происходит|состояни|статус|проверь|проблем|тревог|расскажи|что с улеем|как улей/)) {
+  1686→    return hiveId ? statusAnswer(hive, ctx) : allHivesAnswer(ctx)
+  1687→  }
+  1688→
+  1689→  // Номер улья без распознанной темы — считаем вопросом «что происходит»
+  1690→  if (hiveId !== null) {
+  1691→    return statusAnswer(hive, ctx)
+  1692→  }
+  1693→
+  1694→  return fallbackAnswer(ctx)
+  1695→}
+  1696→
+  1697→/** Быстрые вопросы для чата — ключи переводов (тексты — в i18n-extra-agent). */
+  1698→export const QUICK_QUESTIONS = [
+  1699→  'agent.qq.0',
+  1700→  'agent.qq.1',
+  1701→  'agent.qq.2',
+  1702→  'agent.qq.3',
+  1703→  'agent.qq.4',
+  1704→  'agent.qq.5',
+  1705→]
+  1706→

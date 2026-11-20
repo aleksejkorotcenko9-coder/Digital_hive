@@ -1,0 +1,136 @@
+ROLE
+You are a senior frontend developer. Perform a MINIMAL, ISOLATED addition to an existing Node.js/Express project. Do not touch anything outside the scope described below.
+
+TASK
+Add one new page /map.html with an interactive Leaflet map and a sensor activation panel. Add one navigation link to this page on existing pages.
+
+=== ABSOLUTE PROHIBITIONS ===
+1. DO NOT modify server.js.
+2. DO NOT modify db.js, data/db.json, seed.js, or any backend file.
+3. DO NOT modify auth, middleware, or existing API routes.
+4. DO NOT add npm dependencies (use CDN only).
+5. DO NOT rewrite any existing file. Only ADD one small link to existing pages (see below).
+6. DO NOT output prose between files.
+7. DO NOT write TODO/FIXME/placeholders.
+8. DO NOT use OpenStreetMap tiles (tile.openstreetmap.org) or OpenFreeMap. Use MapLibre Demo Tiles only.
+
+=== FILES TO CREATE (only these three) ===
+public/map.html
+public/js/map.js
+public/data/map-layers.json
+
+=== FILES TO MODIFY (minimal, additive) ===
+Every existing .html file in ./public (catalog.html, dashboard.html, etc.): insert EXACTLY ONE line before the closing </body> tag, without changing anything else:
+
+<a href="/map.html" style="position:fixed;bottom:16px;right:16px;z-index:9999;padding:10px 18px;background:#f97316;color:#fff;border-radius:9999px;text-decoration:none;font-weight:600;box-shadow:0 4px 12px rgba(0,0,0,.25);">🗺 Карта</a>
+
+If a file already contains this link — skip it.
+
+=== DATA (public/data/map-layers.json) ===
+Create a JSON file with this structure. Coordinates of sensors = coordinates of apiaries. Fill with realistic mock data for Moscow region (55.7-55.8, 37.5-37.7):
+
+{
+  "sensors": [
+    { "code": "SN-001", "lat": 55.7558, "lon": 37.6173, "hiveCount": 10, "name": "Пасека \"Лесная\"" },
+    { "code": "SN-002", "lat": 55.80,   "lon": 37.65,   "hiveCount": 15, "name": "Пасека \"Луговая\"" },
+    { "code": "SN-003", "lat": 55.74,   "lon": 37.55,   "hiveCount": 8,  "name": "Пасека \"Речная\"" }
+  ],
+  "pesticides": [
+    { "name": "Поле \"Южное\"", "coordinates": [[55.82,37.60],[55.82,37.70],[55.78,37.70],[55.78,37.60]], "pesticide": "Гербицид X", "date": "2026-05-20" }
+  ],
+  "honeyPlants": [
+    { "name": "Липовый массив", "coordinates": [[55.74,37.55],[55.74,37.62],[55.71,37.62],[55.71,37.55]], "plant": "Липа" },
+    { "name": "Гречишное поле", "coordinates": [[55.81,37.55],[55.81,37.60],[55.79,37.60],[55.79,37.55]], "plant": "Гречиха" }
+  ]
+}
+
+=== PUBLIC/MAP.HTML ===
+- Full standalone HTML page, Russian UI, <meta charset="utf-8">, <meta name="viewport" content="width=device-width, initial-scale=1">.
+- Leaflet CSS + JS via CDN: https://unpkg.com/leaflet@1.9.4/dist/leaflet.css and https://unpkg.com/leaflet@1.9.4/dist/leaflet.js
+- MapLibre GL JS + Leaflet adapter via CDN:
+  https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js
+  https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css
+  https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.1.3/leaflet-maplibre-gl.js
+- Header with title "🗺 Карта пасек, осадков и медоносных растений".
+- Activation panel ABOVE the map (visible at all times):
+  - Label: "Активируйте датчик, чтобы добавить пасеку на карту"
+  - <input id="sensor-code" placeholder="Код датчика (например, SN-001)" />
+  - <button id="activate-btn">Активировать</button>
+  - <div id="activation-msg"></div> — shows success ("✅ Датчик SN-001 активирован: Пасека «Лесная»") or error ("❌ Код не найден") in green/red.
+  - List of activated sensors below the input, each with a "Удалить" button: <ul id="activated-list"></ul>
+- <div id="map" style="height:65vh;width:100%;border-radius:12px"></div>
+- Legend below map: 🟢 Пасеки (активированные датчики), 🔴 Пестициды, 🌸 Медоносные растения, 🌧 Осадки (радар).
+- Link back to main page (e.g. /catalog.html or /) in header.
+- Loads /js/map.js at end of body.
+
+=== PUBLIC/JS/MAP.JS ===
+1. Init Leaflet map: L.map('map').setView([55.7558, 37.6173], 10).
+2. Base layer: MapLibre Demo Tiles via MapLibre GL Leaflet:
+   maplibreGL({ style: 'https://demotiles.maplibre.org/style.json' }).addTo(map);
+3. Fetch /data/map-layers.json → { sensors, pesticides, honeyPlants }.
+4. Pesticides layer: red polygons (L.polygon) from coordinates, popup (name, pesticide, date). Always visible.
+5. Honey plants layer: green polygons, popup (name, plant). Always visible.
+6. Precipitation layer (RainViewer):
+   - Fetch https://api.rainviewer.com/public/weather-maps.json
+   - Take last frame from radar.past, construct tile URL:
+     https://tilecache.rainviewer.com + frame.path + /256/{z}/{x}/{y}/2/1_1.png
+   - Add as L.tileLayer with opacity 0.6. If fetch fails, skip silently.
+7. Apiary layer (activation-driven):
+   - localStorage key: "activatedSensors" (JSON array of sensor codes).
+   - Function loadActivated() → read localStorage, for each code look up in sensors array, add L.marker (green circleMarker) at sensor.lat/lon with popup "<b>{name}</b><br>Ульев: {hiveCount}<br>Датчик: {code}". Add to a single L.layerGroup apiaryLayer.
+   - Function renderActivatedList() → populate <ul id="activated-list"> with items "<b>{code}</b> — {name} <button data-code='{code}'>Удалить</button>".
+   - Activation flow:
+     * On click #activate-btn: read #sensor-code value, trim, uppercase.
+     * If empty → #activation-msg red "Введите код датчика".
+     * Find sensor by code in sensors array.
+     * If not found → #activation-msg red "❌ Код не найден".
+     * If already in localStorage → #activation-msg yellow "⚠️ Датчик уже активирован".
+     * Else → push code to localStorage array, add marker to apiaryLayer, update list, #activation-msg green "✅ Датчик {code} активирован: {name}". Clear input.
+   - Deactivation flow:
+     * On click on "Удалить" button in list (delegated event): remove code from localStorage, remove corresponding marker from apiaryLayer, remove list item, show #activation-msg gray "Датчик {code} деактивирован".
+   - On page load: call loadActivated() and renderActivatedList().
+   - Sensors that are NOT activated MUST NOT appear on the map.
+8. L.control.layers with labels: "🐝 Пасеки", "⚠️ Пестициды", "🌸 Медоносные растения", "🌧 Осадки". Apiary layer added only when at least one sensor activated (or add empty layer, doesn't matter).
+9. Plain JS, no frameworks, no bundler, no other dependencies.
+
+=== AUTH NOTE ===
+If the project's auth middleware blocks /map.html, do NOT change the middleware. Instead, append this one line (and only this) in server.js right before the auth middleware declaration:
+   // === MAP FEATURE (ADDED) ===
+   app.get('/map.html', (req, res) => res.sendFile(__dirname + '/public/map.html'));
+   // === END MAP FEATURE ===
+If /map.html is already served by express.static before the auth middleware, do NOT add this line.
+
+=== OUTPUT FORMAT (strict) ===
+1. "Готово."
+2. File tree:
+   + public/map.html          (NEW)
+   + public/js/map.js         (NEW)
+   + public/data/map-layers.json (NEW)
+   ~ public/catalog.html      (MODIFIED — 1 link added)
+   ~ public/dashboard.html    (MODIFIED — 1 link added)
+   ... (list only files actually touched)
+3. For each NEW file: full content in ```html``` / ```js``` / ```json``` blocks.
+4. For each MODIFIED html file: output ONLY the diff — show 3 lines of context around the inserted link, marked clearly.
+5. If server.js was touched (rare case per AUTH NOTE): show ONLY the 3 inserted lines with 2 lines of context.
+6. No prose between files.
+
+=== SELF-CHECK ===
+[ ] server.js NOT modified (unless AUTH NOTE required it — then only 3 lines added).
+[ ] db.js NOT modified.
+[ ] No npm dependencies added.
+[ ] public/map.html, public/js/map.js, public/data/map-layers.json created in full.
+[ ] One link to /map.html added to each existing page, nothing else changed.
+[ ] Base layer uses MapLibre Demo Tiles (https://demotiles.maplibre.org/style.json) — NOT OpenStreetMap, NOT OpenFreeMap.
+[ ] RainViewer radar overlay added as tile layer (opacity 0.6, skipped silently if fetch fails).
+[ ] Pesticide and honey plant polygons rendered from GeoJSON coordinates — always visible.
+[ ] Apiary markers appear ONLY after entering a valid sensor code and clicking "Активировать".
+[ ] Invalid code shows red error "❌ Код не найден".
+[ ] Already-activated code shows yellow warning "⚠️ Датчик уже активирован".
+[ ] Successful activation shows green confirmation and clears input.
+[ ] Activated sensors persist across page reloads via localStorage key "activatedSensors".
+[ ] Deactivation removes marker from map AND from localStorage AND from list.
+[ ] Layer control includes all four layers.
+[ ] No TODO/FIXME/"...".
+If any check fails, output "SELF-CHECK FAILED: <item>" and stop.
+
+BEGIN.

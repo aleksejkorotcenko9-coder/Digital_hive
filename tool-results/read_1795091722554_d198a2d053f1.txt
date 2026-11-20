@@ -1,0 +1,1398 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * «История событий»: красиво оформленный почасовой журнал датчиков ульев.
+     5→ *
+     6→ * Параметры (температура, влажность, масса) фиксируются КАЖДЫЙ ЧАС — записи
+     7→ * журнала живут в БД (SensorLog) и наполняются по якорной CSV-выгрузке
+     8→ * телеметрии. При наведении на запись всплывает окно с подробной таблицей
+     9→ * изменений параметров; таблицу можно закрепить кликом (и на телефоне тоже).
+    10→ *
+    11→ * Быстрый доступ по периодам: День / Месяц / Год, шаг стрелками и кнопка
+    12→ * календаря — клик по числу открывает этот день с данными.
+    13→ * Времена журнала показываются в UTC — то же время, что в исходной таблице
+    14→ * телеметрии, независимо от часового пояса браузера.
+    15→ */
+    16→import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+    17→import { AnimatePresence, motion } from 'framer-motion'
+    18→import {
+    19→  CalendarDays,
+    20→  Check,
+    21→  CheckCircle2,
+    22→  ChevronDown,
+    23→  ChevronLeft,
+    24→  ChevronRight,
+    25→  Clock3,
+    26→  Droplets,
+    27→  Hexagon,
+    28→  History,
+    29→  Loader2,
+    30→  MousePointerClick,
+    31→  RefreshCcw,
+    32→  Sparkles,
+    33→  Thermometer,
+    34→  TriangleAlert,
+    35→  Weight,
+    36→  X,
+    37→} from 'lucide-react'
+    38→import { ru } from 'date-fns/locale'
+    39→import { Button } from '@/components/ui/button'
+    40→import { Card, CardContent } from '@/components/ui/card'
+    41→import { Calendar } from '@/components/ui/calendar'
+    42→import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+    43→import { cn } from '@/lib/utils'
+    44→import { hiveWord } from '@/lib/hive-sync'
+    45→import type {
+    46→  HistoryAiResponse,
+    47→  HistoryInsightDto,
+    48→  HistoryLogDto,
+    49→  HistoryResponse,
+    50→  HistoryScope,
+    51→} from '@/lib/api-types'
+    52→
+    53→const ease = { duration: 0.25, ease: 'easeOut' as const }
+    54→
+    55→/* ------------------------------------------------------------------ */
+    56→/* Форматирование «стеночных часов» журнала (UTC)                      */
+    57→/* ------------------------------------------------------------------ */
+    58→
+    59→const MONTHS_GEN = [
+    60→  'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+    61→  'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря',
+    62→]
+    63→const MONTHS_NOM = [
+    64→  'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+    65→  'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь',
+    66→]
+    67→const WEEKDAYS = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+    68→
+    69→const pad2 = (n: number) => String(n).padStart(2, '0')
+    70→
+    71→/** «2026-08-29» → «29 августа 2026» (UTC). */
+    72→function fmtDateLabel(key: string): string {
+    73→  const [y, m, d] = key.split('-').map(Number)
+    74→  return `${d} ${MONTHS_GEN[m - 1]} ${y}`
+    75→}
+    76→
+    77→/** «2026-08» → «Август 2026». */
+    78→function fmtMonthLabel(key: string): string {
+    79→  const [y, m] = key.split('-').map(Number)
+    80→  return `${MONTHS_NOM[m - 1]} ${y}`
+    81→}
+    82→
+    83→/** ISO → «HH:MM» (UTC). */
+    84→function fmtTime(iso: string): string {
+    85→  const d = new Date(iso)
+    86→  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`
+    87→}
+    88→
+    89→const dayKeyOf = (d: Date) => d.toISOString().slice(0, 10)
+    90→const parseDayKey = (key: string) => new Date(`${key}T00:00:00Z`)
+    91→
+    92→function addDaysKey(key: string, days: number): string {
+    93→  const d = parseDayKey(key)
+    94→  d.setUTCDate(d.getUTCDate() + days)
+    95→  return dayKeyOf(d)
+    96→}
+    97→
+    98→function addMonthsKey(key: string, months: number): string {
+    99→  const [y, m] = key.split('-').map(Number)
+   100→  const d = new Date(Date.UTC(y, m - 1 + months, 1))
+   101→  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}`
+   102→}
+   103→
+   104→/* ------------------------------------------------------------------ */
+   105→/* Плавающая таблица изменений                                         */
+   106→/* ------------------------------------------------------------------ */
+   107→
+   108→interface PopRect {
+   109→  left: number
+   110→  right: number
+   111→  top: number
+   112→}
+   113→
+   114→interface PopState {
+   115→  rect: PopRect
+   116→  title: string
+   117→  subtitle?: string
+   118→  table: React.ReactNode
+   119→}
+   120→
+   121→/** Компактная таблица с дельтами: строка «время → параметры». */
+   122→function MiniTable({
+   123→  head,
+   124→  rows,
+   125→  highlight,
+   126→}: {
+   127→  head: string[]
+   128→  rows: Array<Array<React.ReactNode>>
+   129→  highlight?: number
+   130→}) {
+   131→  return (
+   132→    <table className="w-full border-collapse text-[11px]">
+   133→      <thead>
+   134→        <tr className="bg-red-50/80 dark:bg-[#2C211C]">
+   135→          {head.map((h, idx) => (
+   136→            <th
+   137→              // ключ по позиции: в шапке встречаются повторяющиеся названия («Δ»)
+   138→              key={idx}
+   139→              className="whitespace-nowrap px-2 py-1.5 text-left font-bold uppercase tracking-wide text-gray-500 first:rounded-tl-lg last:rounded-tr-lg"
+   140→            >
+   141→              {h}
+   142→            </th>
+   143→          ))}
+   144→        </tr>
+   145→      </thead>
+   146→      <tbody>
+   147→        {rows.map((cells, i) => (
+   148→          <tr
+   149→            key={i}
+   150→            className={cn(
+   151→              'border-t border-red-50 dark:border-[#2C211C]',
+   152→              i % 2 === 1 && 'bg-red-50/25 dark:bg-[#2A1D18]',
+   153→              highlight === i && 'bg-amber-50 ring-1 ring-inset ring-amber-200 dark:bg-[#3A2C14]',
+   154→            )}
+   155→          >
+   156→            {cells.map((c, j) => (
+   157→              <td key={j} className={cn('whitespace-nowrap px-2 py-1.5 tabular-nums', j === 0 && 'font-bold text-[#2A1A12] dark:text-[#E8D9CF]')}>
+   158→                {c}
+   159→              </td>
+   160→            ))}
+   161→          </tr>
+   162→        ))}
+   163→      </tbody>
+   164→    </table>
+   165→  )
+   166→}
+   167→
+   168→/** Стрелка дельты: зелёный рост, красное падение, серый ноль. */
+   169→function Delta({ v, unit }: { v: number; unit: string }) {
+   170→  const eps = unit === '°C' ? 0.05 : unit === '%' ? 0.5 : 0.05
+   171→  const up = v > eps
+   172→  const down = v < -eps
+   173→  return (
+   174→    <span
+   175→      className={cn(
+   176→        'inline-flex items-center gap-0.5 font-semibold',
+   177→        up && 'text-emerald-600',
+   178→        down && 'text-red-600',
+   179→        !up && !down && 'text-gray-400',
+   180→      )}
+   181→    >
+   182→      {up ? '↑' : down ? '↓' : '·'} {up || down ? `${v > 0 ? '+' : ''}${unit === '%' ? Math.round(v) : v.toFixed(1)}` : '0'}
+   183→    </span>
+   184→  )
+   185→}
+   186→
+   187→/** Всплывающее окно с подробной таблицей: следует за записью при наведении,
+   188→ *  закрепляется кликом (работает и на телефоне). */
+   189→function DetailPopup({
+   190→  pop,
+   191→  pinned,
+   192→  onEnter,
+   193→  onLeave,
+   194→  onClose,
+   195→}: {
+   196→  pop: PopState
+   197→  pinned: boolean
+   198→  onEnter: () => void
+   199→  onLeave?: () => void
+   200→  onClose: () => void
+   201→}) {
+   202→  const W = 372
+   203→  const space = typeof window !== 'undefined' ? window.innerWidth - pop.rect.right : 9999
+   204→  const left = space >= W + 16
+   205→    ? pop.rect.right + 12
+   206→    : Math.max(12, pop.rect.left - W - 12)
+   207→  const top = typeof window !== 'undefined'
+   208→    ? Math.max(12, Math.min(pop.rect.top - 8, window.innerHeight - 300))
+   209→    : pop.rect.top
+   210→  return (
+   211→    <motion.div
+   212→      initial={{ opacity: 0, y: 8, scale: 0.97 }}
+   213→      animate={{ opacity: 1, y: 0, scale: 1 }}
+   214→      exit={{ opacity: 0, y: 6, scale: 0.98 }}
+   215→      transition={ease}
+   216→      onMouseEnter={onEnter}
+   217→      onMouseLeave={onLeave}
+   218→      style={{ left, top, width: W }}
+   219→      className={cn(
+   220→        'fixed z-[61] overflow-hidden rounded-2xl border border-red-100 bg-white shadow-xl shadow-red-100/70 dark:bg-[#221814] dark:shadow-black/40',
+   221→        pinned && 'ring-2 ring-red-200',
+   222→      )}
+   223→    >
+   224→      <div className="flex items-start justify-between gap-2 border-b border-red-50 bg-red-50/50 px-3.5 py-2.5 dark:border-[#2C211C] dark:bg-[#2C211C]">
+   225→        <div className="min-w-0">
+   226→          <p className="truncate text-xs font-extrabold text-[#2A1A12] dark:text-[#E8D9CF]">{pop.title}</p>
+   227→          {pop.subtitle && <p className="mt-0.5 text-[10px] text-gray-400">{pop.subtitle}</p>}
+   228→        </div>
+   229→        {pinned && (
+   230→          <button
+   231→            onClick={onClose}
+   232→            aria-label="Закрыть таблицу"
+   233→            className="rounded-md p-1 text-gray-400 transition hover:bg-red-50 hover:text-red-600 dark:hover:bg-[#2C211C]"
+   234→          >
+   235→            <X className="h-3.5 w-3.5" />
+   236→          </button>
+   237→        )}
+   238→      </div>
+   239→      <div className="history-scroll max-h-[46vh] overflow-y-auto overscroll-contain px-1.5 py-1.5">
+   240→        {pop.table}
+   241→      </div>
+   242→    </motion.div>
+   243→  )
+   244→}
+   245→
+   246→/* ------------------------------------------------------------------ */
+   247→/* Мелкие блоки интерфейса                                             */
+   248→/* ------------------------------------------------------------------ */
+   249→
+   250→function SummaryChip({ icon, label, value }: { icon: React.ReactNode; label: string; value: React.ReactNode }) {
+   251→  return (
+   252→    <span className="inline-flex items-center gap-2 rounded-full border border-red-100 bg-white px-3.5 py-2 text-xs font-bold text-gray-600 shadow-sm dark:bg-[#221814]">
+   253→      <span className="text-red-600">{icon}</span>
+   254→      {value} <span className="font-semibold text-gray-400">{label}</span>
+   255→    </span>
+   256→  )
+   257→}
+   258→
+   259→/* Оформление выводов ИИ-анализа: опасно / предупреждение / норма */
+   260→const SEVERITY_META = {
+   261→  danger: {
+   262→    label: 'Проблема',
+   263→    wrap: 'border-red-200 bg-red-50/70 dark:bg-[#331B16]',
+   264→    badge: 'bg-red-600 text-white',
+   265→    title: 'text-red-700 dark:text-red-400',
+   266→    icon: <TriangleAlert className="h-4 w-4 shrink-0 text-red-600" />,
+   267→  },
+   268→  warn: {
+   269→    label: 'Внимание',
+   270→    wrap: 'border-amber-200 bg-amber-50/70 dark:bg-[#3A2C14]',
+   271→    badge: 'bg-amber-500 text-white',
+   272→    title: 'text-amber-700 dark:text-amber-400',
+   273→    icon: <TriangleAlert className="h-4 w-4 shrink-0 text-amber-600" />,
+   274→  },
+   275→  ok: {
+   276→    label: 'В норме',
+   277→    wrap: 'border-emerald-200 bg-emerald-50/70 dark:bg-[#16302A]',
+   278→    badge: 'bg-emerald-600 text-white',
+   279→    title: 'text-emerald-700 dark:text-emerald-400',
+   280→    icon: <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />,
+   281→  },
+   282→} as const
+   283→
+   284→/** Вывод ИИ-анализа: что не так + краткое, как исправить. */
+   285→function InsightCard({ f }: { f: HistoryInsightDto }) {
+   286→  const meta = SEVERITY_META[f.severity]
+   287→  return (
+   288→    <div className={cn('rounded-2xl border p-3.5', meta.wrap)}>
+   289→      <div className="flex flex-wrap items-center gap-2">
+   290→        {meta.icon}
+   291→        <p className={cn('text-sm font-extrabold', meta.title)}>{f.title}</p>
+   292→        <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide', meta.badge)}>
+   293→          {meta.label}
+   294→        </span>
+   295→        {f.pointName && (
+   296→          <span className="ml-auto inline-flex items-center gap-1 rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-gray-500 dark:bg-[#221814]">
+   297→            <Hexagon className="h-3 w-3 text-red-500" /> {f.pointName}
+   298→          </span>
+   299→        )}
+   300→      </div>
+   301→      <p className="mt-2 text-xs leading-relaxed text-gray-600 dark:text-gray-300">
+   302→        <span className="font-extrabold text-gray-700 dark:text-gray-200">Что не так: </span>
+   303→        {f.problem}
+   304→      </p>
+   305→      <p className="mt-1.5 text-xs leading-relaxed text-gray-600 dark:text-gray-300">
+   306→        <span className="font-extrabold text-gray-700 dark:text-gray-200">Как исправить: </span>
+   307→        {f.fix}
+   308→      </p>
+   309→      {f.metrics.length > 0 && (
+   310→        <div className="mt-2.5 flex flex-wrap gap-1.5">
+   311→          {f.metrics.map((m) => (
+   312→            <span key={m.label} className="rounded-lg bg-white px-2 py-1 text-[10px] font-bold text-gray-600 shadow-sm dark:bg-[#221814]">
+   313→              <span className="text-gray-400">{m.label}: </span>{m.value}
+   314→            </span>
+   315→          ))}
+   316→        </div>
+   317→      )}
+   318→    </div>
+   319→  )
+   320→}
+   321→
+   322→/** Мини-карточка показаний одного улья в конкретный час. */
+   323→function HourCard({
+   324→  name,
+   325→  log,
+   326→  alarm,
+   327→  onHover,
+   328→  onLeave,
+   329→  onClick,
+   330→}: {
+   331→  name: string
+   332→  log: HistoryLogDto
+   333→  alarm: boolean
+   334→  onHover: (el: HTMLElement) => void
+   335→  onLeave: () => void
+   336→  onClick: (el: HTMLElement) => void
+   337→}) {
+   338→  return (
+   339→    <div
+   340→      onMouseEnter={(e) => onHover(e.currentTarget)}
+   341→      onMouseLeave={onLeave}
+   342→      onClick={(e) => onClick(e.currentTarget)}
+   343→      className={cn(
+   344→        'cursor-pointer rounded-xl border px-2.5 py-2 transition-shadow hover:shadow-md',
+   345→        alarm
+   346→          ? 'border-red-300 bg-red-50/70 dark:bg-[#331B16]'
+   347→          : 'border-red-100 bg-red-50/40 dark:bg-[#2C211C]',
+   348→      )}
+   349→    >
+   350→      <p className="flex items-center gap-1 truncate text-[10px] font-bold text-gray-500">
+   351→        {alarm && <TriangleAlert className="h-3 w-3 shrink-0 text-red-500" />}
+   352→        {name}
+   353→      </p>
+   354→      <div className="mt-1 flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5 text-[11px] font-extrabold tabular-nums text-[#2A1A12] dark:text-[#E8D9CF]">
+   355→        <span className="inline-flex items-center gap-0.5">
+   356→          <Thermometer className="h-3 w-3 text-red-500" /> {log.tempC.toFixed(1)}°
+   357→        </span>
+   358→        <span className="inline-flex items-center gap-0.5">
+   359→          <Weight className="h-3 w-3 text-amber-500" /> {log.weightKg.toFixed(1)} кг
+   360→        </span>
+   361→        <span className="inline-flex items-center gap-0.5">
+   362→          <Droplets className="h-3 w-3 text-sky-500" /> {log.humidityPct}%
+   363→        </span>
+   364→      </div>
+   365→    </div>
+   366→  )
+   367→}
+   368→
+   369→/* ------------------------------------------------------------------ */
+   370→/* Основной экран                                                      */
+   371→/* ------------------------------------------------------------------ */
+   372→
+   373→export function HistoryView() {
+   374→  const [scope, setScope] = useState<HistoryScope>('day')
+   375→  /** Выбранный период: yyyy-MM-dd | yyyy-MM | yyyy; null — «последние записи». */
+   376→  const [dateKey, setDateKey] = useState<string | null>(null)
+   377→  /** Каскадный выбор: сначала пасека, потом конкретный улей. */
+   378→  const [groupFilter, setGroupFilter] = useState<'all' | string>('all')
+   379→  const [pointFilter, setPointFilter] = useState<'all' | string>('all')
+   380→  const [pickerOpen, setPickerOpen] = useState(false)
+   381→  /** Открытая пасека внутри выбора: 'root' — список пасек, id — список её ульев. */
+   382→  const [pickerLevel, setPickerLevel] = useState<'root' | string>('root')
+   383→  const [data, setData] = useState<HistoryResponse | null>(null)
+   384→  const [calOpen, setCalOpen] = useState(false)
+   385→  const [reloadTick, setReloadTick] = useState(0)
+   386→
+   387→  const [hoverPop, setHoverPop] = useState<PopState | null>(null)
+   388→  const [pinnedPop, setPinnedPop] = useState<PopState | null>(null)
+   389→  const leaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+   390→
+   391→  const range = data?.range ?? { from: '2026-07-01', to: '2026-08-29' }
+   392→
+   393→  /* Загрузка: состояние «загрузки/ошибки» производное от ключа периода —
+   394→     без setState внутри тела эффекта (правило react-hooks). */
+   395→  const defaultYear = range.to.slice(0, 4)
+   396→  const currentKey = `${scope}|${dateKey ?? (scope === 'year' ? defaultYear : 'latest')}|${reloadTick}`
+   397→  const [loadedKey, setLoadedKey] = useState<string | null>(null)
+   398→  const [errState, setErrState] = useState<{ key: string; message: string } | null>(null)
+   399→  const loading = loadedKey !== currentKey
+   400→  const error = errState && errState.key === currentKey ? errState.message : null
+   401→
+   402→  useEffect(() => {
+   403→    const ctrl = new AbortController()
+   404→    const q = dateKey
+   405→      ? scope === 'day'
+   406→        ? `date=${dateKey}`
+   407→        : scope === 'month'
+   408→          ? `month=${dateKey}`
+   409→          : `year=${dateKey}`
+   410→      : scope === 'year'
+   411→        ? `year=${defaultYear}`
+   412→        : ''
+   413→    fetch(`/api/history?scope=${scope}${q ? `&${q}` : ''}`, { cache: 'no-store', signal: ctrl.signal })
+   414→      .then(async (res) => {
+   415→        const j = (await res.json().catch(() => ({}))) as HistoryResponse & { error?: string }
+   416→        if (!res.ok) throw new Error(j.error ?? `HTTP ${res.status}`)
+   417→        return j
+   418→      })
+   419→      .then((j) => {
+   420→        if (ctrl.signal.aborted) return
+   421→        setData(j)
+   422→        setHoverPop(null)
+   423→        setPinnedPop(null)
+   424→        setErrState(null)
+   425→        const resolvedDate = dateKey ?? j.date
+   426→        setLoadedKey(`${scope}|${resolvedDate}|${reloadTick}`)
+   427→        if (!dateKey) setDateKey(j.date)
+   428→      })
+   429→      .catch((e: unknown) => {
+   430→        if (e instanceof DOMException && e.name === 'AbortError') return
+   431→        setErrState({
+   432→          key: `${scope}|${dateKey ?? (scope === 'year' ? defaultYear : 'latest')}|${reloadTick}`,
+   433→          message: e instanceof Error ? e.message : 'Не удалось загрузить журнал',
+   434→        })
+   435→        setLoadedKey(`${scope}|${dateKey ?? (scope === 'year' ? defaultYear : 'latest')}|${reloadTick}`)
+   436→      })
+   437→    return () => ctrl.abort()
+   438→  }, [scope, dateKey, reloadTick, defaultYear])
+   439→
+   440→  /* ИИ-анализ периода: запускается, когда журнал загружен, и следует за
+   441→     выбранным периодом и ульем. Анализ делает /api/history/ai — агент смотрит
+   442→     на те же данные, что и графики, и объясняет, как исправить отклонения. */
+   443→  const [aiData, setAiData] = useState<HistoryAiResponse | null>(null)
+   444→  const [aiKey, setAiKey] = useState<string | null>(null)
+   445→  const [aiErr, setAiErr] = useState<string | null>(null)
+   446→  const expectedAiKey = data ? `${scope}|${data.date}|${pointFilter}|${reloadTick}` : null
+   447→  const aiLoading = expectedAiKey !== null && aiKey !== expectedAiKey
+   448→
+   449→  useEffect(() => {
+   450→    if (!data || loading) return
+   451→    const key = `${scope}|${data.date}|${pointFilter}|${reloadTick}`
+   452→    if (aiKey === key) return
+   453→    const ctrl = new AbortController()
+   454→    const dateParam =
+   455→      scope === 'day' ? `date=${data.date}` : scope === 'month' ? `month=${data.date}` : `year=${data.date}`
+   456→    const pointQ = pointFilter !== 'all' ? `&pointId=${encodeURIComponent(pointFilter)}` : ''
+   457→    fetch(`/api/history/ai?scope=${scope}&${dateParam}${pointQ}`, { cache: 'no-store', signal: ctrl.signal })
+   458→      .then(async (res) => {
+   459→        const j = (await res.json().catch(() => ({}))) as HistoryAiResponse & { error?: string }
+   460→        if (!res.ok) throw new Error(j.error ?? `HTTP ${res.status}`)
+   461→        return j
+   462→      })
+   463→      .then((j) => {
+   464→        if (ctrl.signal.aborted) return
+   465→        setAiData(j)
+   466→        setAiKey(key)
+   467→        setAiErr(null)
+   468→      })
+   469→      .catch((e: unknown) => {
+   470→        if (e instanceof DOMException && e.name === 'AbortError') return
+   471→        setAiKey(key)
+   472→        setAiErr(e instanceof Error ? e.message : 'Не удалось получить анализ')
+   473→      })
+   474→    return () => ctrl.abort()
+   475→  }, [data, loading, scope, pointFilter, reloadTick, aiKey])
+   476→
+   477→  /* Всплывающие таблицы */
+   478→  const openPop = useCallback(
+   479→    (el: HTMLElement, title: string, subtitle: string | undefined, table: React.ReactNode) => {
+   480→      if (leaveTimer.current) {
+   481→        clearTimeout(leaveTimer.current)
+   482→        leaveTimer.current = null
+   483→      }
+   484→      const r = el.getBoundingClientRect()
+   485→      setHoverPop({ rect: { left: r.left, right: r.right, top: r.top }, title, subtitle, table })
+   486→    },
+   487→    [],
+   488→  )
+   489→  const closePopSoon = useCallback(() => {
+   490→    if (leaveTimer.current) clearTimeout(leaveTimer.current)
+   491→    leaveTimer.current = setTimeout(() => setHoverPop(null), 180)
+   492→  }, [])
+   493→  const keepPop = useCallback(() => {
+   494→    if (leaveTimer.current) {
+   495→      clearTimeout(leaveTimer.current)
+   496→      leaveTimer.current = null
+   497→    }
+   498→  }, [])
+   499→  const pinPop = useCallback(
+   500→    (el: HTMLElement, title: string, subtitle: string | undefined, table: React.ReactNode) => {
+   501→      const r = el.getBoundingClientRect()
+   502→      const st = { rect: { left: r.left, right: r.right, top: r.top }, title, subtitle, table }
+   503→      setPinnedPop((prev) =>
+   504→        prev && prev.title === title && prev.rect.top === st.rect.top ? null : st,
+   505→      )
+   506→    },
+   507→    [],
+   508→  )
+   509→  useEffect(() => () => void (leaveTimer.current && clearTimeout(leaveTimer.current)), [])
+   510→
+   511→  /* Данные журнала с каскадным фильтром «пасека → улей» */
+   512→  const groups = data?.groups ?? []
+   513→  const pointName = useMemo(() => {
+   514→    const m = new Map<string, string>()
+   515→    for (const p of data?.points ?? []) m.set(p.id, p.name)
+   516→    return m
+   517→  }, [data])
+   518→
+   519→  /** Попадает ли улей в текущий выбор пасеки/улья. */
+   520→  const matchPoint = useCallback(
+   521→    (pid: string) => {
+   522→      if (pointFilter !== 'all') return pid === pointFilter
+   523→      if (groupFilter === 'all') return true
+   524→      return groups.find((g) => g.id === groupFilter)?.pointIds.includes(pid) ?? false
+   525→    },
+   526→    [pointFilter, groupFilter, groups],
+   527→  )
+   528→
+   529→  const filteredLogs = useMemo(() => {
+   530→    if (!data?.logs) return []
+   531→    return data.logs.filter((l) => matchPoint(l.pointId))
+   532→  }, [data, matchPoint])
+   533→
+   534→  /* День: группировка по часам */
+   535→  const dayHours = useMemo(() => {
+   536→    const map = new Map<number, HistoryLogDto[]>()
+   537→    for (const l of filteredLogs) {
+   538→      const h = new Date(l.recordedAt).getUTCHours()
+   539→      const arr = map.get(h)
+   540→      if (arr) arr.push(l)
+   541→      else map.set(h, [l])
+   542→    }
+   543→    return [...map.entries()].sort(([a], [b]) => a - b)
+   544→  }, [filteredLogs])
+   545→
+   546→  /* Сводки периода */
+   547→  const daySummary = useMemo(() => {
+   548→    if (filteredLogs.length === 0) return null
+   549→    const avgT = filteredLogs.reduce((s, l) => s + l.tempC, 0) / filteredLogs.length
+   550→    const avgH = filteredLogs.reduce((s, l) => s + l.humidityPct, 0) / filteredLogs.length
+   551→    const byPoint = new Map<string, { first: number; last: number }>()
+   552→    for (const l of filteredLogs) {
+   553→      const acc = byPoint.get(l.pointId) ?? { first: l.weightKg, last: l.weightKg }
+   554→      acc.last = l.weightKg
+   555→      byPoint.set(l.pointId, acc)
+   556→    }
+   557→    const gain = [...byPoint.values()].reduce((s, v) => s + (v.last - v.first), 0)
+   558→    const alarms = filteredLogs.filter((l) => l.alarm).length
+   559→    return { avgT, avgH, gain, alarms, logs: filteredLogs.length }
+   560→  }, [filteredLogs])
+   561→
+   562→  const monthSummary = useMemo(() => {
+   563→    const days = (data?.days ?? []).filter((d) => d.perPoint.some((p) => matchPoint(p.pointId)))
+   564→    if (days.length === 0) return null
+   565→    const pts = days.flatMap((d) => d.perPoint.filter((p) => matchPoint(p.pointId)))
+   566→    const avgT = pts.reduce((s, p) => s + p.avgTempC * p.logs, 0) / pts.reduce((s, p) => s + p.logs, 0)
+   567→    const avgH = pts.reduce((s, p) => s + p.avgHumidityPct * p.logs, 0) / pts.reduce((s, p) => s + p.logs, 0)
+   568→    const gain = pts.reduce((s, p) => s + p.deltaWeightKg, 0)
+   569→    const alarms = pts.reduce((s, p) => s + p.alarms, 0)
+   570→    const logs = pts.reduce((s, p) => s + p.logs, 0)
+   571→    return { days: days.length, avgT, avgH, gain, alarms, logs }
+   572→  }, [data, matchPoint])
+   573→
+   574→  const yearSummary = useMemo(() => {
+   575→    const months = (data?.months ?? []).filter((m) => m.perPoint.some((p) => matchPoint(p.pointId)))
+   576→    if (months.length === 0) return null
+   577→    const pts = months.flatMap((m) => m.perPoint.filter((p) => matchPoint(p.pointId)))
+   578→    const avgT = pts.reduce((s, p) => s + p.avgTempC * p.logs, 0) / pts.reduce((s, p) => s + p.logs, 0)
+   579→    const avgH = pts.reduce((s, p) => s + p.avgHumidityPct * p.logs, 0) / pts.reduce((s, p) => s + p.logs, 0)
+   580→    const gain = pts.reduce((s, p) => s + p.deltaWeightKg, 0)
+   581→    const alarms = pts.reduce((s, p) => s + p.alarms, 0)
+   582→    const logs = pts.reduce((s, p) => s + p.logs, 0)
+   583→    return { months: months.length, avgT, avgH, gain, alarms, logs }
+   584→  }, [data, matchPoint])
+   585→
+   586→  /* Таблицы для всплывающих окон */
+   587→
+   588→  /** Почасовые изменения одной семьи за выбранный день. */
+   589→  const dayHiveTable = useCallback(
+   590→    (pointId: string, hour: number) => {
+   591→      const logs = data?.logs?.filter((l) => l.pointId === pointId) ?? []
+   592→      const rows = logs.map((l, i) => {
+   593→        const prev = i > 0 ? logs[i - 1] : null
+   594→        return [
+   595→          fmtTime(l.recordedAt),
+   596→          `${l.weightKg.toFixed(1)} кг`,
+   597→          <Delta key="dw" v={prev ? l.weightKg - prev.weightKg : 0} unit="кг" />,
+   598→          `${l.tempC.toFixed(1)}°C`,
+   599→          <Delta key="dt" v={prev ? l.tempC - prev.tempC : 0} unit="°C" />,
+   600→          `${l.humidityPct}%`,
+   601→          <Delta key="dh" v={prev ? l.humidityPct - prev.humidityPct : 0} unit="%" />,
+   602→        ]
+   603→      })
+   604→      return (
+   605→        <MiniTable
+   606→          head={['Час', 'Вес', 'Δ', 'Темп.', 'Δ', 'Влажн.', 'Δ']}
+   607→          rows={rows}
+   608→          highlight={hour}
+   609→        />
+   610→      )
+   611→    },
+   612→    [data],
+   613→  )
+   614→
+   615→  /** Снимок всех ульев в конкретный час (в рамках выбранной пасеки/улья). */
+   616→  const hourSnapshotTable = useCallback(
+   617→    (hour: number) => {
+   618→      const logs = filteredLogs.filter((l) => new Date(l.recordedAt).getUTCHours() === hour)
+   619→      const rows = logs.map((l) => [
+   620→        pointName.get(l.pointId) ?? 'Улей',
+   621→        `${l.weightKg.toFixed(1)} кг`,
+   622→        `${l.tempC.toFixed(1)}°C`,
+   623→        `${l.humidityPct}%`,
+   624→        l.alarm ? <span key="a" className="inline-flex items-center gap-1 font-bold text-red-600"><TriangleAlert className="h-3 w-3" /> тревога</span> : <span key="a" className="text-emerald-600">норма</span>,
+   625→      ])
+   626→      return <MiniTable head={['Улей', 'Вес', 'Темп.', 'Влажн.', 'Статус']} rows={rows} />
+   627→    },
+   628→    [filteredLogs, pointName],
+   629→  )
+   630→
+   631→  /** Сводка по ульям за день (месячный вид). */
+   632→  const monthDayTable = useCallback(
+   633→    (date: string) => {
+   634→      const day = data?.days?.find((d) => d.date === date)
+   635→      const per = (day?.perPoint ?? []).filter((p) => matchPoint(p.pointId))
+   636→      const rows = per.map((p) => [
+   637→        pointName.get(p.pointId) ?? 'Улей',
+   638→        `${p.startWeightKg.toFixed(1)} кг`,
+   639→        `${p.endWeightKg.toFixed(1)} кг`,
+   640→        <span key="d" className={cn('font-bold', p.deltaWeightKg >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+   641→          {p.deltaWeightKg >= 0 ? '+' : ''}{p.deltaWeightKg.toFixed(1)} кг
+   642→        </span>,
+   643→        `${p.avgTempC.toFixed(1)}°C`,
+   644→        `${p.minTempC.toFixed(1)}…${p.maxTempC.toFixed(1)}°C`,
+   645→        `${p.avgHumidityPct}%`,
+   646→        `${p.logs}`,
+   647→        p.alarms > 0 ? <span key="a" className="font-bold text-red-600">{p.alarms}</span> : <span key="a" className="text-gray-400">0</span>,
+   648→      ])
+   649→      return (
+   650→        <MiniTable
+   651→          head={['Улей', 'Вес утро', 'Вес вечер', 'Δ за день', 'Ср t°', 't макс/мин', 'Ср влажн.', 'Записей', 'Событий']}
+   652→          rows={rows}
+   653→        />
+   654→      )
+   655→    },
+   656→    [data, matchPoint, pointName],
+   657→  )
+   658→
+   659→  /** Сводка по ульям за месяц (годовой вид). */
+   660→  const yearMonthTable = useCallback(
+   661→    (month: string) => {
+   662→      const m = data?.months?.find((x) => x.month === month)
+   663→      const per = (m?.perPoint ?? []).filter((p) => matchPoint(p.pointId))
+   664→      const rows = per.map((p) => [
+   665→        pointName.get(p.pointId) ?? 'Улей',
+   666→        `${p.avgTempC.toFixed(1)}°C`,
+   667→        `${p.avgHumidityPct}%`,
+   668→        <span key="d" className={cn('font-bold', p.deltaWeightKg >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+   669→          {p.deltaWeightKg >= 0 ? '+' : ''}{p.deltaWeightKg.toFixed(1)} кг
+   670→        </span>,
+   671→        `${p.logs}`,
+   672→        p.alarms > 0 ? <span key="a" className="font-bold text-red-600">{p.alarms}</span> : <span key="a" className="text-gray-400">0</span>,
+   673→      ])
+   674→      return <MiniTable head={['Улей', 'Ср t°', 'Ср влажн.', 'Набор веса', 'Записей', 'Событий']} rows={rows} />
+   675→    },
+   676→    [data, matchPoint, pointName],
+   677→  )
+   678→
+   679→  /* Переключение периодов */
+   680→
+   681→  const clampDayKey = (key: string) =>
+   682→    key < range.from ? range.from : key > range.to ? range.to : key
+   683→
+   684→  /** «2026-08-29» / «2026-08» / «2026» → ключ дня в пределах диапазона журнала. */
+   685→  const asDayKey = (k: string) => {
+   686→    if (k.length === 10) return k
+   687→    if (k.length === 7) return `${k}-01`
+   688→    return `${k}-${range.from.slice(5, 7)}-01`
+   689→  }
+   690→
+   691→  const clampMonthKey = (key: string) => {
+   692→    const from = range.from.slice(0, 7)
+   693→    const to = range.to.slice(0, 7)
+   694→    return key < from ? from : key > to ? to : key
+   695→  }
+   696→
+   697→  const switchScope = (next: HistoryScope) => {
+   698→    if (next === scope) return
+   699→    const cur = dateKey ?? range.to
+   700→    let key: string
+   701→    if (next === 'day') key = clampDayKey(asDayKey(cur))
+   702→    else if (next === 'month') key = clampMonthKey(cur.slice(0, 7))
+   703→    else {
+   704→      const y = Number(cur.slice(0, 4))
+   705→      const minY = Number(range.from.slice(0, 4))
+   706→      const maxY = Number(range.to.slice(0, 4))
+   707→      key = String(Math.max(minY, Math.min(maxY, y)))
+   708→    }
+   709→    setScope(next)
+   710→    setDateKey(key)
+   711→  }
+   712→
+   713→  const step = (dir: 1 | -1) => {
+   714→    const cur = dateKey ?? range.to
+   715→    if (scope === 'day') setDateKey(clampDayKey(addDaysKey(cur, dir)))
+   716→    else if (scope === 'month') {
+   717→      const mk = addMonthsKey(cur, dir)
+   718→      setDateKey(mk < range.from.slice(0, 7) ? range.to.slice(0, 7) : mk > range.to.slice(0, 7) ? range.from.slice(0, 7) : mk)
+   719→    } else {
+   720→      const y = Number(cur) + dir
+   721→      const minY = Number(range.from.slice(0, 4))
+   722→      const maxY = Number(range.to.slice(0, 4))
+   723→      setDateKey(String(Math.max(minY, Math.min(maxY, y))))
+   724→    }
+   725→  }
+   726→
+   727→  const periodLabel = !dateKey
+   728→    ? 'Последние записи'
+   729→    : scope === 'day'
+   730→      ? fmtDateLabel(dateKey)
+   731→      : scope === 'month'
+   732→        ? fmtMonthLabel(dateKey)
+   733→        : `${dateKey} год`
+   734→
+   735→  const atStart = !dateKey
+   736→    ? false
+   737→    : scope === 'day'
+   738→      ? dateKey <= range.from
+   739→      : scope === 'month'
+   740→        ? dateKey <= range.from.slice(0, 7)
+   741→        : Number(dateKey) <= Number(range.from.slice(0, 4))
+   742→  const atEnd = !dateKey
+   743→    ? false
+   744→    : scope === 'day'
+   745→      ? dateKey >= range.to
+   746→      : scope === 'month'
+   747→        ? dateKey >= range.to.slice(0, 7)
+   748→        : Number(dateKey) >= Number(range.to.slice(0, 4))
+   749→
+   750→  const calendarMonth = useMemo(() => {
+   751→    const base = dateKey ?? range.to
+   752→    const key = scope === 'day' ? base : scope === 'month' ? `${base}-01` : `${base}-${range.to.slice(5, 7)}-01`
+   753→    return parseDayKey(key)
+   754→  }, [dateKey, scope, calOpen, range])
+   755→
+   756→  const hasSensorPoints = (data?.points.length ?? 0) > 0
+   757→  const showPop = pinnedPop ?? hoverPop
+   758→
+   759→  /* ---------------------------------------------------------------- */
+   760→
+   761→  return (
+   762→    <div className="mx-auto max-w-6xl space-y-5">
+   763→      {/* Стиль скроллбара журнала */}
+   764→      <style>{`
+   765→        .history-scroll::-webkit-scrollbar { width: 8px }
+   766→        .history-scroll::-webkit-scrollbar-thumb { background: #f0d5c8; border-radius: 999px }
+   767→        .history-scroll::-webkit-scrollbar-track { background: transparent }
+   768→        .dark .history-scroll::-webkit-scrollbar-thumb { background: #3a2a22 }
+   769→      `}</style>
+   770→
+   771→      {/* Заголовок */}
+   772→      <div className="flex flex-wrap items-center justify-between gap-2">
+   773→        <div>
+   774→          <h1 className="flex items-center gap-2 text-2xl font-extrabold tracking-tight text-[#2A1A12]">
+   775→            <History className="h-6 w-6 text-red-600" /> История событий
+   776→          </h1>
+   777→          <p className="mt-1 max-w-2xl text-sm text-gray-500">
+   778→            Журнал датчиков ульев: температура, влажность и масса фиксируются каждый час.
+   779→            Выберите пасеку и улей кнопкой справа, наведите на запись — всплывёт таблица изменений,
+   780→            а ИИ-агент следит за показателями и подсказывает, что делать при отклонениях.
+   781→          </p>
+   782→        </div>
+   783→        <span className="inline-flex items-center gap-1.5 rounded-full border border-red-100 bg-white px-3 py-1.5 text-[11px] font-semibold text-gray-400 shadow-sm dark:bg-[#221814]">
+   784→          <MousePointerClick className="h-3.5 w-3.5 text-red-500" /> клик закрепляет таблицу
+   785→        </span>
+   786→      </div>
+   787→
+   788→      {/* Панель периодов */}
+   789→      <Card className="border-red-100 dark:bg-[#221814]">
+   790→        <CardContent className="flex flex-wrap items-center gap-2.5 p-3.5">
+   791→          {/* День / Месяц / Год */}
+   792→          <div className="flex rounded-full border border-red-100 bg-red-50/50 p-1 dark:border-[#2C211C] dark:bg-[#2C211C]">
+   793→            {([
+   794→              { id: 'day', label: 'День' },
+   795→              { id: 'month', label: 'Месяц' },
+   796→              { id: 'year', label: 'Год' },
+   797→            ] as const).map((t) => (
+   798→              <button
+   799→                key={t.id}
+   800→                onClick={() => switchScope(t.id)}
+   801→                aria-pressed={scope === t.id}
+   802→                className={cn(
+   803→                  'rounded-full px-4 py-1.5 text-xs font-extrabold transition-all',
+   804→                  scope === t.id
+   805→                    ? 'bg-gradient-to-r from-red-600 to-orange-500 text-white shadow-md shadow-red-100'
+   806→                    : 'text-gray-500 hover:text-red-600',
+   807→                )}
+   808→              >
+   809→                {t.label}
+   810→              </button>
+   811→            ))}
+   812→          </div>
+   813→
+   814→          {/* Шаг назад/вперёд */}
+   815→          <div className="flex items-center gap-1">
+   816→            <Button
+   817→              size="icon"
+   818→              variant="outline"
+   819→              className="h-9 w-9 rounded-full border-red-100"
+   820→              disabled={atStart}
+   821→              onClick={() => step(-1)}
+   822→              aria-label="Предыдущий период"
+   823→            >
+   824→              <ChevronLeft className="h-4 w-4" />
+   825→            </Button>
+   826→            <span className="min-w-[170px] text-center text-sm font-extrabold tabular-nums text-[#2A1A12] dark:text-[#E8D9CF]">
+   827→              {periodLabel}
+   828→            </span>
+   829→            <Button
+   830→              size="icon"
+   831→              variant="outline"
+   832→              className="h-9 w-9 rounded-full border-red-100"
+   833→              disabled={atEnd}
+   834→              onClick={() => step(1)}
+   835→              aria-label="Следующий период"
+   836→            >
+   837→              <ChevronRight className="h-4 w-4" />
+   838→            </Button>
+   839→          </div>
+   840→
+   841→          {/* Календарь */}
+   842→          <Popover open={calOpen} onOpenChange={setCalOpen}>
+   843→            <PopoverTrigger asChild>
+   844→              <Button variant="outline" className="h-9 gap-1.5 rounded-full border-red-100 text-xs font-bold">
+   845→                <CalendarDays className="h-4 w-4 text-red-600" /> Календарь
+   846→              </Button>
+   847→            </PopoverTrigger>
+   848→            <PopoverContent align="start" className="w-auto p-0">
+   849→              <Calendar
+   850→                mode="single"
+   851→                locale={ru}
+   852→                captionLayout="dropdown"
+   853→                formatters={{
+   854→                  // подпись месяца в выпадающем списке — по-русски (в компоненте
+   855→                  // календаря локаль по умолчанию — «default» браузера)
+   856→                  formatMonthDropdown: (m) => MONTHS_NOM[m.getMonth()],
+   857→                }}
+   858→                defaultMonth={calendarMonth}
+   859→                selected={scope === 'day' && dateKey ? parseDayKey(dateKey) : undefined}
+   860→                onSelect={(d) => {
+   861→                  if (!d) return
+   862→                  setScope('day')
+   863→                  setDateKey(dayKeyOf(d))
+   864→                  setCalOpen(false)
+   865→                }}
+   866→                disabled={[{ before: parseDayKey(range.from), after: parseDayKey(range.to) }]}
+   867→              />
+   868→              <p className="border-t border-red-50 px-3 py-2 text-[10px] leading-relaxed text-gray-400 dark:border-[#2C211C]">
+   869→                Журнал ведётся с 1 июля по 29 августа 2026 — клик по числу открывает этот день.
+   870→              </p>
+   871→            </PopoverContent>
+   872→          </Popover>
+   873→
+   874→          {/* Каскадный выбор: пасека → улей */}
+   875→          {hasSensorPoints && (
+   876→            <div className="ml-auto flex flex-wrap items-center gap-1.5">
+   877→              <button
+   878→                onClick={() => {
+   879→                  setPointFilter('all')
+   880→                  setGroupFilter('all')
+   881→                }}
+   882→                className={cn(
+   883→                  'rounded-full px-3 py-1.5 text-[11px] font-bold transition',
+   884→                  pointFilter === 'all' && groupFilter === 'all'
+   885→                    ? 'bg-red-600 text-white shadow-sm'
+   886→                    : 'bg-red-50 text-gray-500 hover:text-red-600 dark:bg-[#2C211C]',
+   887→                )}
+   888→              >
+   889→                Все ульи
+   890→              </button>
+   891→
+   892→              <Popover
+   893→                open={pickerOpen}
+   894→                onOpenChange={(v) => {
+   895→                  setPickerOpen(v)
+   896→                  if (!v) setPickerLevel('root')
+   897→                }}
+   898→              >
+   899→                <PopoverTrigger asChild>
+   900→                  <Button
+   901→                    variant="outline"
+   902→                    aria-label="Выбрать пасеку и улей"
+   903→                    className={cn(
+   904→                      'h-9 gap-1.5 rounded-full border-red-100 text-[11px] font-bold',
+   905→                      (pointFilter !== 'all' || groupFilter !== 'all') && 'border-red-300 bg-red-50 text-red-700',
+   906→                    )}
+   907→                  >
+   908→                    <Hexagon className="h-3.5 w-3.5 text-red-600" />
+   909→                    {pointFilter !== 'all'
+   910→                      ? (pointName.get(pointFilter) ?? 'Улей')
+   911→                      : groupFilter !== 'all'
+   912→                        ? (groups.find((g) => g.id === groupFilter)?.name ?? 'Пасека')
+   913→                        : 'Пасека и улей'}
+   914→                    <ChevronDown className="h-3.5 w-3.5 text-gray-400" />
+   915→                  </Button>
+   916→                </PopoverTrigger>
+   917→                <PopoverContent align="end" className="w-72 p-2">
+   918→                  {pickerLevel === 'root' ? (
+   919→                    <>
+   920→                      <p className="px-2 pb-1.5 pt-1 text-[10px] font-bold uppercase tracking-wide text-gray-400">
+   921→                        Выберите пасеку
+   922→                      </p>
+   923→                      <div className="space-y-0.5">
+   924→                        {groups.map((g) => (
+   925→                          <button
+   926→                            key={g.id}
+   927→                            onClick={() => setPickerLevel(g.id)}
+   928→                            className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left transition hover:bg-red-50 dark:hover:bg-[#2C211C]"
+   929→                          >
+   930→                            <Hexagon className="h-4 w-4 shrink-0 text-red-500" />
+   931→                            <span className="min-w-0 flex-1">
+   932→                              <span className="block truncate text-xs font-extrabold text-[#2A1A12] dark:text-[#E8D9CF]">
+   933→                                {g.name}
+   934→                              </span>
+   935→                              <span className="text-[10px] font-semibold text-gray-400">
+   936→                                {g.pointIds.length} {hiveWord(g.pointIds.length)} · далее выберите улей
+   937→                              </span>
+   938→                            </span>
+   939→                            {groupFilter === g.id && <Check className="h-4 w-4 shrink-0 text-red-600" />}
+   940→                            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-gray-300" />
+   941→                          </button>
+   942→                        ))}
+   943→                      </div>
+   944→                      <p className="mt-1.5 border-t border-red-50 px-2 pb-1 pt-2 text-[10px] leading-relaxed text-gray-400 dark:border-[#2C211C]">
+   945→                        Ульи собраны в пасеки по месту установки датчиков. Внутри пасеки — все её ульи.
+   946→                      </p>
+   947→                    </>
+   948→                  ) : (
+   949→                    <>
+   950→                      <button
+   951→                        onClick={() => setPickerLevel('root')}
+   952→                        className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-[11px] font-extrabold text-red-700 transition hover:bg-red-50 dark:hover:bg-[#2C211C]"
+   953→                      >
+   954→                        <ChevronLeft className="h-3.5 w-3.5" /> Все пасеки
+   955→                      </button>
+   956→                      {(() => {
+   957→                        const g = groups.find((x) => x.id === pickerLevel)
+   958→                        if (!g) return null
+   959→                        const pts = g.pointIds
+   960→                          .map((pid) => ({ id: pid, name: pointName.get(pid) ?? 'Улей' }))
+   961→                          .sort((a, b) => {
+   962→                            const ai = (data?.points ?? []).findIndex((p) => p.id === a.id)
+   963→                            const bi = (data?.points ?? []).findIndex((p) => p.id === b.id)
+   964→                            return ai - bi
+   965→                          })
+   966→                        return (
+   967→                          <>
+   968→                            <p className="flex items-center gap-2 px-2 pt-1 text-xs font-extrabold text-[#2A1A12] dark:text-[#E8D9CF]">
+   969→                              <Hexagon className="h-4 w-4 text-red-500" /> {g.name}
+   970→                            </p>
+   971→                            <button
+   972→                              onClick={() => {
+   973→                                setGroupFilter(g.id)
+   974→                                setPointFilter('all')
+   975→                                setPickerOpen(false)
+   976→                              }}
+   977→                              className={cn(
+   978→                                'mt-1.5 flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left transition hover:bg-red-50 dark:hover:bg-[#2C211C]',
+   979→                                groupFilter === g.id && pointFilter === 'all' && 'bg-red-50 dark:bg-[#2C211C]',
+   980→                              )}
+   981→                            >
+   982→                              <span className="min-w-0 flex-1 text-xs font-bold text-gray-600 dark:text-gray-300">
+   983→                                Все ульи пасеки ({pts.length})
+   984→                              </span>
+   985→                              {groupFilter === g.id && pointFilter === 'all' && (
+   986→                                <Check className="h-4 w-4 shrink-0 text-red-600" />
+   987→                              )}
+   988→                            </button>
+   989→                            <div className="mt-0.5 space-y-0.5">
+   990→                              {pts.map((p) => (
+   991→                                <button
+   992→                                  key={p.id}
+   993→                                  onClick={() => {
+   994→                                    setGroupFilter(g.id)
+   995→                                    setPointFilter(p.id)
+   996→                                    setPickerOpen(false)
+   997→                                  }}
+   998→                                  className={cn(
+   999→                                    'flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left transition hover:bg-red-50 dark:hover:bg-[#2C211C]',
+  1000→                                    pointFilter === p.id && 'bg-red-50 dark:bg-[#2C211C]',
+  1001→                                  )}
+  1002→                                >
+  1003→                                  <span className="min-w-0 flex-1 truncate text-xs font-bold text-[#2A1A12] dark:text-[#E8D9CF]">
+  1004→                                    {p.name}
+  1005→                                  </span>
+  1006→                                  {pointFilter === p.id && <Check className="h-4 w-4 shrink-0 text-red-600" />}
+  1007→                                </button>
+  1008→                              ))}
+  1009→                            </div>
+  1010→                          </>
+  1011→                        )
+  1012→                      })()}
+  1013→                    </>
+  1014→                  )}
+  1015→                </PopoverContent>
+  1016→              </Popover>
+  1017→            </div>
+  1018→          )}
+  1019→        </CardContent>
+  1020→      </Card>
+  1021→
+  1022→      {/* Состояния */}
+  1023→      {error && (
+  1024→        <Card className="border-red-200">
+  1025→          <CardContent className="flex flex-col items-start gap-3 p-5">
+  1026→            <p className="text-sm font-semibold text-red-600">Не удалось загрузить журнал: {error}</p>
+  1027→            <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setReloadTick((t) => t + 1)}>
+  1028→              <RefreshCcw className="h-3.5 w-3.5" /> Повторить
+  1029→            </Button>
+  1030→          </CardContent>
+  1031→        </Card>
+  1032→      )}
+  1033→
+  1034→      {!error && !data && loading && (
+  1035→        <div className="space-y-3">
+  1036→          {[0, 1, 2, 3].map((i) => (
+  1037→            <div key={i} className="h-16 animate-pulse rounded-2xl bg-red-100/50" />
+  1038→          ))}
+  1039→        </div>
+  1040→      )}
+  1041→
+  1042→      {!error && data && !hasSensorPoints && (
+  1043→        <Card className="border-dashed border-red-200 bg-red-50/30 dark:bg-[#221814]">
+  1044→          <CardContent className="flex flex-col items-center gap-2 p-8 text-center">
+  1045→            <History className="h-8 w-8 text-red-300" />
+  1046→            <p className="font-bold text-[#2A1A12]">Журнала пока нет</p>
+  1047→            <p className="max-w-sm text-sm text-gray-500">
+  1048→              История пишется по ульям с датчиками. Откройте «Карта пасеки», привяжите улей по коду
+  1049→              датчика — и почасовые записи появятся здесь.
+  1050→            </p>
+  1051→          </CardContent>
+  1052→        </Card>
+  1053→      )}
+  1054→
+  1055→      {!error && data && hasSensorPoints && (
+  1056→        <>
+  1057→          {/* Сводка периода */}
+  1058→          <div className="flex flex-wrap gap-2">
+  1059→            {scope === 'day' && daySummary && (
+  1060→              <>
+  1061→                <SummaryChip icon={<Thermometer className="h-3.5 w-3.5" />} label="средняя за день" value={`${daySummary.avgT.toFixed(1)}°C`} />
+  1062→                <SummaryChip icon={<Droplets className="h-3.5 w-3.5" />} label="средняя влажность" value={`${Math.round(daySummary.avgH)}%`} />
+  1063→                <SummaryChip icon={<Weight className="h-3.5 w-3.5" />} label="набор веса за сутки" value={`${daySummary.gain >= 0 ? '+' : ''}${daySummary.gain.toFixed(1)} кг`} />
+  1064→                <SummaryChip icon={<Clock3 className="h-3.5 w-3.5" />} label="почасовых записей" value={daySummary.logs} />
+  1065→                <SummaryChip
+  1066→                  icon={<TriangleAlert className="h-3.5 w-3.5" />}
+  1067→                  label="тревожных событий"
+  1068→                  value={<span className={daySummary.alarms > 0 ? 'text-red-600' : ''}>{daySummary.alarms}</span>}
+  1069→                />
+  1070→              </>
+  1071→            )}
+  1072→            {scope === 'month' && monthSummary && (
+  1073→              <>
+  1074→                <SummaryChip icon={<CalendarDays className="h-3.5 w-3.5" />} label="дней с записями" value={monthSummary.days} />
+  1075→                <SummaryChip icon={<Thermometer className="h-3.5 w-3.5" />} label="средняя за месяц" value={`${monthSummary.avgT.toFixed(1)}°C`} />
+  1076→                <SummaryChip icon={<Droplets className="h-3.5 w-3.5" />} label="средняя влажность" value={`${Math.round(monthSummary.avgH)}%`} />
+  1077→                <SummaryChip icon={<Weight className="h-3.5 w-3.5" />} label="набор веса за месяц" value={`${monthSummary.gain >= 0 ? '+' : ''}${monthSummary.gain.toFixed(1)} кг`} />
+  1078→                <SummaryChip
+  1079→                  icon={<TriangleAlert className="h-3.5 w-3.5" />}
+  1080→                  label="тревожных событий"
+  1081→                  value={<span className={monthSummary.alarms > 0 ? 'text-red-600' : ''}>{monthSummary.alarms}</span>}
+  1082→                />
+  1083→              </>
+  1084→            )}
+  1085→            {scope === 'year' && yearSummary && (
+  1086→              <>
+  1087→                <SummaryChip icon={<CalendarDays className="h-3.5 w-3.5" />} label="месяцев с записями" value={yearSummary.months} />
+  1088→                <SummaryChip icon={<Thermometer className="h-3.5 w-3.5" />} label="средняя за год" value={`${yearSummary.avgT.toFixed(1)}°C`} />
+  1089→                <SummaryChip icon={<Weight className="h-3.5 w-3.5" />} label="набор веса за год" value={`${yearSummary.gain >= 0 ? '+' : ''}${yearSummary.gain.toFixed(1)} кг`} />
+  1090→                <SummaryChip icon={<Clock3 className="h-3.5 w-3.5" />} label="записей в журнале" value={yearSummary.logs} />
+  1091→                <SummaryChip
+  1092→                  icon={<TriangleAlert className="h-3.5 w-3.5" />}
+  1093→                  label="тревожных событий"
+  1094→                  value={<span className={yearSummary.alarms > 0 ? 'text-red-600' : ''}>{yearSummary.alarms}</span>}
+  1095→                />
+  1096→              </>
+  1097→            )}
+  1098→            {(scope === 'day' && !daySummary) || (scope === 'month' && !monthSummary) || (scope === 'year' && !yearSummary) ? (
+  1099→              <span className="inline-flex items-center gap-2 rounded-full border border-dashed border-red-200 bg-white px-3.5 py-2 text-xs font-bold text-gray-400 dark:bg-[#221814]">
+  1100→                Записей за выбранный период нет
+  1101→              </span>
+  1102→            ) : null}
+  1103→          </div>
+  1104→
+  1105→          {/* ИИ-анализ периода: агент смотрит на те же данные, что и графики */}
+  1106→          {data && hasSensorPoints && !aiLoading && aiData && aiData.findings.length > 0 && (
+  1107→            <Card className="border-red-100 dark:bg-[#221814]">
+  1108→              <CardContent className="p-4">
+  1109→                <div className="mb-3 flex flex-wrap items-center gap-2">
+  1110→                  <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-gray-400">
+  1111→                    <Sparkles className="h-3.5 w-3.5 text-red-500" />
+  1112→                    ИИ-анализ периода
+  1113→                  </p>
+  1114→                  <span className="text-[11px] font-semibold text-gray-400">
+  1115→                    {periodLabel}
+  1116→                    {aiData.pointName ? ` · ${aiData.pointName}` : ' · все ульи'}
+  1117→                  </span>
+  1118→                  {aiErr && (
+  1119→                    <span className="text-[11px] font-semibold text-red-500">ошибка: {aiErr}</span>
+  1120→                  )}
+  1121→                </div>
+  1122→                <div className="grid gap-2.5 md:grid-cols-2">
+  1123→                  {aiData.findings.map((f) => (
+  1124→                    <InsightCard key={f.id + (f.pointName ?? '')} f={f} />
+  1125→                  ))}
+  1126→                </div>
+  1127→              </CardContent>
+  1128→            </Card>
+  1129→          )}
+  1130→          {data && hasSensorPoints && aiLoading && (
+  1131→            <div className="flex items-center gap-2 rounded-2xl border border-dashed border-red-100 bg-red-50/30 px-4 py-3 dark:bg-[#221814]">
+  1132→              <Loader2 className="h-4 w-4 animate-spin text-red-500" />
+  1133→              <p className="text-xs font-semibold text-gray-400">
+  1134→                ИИ-агент смотрит на данные периода…
+  1135→              </p>
+  1136→            </div>
+  1137→          )}
+  1138→
+  1139→          {/* Пустой период */}
+  1140→          {((scope === 'day' && filteredLogs.length === 0) ||
+  1141→            (scope === 'month' && monthSummary === null) ||
+  1142→            (scope === 'year' && yearSummary === null)) && (
+  1143→            <Card className="border-dashed border-red-200 bg-red-50/30 dark:bg-[#221814]">
+  1144→              <CardContent className="flex flex-col items-center gap-3 p-8 text-center">
+  1145→                <Clock3 className="h-8 w-8 text-red-300" />
+  1146→                <p className="font-bold text-[#2A1A12]">За этот период записей нет</p>
+  1147→                <p className="max-w-sm text-sm text-gray-500">
+  1148→                  Журнал ведётся с 1 июля по 29 августа 2026. Стрелками или календарём выберите дату
+  1149→                  внутри этого диапазона.
+  1150→                </p>
+  1151→                <Button
+  1152→                  size="sm"
+  1153→                  className="bg-gradient-to-r from-red-600 to-orange-500 font-bold"
+  1154→                  onClick={() => {
+  1155→                    setScope('day')
+  1156→                    setDateKey(range.to)
+  1157→                  }}
+  1158→                >
+  1159→                  К последним записям
+  1160→                </Button>
+  1161→              </CardContent>
+  1162→            </Card>
+  1163→          )}
+  1164→
+  1165→          {/* ДЕНЬ: почасовой таймлайн */}
+  1166→          {scope === 'day' && dayHours.length > 0 && (
+  1167→            <Card className="border-red-100 dark:bg-[#221814]">
+  1168→              <CardContent className="p-4">
+  1169→                <p className="mb-3 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-gray-400">
+  1170→                  <Clock3 className="h-3.5 w-3.5 text-red-500" />
+  1171→                  Почасовые фиксации — {fmtDateLabel(data.date)}
+  1172→                  <span className="font-semibold normal-case text-gray-400">· наведите на карточку улья</span>
+  1173→                </p>
+  1174→                <div className="history-scroll max-h-[540px] space-y-2 overflow-y-auto pr-1">
+  1175→                  {dayHours.map(([hour, logs]) => (
+  1176→                    <motion.div
+  1177→                      key={hour}
+  1178→                      initial={{ opacity: 0, y: 8 }}
+  1179→                      animate={{ opacity: 1, y: 0 }}
+  1180→                      transition={ease}
+  1181→                      className="flex items-stretch gap-2.5"
+  1182→                    >
+  1183→                      <button
+  1184→                        onMouseEnter={(e) =>
+  1185→                          openPop(e.currentTarget, `${pad2(hour)}:00 — все ульи`, `Снимок на ${fmtDateLabel(data.date)}`, hourSnapshotTable(hour))
+  1186→                        }
+  1187→                        onMouseLeave={closePopSoon}
+  1188→                        onClick={(e) =>
+  1189→                          pinPop(e.currentTarget, `${pad2(hour)}:00 — все ульи`, `Снимок на ${fmtDateLabel(data.date)}`, hourSnapshotTable(hour))
+  1190→                        }
+  1191→                        className="flex w-14 shrink-0 flex-col items-center justify-center rounded-xl bg-white shadow-sm ring-1 ring-red-100 transition hover:ring-red-300 dark:bg-[#2C211C] dark:ring-[#2C211C]"
+  1192→                        aria-label={`Снимок всех ульев в ${pad2(hour)}:00`}
+  1193→                      >
+  1194→                        <span className="text-sm font-extrabold tabular-nums text-[#2A1A12] dark:text-[#E8D9CF]">
+  1195→                          {pad2(hour)}:00
+  1196→                        </span>
+  1197→                        <span className="text-[9px] font-semibold text-gray-400">каждый час</span>
+  1198→                      </button>
+  1199→                      <div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+  1200→                        {logs.map((l) => (
+  1201→                          <HourCard
+  1202→                            key={`${l.pointId}-${l.recordedAt}`}
+  1203→                            name={pointName.get(l.pointId) ?? 'Улей'}
+  1204→                            log={l}
+  1205→                            alarm={l.alarm}
+  1206→                            onHover={(el) =>
+  1207→                              openPop(
+  1208→                                el,
+  1209→                                `${pointName.get(l.pointId) ?? 'Улей'} — изменения за день`,
+  1210→                                `${fmtDateLabel(data.date)} · час ${pad2(hour)}:00 выделен`,
+  1211→                                dayHiveTable(l.pointId, hour),
+  1212→                              )
+  1213→                            }
+  1214→                            onLeave={closePopSoon}
+  1215→                            onClick={(el) =>
+  1216→                              pinPop(
+  1217→                                el,
+  1218→                                `${pointName.get(l.pointId) ?? 'Улей'} — изменения за день`,
+  1219→                                `${fmtDateLabel(data.date)} · час ${pad2(hour)}:00 выделен`,
+  1220→                                dayHiveTable(l.pointId, hour),
+  1221→                              )
+  1222→                            }
+  1223→                          />
+  1224→                        ))}
+  1225→                      </div>
+  1226→                    </motion.div>
+  1227→                  ))}
+  1228→                </div>
+  1229→              </CardContent>
+  1230→            </Card>
+  1231→          )}
+  1232→
+  1233→          {/* МЕСЯЦ: сетка дней */}
+  1234→          {scope === 'month' && monthSummary !== null && (
+  1235→            <Card className="border-red-100 dark:bg-[#221814]">
+  1236→              <CardContent className="p-4">
+  1237→                <p className="mb-3 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-gray-400">
+  1238→                  <CalendarDays className="h-3.5 w-3.5 text-red-500" />
+  1239→                  Дни месяца — {fmtMonthLabel(data.date)}
+  1240→                  <span className="font-semibold normal-case text-gray-400">· наведите на день, клик открывает его</span>
+  1241→                </p>
+  1242→                <div className="grid grid-cols-7 gap-1 text-center">
+  1243→                  {WEEKDAYS.map((w) => (
+  1244→                    <span key={w} className="pb-1 text-[10px] font-bold uppercase text-gray-400">
+  1245→                      {w}
+  1246→                    </span>
+  1247→                  ))}
+  1248→                  {(() => {
+  1249→                    const [y, m] = data.date.split('-').map(Number)
+  1250→                    const first = new Date(Date.UTC(y, m - 1, 1))
+  1251→                    const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate()
+  1252→                    const shift = (first.getUTCDay() + 6) % 7
+  1253→                    const byDay = new Map((data.days ?? []).map((d) => [d.date, d]))
+  1254→                    const cells: React.ReactNode[] = []
+  1255→                    for (let i = 0; i < shift; i++) cells.push(<span key={`e${i}`} />)
+  1256→                    for (let d = 1; d <= daysInMonth; d++) {
+  1257→                      const key = `${data.date}-${pad2(d)}`
+  1258→                      const summary = byDay.get(key)
+  1259→                      const per = (summary?.perPoint ?? []).filter((p) => matchPoint(p.pointId))
+  1260→                      const gain = per.reduce((s, p) => s + p.deltaWeightKg, 0)
+  1261→                      const avgT = per.length > 0 ? per.reduce((s, p) => s + p.avgTempC * p.logs, 0) / per.reduce((s, p) => s + p.logs, 0) : null
+  1262→                      const alarms = per.reduce((s, p) => s + p.alarms, 0)
+  1263→                      cells.push(
+  1264→                        <div
+  1265→                          key={key}
+  1266→                          onMouseEnter={(e) =>
+  1267→                            per.length > 0 &&
+  1268→                            openPop(e.currentTarget, fmtDateLabel(key), 'Сводка по ульям за день', monthDayTable(key))
+  1269→                          }
+  1270→                          onMouseLeave={closePopSoon}
+  1271→                          onClick={() => {
+  1272→                            if (per.length === 0) return
+  1273→                            setScope('day')
+  1274→                            setDateKey(key)
+  1275→                          }}
+  1276→                          className={cn(
+  1277→                            'min-h-[76px] rounded-xl border p-1.5 text-left transition',
+  1278→                            per.length > 0
+  1279→                              ? 'cursor-pointer border-red-100 bg-white shadow-sm hover:border-red-300 hover:shadow-md dark:bg-[#2C211C]'
+  1280→                              : 'border-transparent bg-red-50/30 dark:bg-transparent',
+  1281→                          )}
+  1282→                          role={per.length > 0 ? 'button' : undefined}
+  1283→                        >
+  1284→                          <p className="flex items-center justify-between text-[11px] font-extrabold tabular-nums">
+  1285→                            <span className={per.length > 0 ? 'text-[#2A1A12] dark:text-[#E8D9CF]' : 'text-gray-300'}>{d}</span>
+  1286→                            {alarms > 0 && <TriangleAlert className="h-3 w-3 text-red-500" />}
+  1287→                          </p>
+  1288→                          {per.length > 0 && (
+  1289→                            <div className="mt-1 space-y-0.5 text-[10px] font-bold tabular-nums">
+  1290→                              <p className={gain >= 0 ? 'text-emerald-600' : 'text-red-600'}>
+  1291→                                {gain >= 0 ? '+' : ''}{gain.toFixed(1)} кг
+  1292→                              </p>
+  1293→                              {avgT !== null && <p className="text-red-500">{avgT.toFixed(1)}°C</p>}
+  1294→                              <p className="text-gray-400">{per.reduce((s, p) => s + p.logs, 0)} зап.</p>
+  1295→                            </div>
+  1296→                          )}
+  1297→                        </div>,
+  1298→                      )
+  1299→                    }
+  1300→                    return cells
+  1301→                  })()}
+  1302→                </div>
+  1303→              </CardContent>
+  1304→            </Card>
+  1305→          )}
+  1306→
+  1307→          {/* ГОД: карточки месяцев */}
+  1308→          {scope === 'year' && yearSummary !== null && (
+  1309→            <Card className="border-red-100 dark:bg-[#221814]">
+  1310→              <CardContent className="p-4">
+  1311→                <p className="mb-3 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-gray-400">
+  1312→                  <CalendarDays className="h-3.5 w-3.5 text-red-500" />
+  1313→                  Месяцы года — {data.date}
+  1314→                  <span className="font-semibold normal-case text-gray-400">· наведите на месяц, клик открывает его</span>
+  1315→                </p>
+  1316→                <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+  1317→                  {MONTHS_NOM.map((name, idx) => {
+  1318→                    const mk = `${data.date}-${pad2(idx + 1)}`
+  1319→                    const m = (data.months ?? []).find((x) => x.month === mk)
+  1320→                    const per = (m?.perPoint ?? []).filter((p) => matchPoint(p.pointId))
+  1321→                    const has = per.length > 0
+  1322→                    const avgT = has ? per.reduce((s, p) => s + p.avgTempC * p.logs, 0) / per.reduce((s, p) => s + p.logs, 0) : null
+  1323→                    const avgH = has ? per.reduce((s, p) => s + p.avgHumidityPct * p.logs, 0) / per.reduce((s, p) => s + p.logs, 0) : null
+  1324→                    const gain = per.reduce((s, p) => s + p.deltaWeightKg, 0)
+  1325→                    const alarms = per.reduce((s, p) => s + p.alarms, 0)
+  1326→                    const logs = per.reduce((s, p) => s + p.logs, 0)
+  1327→                    return (
+  1328→                      <div
+  1329→                        key={mk}
+  1330→                        onMouseEnter={(e) =>
+  1331→                          has && openPop(e.currentTarget, `${name} ${data.date}`, 'Сводка по ульям за месяц', yearMonthTable(mk))
+  1332→                        }
+  1333→                        onMouseLeave={closePopSoon}
+  1334→                        onClick={() => {
+  1335→                          if (!has) return
+  1336→                          setScope('month')
+  1337→                          setDateKey(mk)
+  1338→                        }}
+  1339→                        className={cn(
+  1340→                          'rounded-2xl border p-3 transition',
+  1341→                          has
+  1342→                            ? 'cursor-pointer border-red-100 bg-white shadow-sm hover:border-red-300 hover:shadow-md dark:bg-[#2C211C]'
+  1343→                            : 'border-dashed border-red-100 bg-red-50/30 dark:bg-transparent',
+  1344→                        )}
+  1345→                        role={has ? 'button' : undefined}
+  1346→                      >
+  1347→                        <p className="flex items-center justify-between text-sm font-extrabold text-[#2A1A12] dark:text-[#E8D9CF]">
+  1348→                          {name}
+  1349→                          {alarms > 0 && <TriangleAlert className="h-3.5 w-3.5 text-red-500" />}
+  1350→                        </p>
+  1351→                        {has ? (
+  1352→                          <div className="mt-2 grid grid-cols-2 gap-x-2 gap-y-1 text-[11px] font-bold tabular-nums">
+  1353→                            <span className="text-red-500">{avgT!.toFixed(1)}°C ср.</span>
+  1354→                            <span className="text-sky-500">{Math.round(avgH!)}% влажн.</span>
+  1355→                            <span className={gain >= 0 ? 'text-emerald-600' : 'text-red-600'}>
+  1356→                              {gain >= 0 ? '+' : ''}{gain.toFixed(1)} кг
+  1357→                            </span>
+  1358→                            <span className="text-gray-400">{logs} записей</span>
+  1359→                          </div>
+  1360→                        ) : (
+  1361→                          <p className="mt-2 text-[11px] font-semibold text-gray-300">нет записей</p>
+  1362→                        )}
+  1363→                      </div>
+  1364→                    )
+  1365→                  })}
+  1366→                </div>
+  1367→              </CardContent>
+  1368→            </Card>
+  1369→          )}
+  1370→
+  1371→          <p className="text-xs leading-relaxed text-gray-400">
+  1372→            Записи журнала формируются по телеметрии ульев: в 8:00 и 20:00 — контрольные замеры,
+  1373→            между ними значения фиксируются каждый час. Тревожные события: перегрев или переохлаждение
+  1374→            семьи, слишком сухой или сырой воздух, резкое падение массы улья.
+  1375→          </p>
+  1376→        </>
+  1377→      )}
+  1378→
+  1379→      {/* Закреплённая таблица: клик по фону закрывает */}
+  1380→      {pinnedPop && <div className="fixed inset-0 z-[60]" onClick={() => setPinnedPop(null)} aria-hidden />}
+  1381→
+  1382→      {/* Всплывающая таблица изменений */}
+  1383→      <AnimatePresence>
+  1384→        {showPop && (
+  1385→          <DetailPopup
+  1386→            key={`pop-${showPop.title}-${showPop.rect.top}`}
+  1387→            pop={showPop}
+  1388→            pinned={pinnedPop !== null}
+  1389→            onEnter={keepPop}
+  1390→            onLeave={pinnedPop ? undefined : closePopSoon}
+  1391→            onClose={() => setPinnedPop(null)}
+  1392→          />
+  1393→        )}
+  1394→      </AnimatePresence>
+  1395→    </div>
+  1396→  )
+  1397→}
+  1398→

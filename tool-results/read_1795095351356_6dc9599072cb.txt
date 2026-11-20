@@ -1,0 +1,1363 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Демо-режим «Мои пасеки» — Bento-дашборд «Пасека Уфа» с живой телеметрией
+     5→ * (тик каждые 2 секунды). Структура экрана:
+     6→ *   1) срочный пестицидный баннер (рапс «Заречное», 2,4 км, ветер к пасеке);
+     7→ *   2) заголовок + компактный погодный виджет (город из профиля) + режим;
+     8→ *   3) лента-переключатель ульев [Вся пасека | №1 | №2 | №3 | №4 | +];
+     9→ *   4) БЛОК 1 — паспорт улья + цветной статус + индекс + живые плитки
+    10→ *      (темп. внутри, влажность, масса, заклещенность ±0,02 %, гул, CO₂, трафик);
+    11→ *   5) БЛОК 2 — привес за сутки 50/50 накоплено за взяток (прогресс магазинов);
+    12→ *   6) БЛОК 3 — график привесов за 7 дней (столбцы + ночная температура);
+    13→ *   7) ряд из 3 графиков — температура | влажность | динамика заклещенности
+    14→ *      (красный пунктир порога 3 % + пунктирный прогноз);
+    15→ *   8) БЛОК 4 — микроклимат гнезда 50/50 заклещёванность (замер клеща);
+    16→ *   9) камера летка | акустика | качество воздуха;
+    17→ *  10) погода на пасеке | цветение медоносов (GDD);
+    18→ *  11) БЛОК 5 — предписания ИИ-агента (с кнопкой «Провести обработку»:
+    19→ *      заклещенность №3 падает до 0,4 %) + умные напоминания и события.
+    20→ */
+    21→import { useCallback, useState } from 'react'
+    22→import { AnimatePresence, motion } from 'framer-motion'
+    23→import {
+    24→  AlertTriangle,
+    25→  ArrowUpRight,
+    26→  AudioLines,
+    27→  BatteryCharging,
+    28→  Bug,
+    29→  CalendarDays,
+    30→  Cctv,
+    31→  CheckCircle2,
+    32→  ClipboardList,
+    33→  Droplets,
+    34→  FlaskConical,
+    35→  Flower2,
+    36→  Gauge,
+    37→  Hexagon,
+    38→  MapPin,
+    39→  MessageSquareText,
+    40→  Plus,
+    41→  Scale,
+    42→  Search,
+    43→  Split,
+    44→  Sun,
+    45→  Thermometer,
+    46→  TrendingUp,
+    47→  Wind,
+    48→  Wrench,
+    49→} from 'lucide-react'
+    50→import { format } from 'date-fns'
+    51→import { Button } from '@/components/ui/button'
+    52→import { useToast } from '@/hooks/use-toast'
+    53→import { cn } from '@/lib/utils'
+    54→import { fmtNum, fmtSigned } from '@/lib/hive-model'
+    55→import {
+    56→  BASIS_KEY,
+    57→  DEMO_HIVES,
+    58→  GDD_CURRENT,
+    59→  GDD_PER_DAY,
+    60→  demoClimateSeries,
+    61→  demoGaugeInfo,
+    62→  demoGainSeries,
+    63→  demoHiveById,
+    64→  demoVarroaSeries,
+    65→  demoWeightSeries,
+    66→  gddForecast,
+    67→  trafficState,
+    68→  varroaStatus,
+    69→  vocState,
+    70→  type DemoFinding,
+    71→  type DemoHive,
+    72→  type DemoScenario,
+    73→  type LiveDemoValues,
+    74→} from '@/lib/demo-hives'
+    75→import { liveForHive, useLiveTelemetry, type LiveTelemetry } from '@/hooks/use-live-demo'
+    76→import { useAppState } from '@/lib/store'
+    77→import { tr, useT, LANG_DATE_LOCALE } from '@/lib/i18n'
+    78→import { WeatherPanel, WeatherChip } from './WeatherPanel'
+    79→import { StatusGauge } from './StatusGauge'
+    80→import { ModeSwitcher } from './ModeSwitcher'
+    81→import { UrgencyBadge } from './decor'
+    82→import {
+    83→  AcousticSpark,
+    84→  AnimatedNumber,
+    85→  DemoClimateMini,
+    86→  DemoWeightBars,
+    87→  GainComboChart,
+    88→  LiveValue,
+    89→  Rise,
+    90→  SensorCardIcon,
+    91→  VarroaChart,
+    92→} from './DemoCharts'
+    93→import { EvidenceDialog, EveningReportDialog, MeasureDialog, PesticideDialog } from './DemoDialogs'
+    94→
+    95→/* ------------------------------------------------------------------ */
+    96→/* Перевод демо-данных: ключ → словарь, при отсутствии ключа —        */
+    97→/* канонический русский текст из demo-hives.ts (фолбэк данных)         */
+    98→/* ------------------------------------------------------------------ */
+    99→
+   100→function useTF() {
+   101→  const lang = useAppState((s) => s.lang)
+   102→  return useCallback(
+   103→    (key: string, fallback: string, vars?: Record<string, string | number>) => {
+   104→      const s = tr(lang, key, vars)
+   105→      return s === key ? fallback : s
+   106→    },
+   107→    [lang],
+   108→  )
+   109→}
+   110→
+   111→/* ------------------------------------------------------------------ */
+   112→/* Баннер статуса по сценарию улья                                     */
+   113→/* ------------------------------------------------------------------ */
+   114→
+   115→type BannerKey = DemoScenario | 'all'
+   116→
+   117→const SCENARIO_BANNER: Record<
+   118→  BannerKey,
+   119→  { cls: string; icon: typeof Sun; titleKey: string; textKey: string; ctaKey: string }
+   120→> = {
+   121→  norm: {
+   122→    cls: 'bg-gradient-to-r from-emerald-600 to-teal-500 shadow-emerald-100',
+   123→    icon: Sun,
+   124→    titleKey: 'dash.banner.norm.title',
+   125→    textKey: 'dash.banner.norm.text',
+   126→    ctaKey: 'dash.banner.cta.evidence',
+   127→  },
+   128→  flow: {
+   129→    cls: 'bg-gradient-to-r from-amber-500 to-orange-400 shadow-amber-100',
+   130→    icon: TrendingUp,
+   131→    titleKey: 'dash.banner.flow.title',
+   132→    textKey: 'dash.banner.flow.text',
+   133→    ctaKey: 'dash.banner.cta.evidence',
+   134→  },
+   135→  varroa: {
+   136→    cls: 'bg-gradient-to-r from-[#D93E00] to-[#FF5A1F] shadow-red-100',
+   137→    icon: AlertTriangle,
+   138→    titleKey: 'dash.banner.varroa.title',
+   139→    textKey: 'dash.banner.varroa.text',
+   140→    ctaKey: 'dash.banner.cta.why',
+   141→  },
+   142→  swarm: {
+   143→    cls: 'bg-gradient-to-r from-[#C23000] to-[#F2542D] shadow-red-100',
+   144→    icon: Split,
+   145→    titleKey: 'dash.banner.swarm.title',
+   146→    textKey: 'dash.banner.swarm.text',
+   147→    ctaKey: 'dash.banner.cta.why',
+   148→  },
+   149→  all: {
+   150→    cls: 'bg-gradient-to-r from-amber-600 to-orange-500 shadow-amber-100',
+   151→    icon: Hexagon,
+   152→    titleKey: 'dash.banner.all.title',
+   153→    textKey: 'dash.banner.all.text',
+   154→    ctaKey: 'dash.banner.cta.evidence',
+   155→  },
+   156→}
+   157→
+   158→/** Цвета точек ленты-переключателя (как на референсе: №3 — жёлтый, №4 — красный). */
+   159→const RIBBON_DOT: Record<number, string> = {
+   160→  0: 'bg-gradient-to-br from-red-500 to-orange-400',
+   161→  1: 'bg-emerald-500',
+   162→  2: 'bg-emerald-500',
+   163→  3: 'bg-amber-400',
+   164→  4: 'bg-red-500',
+   165→}
+   166→
+   167→const SCEN_GAUGE_KEY: Record<string, string> = {
+   168→  alert: 'dash.gauge.alert',
+   169→  watch: 'dash.gauge.watch',
+   170→  normal: 'dash.gauge.normal',
+   171→  ok: 'dash.gauge.ok',
+   172→}
+   173→
+   174→/* ------------------------------------------------------------------ */
+   175→/* Живые значения для сводного вида «Вся пасека»                       */
+   176→/* ------------------------------------------------------------------ */
+   177→
+   178→function liveForSelection(live: LiveTelemetry, hive: DemoHive): LiveDemoValues {
+   179→  if (hive.id !== 0) return liveForHive(live, hive)
+   180→  const vals = DEMO_HIVES.map((h) => live.values[h.id] ?? h.base)
+   181→  const avg = (f: (v: LiveDemoValues) => number) => vals.reduce((s, v) => s + f(v), 0) / vals.length
+   182→  return {
+   183→    tempC: avg((v) => v.tempC),
+   184→    humidityPct: avg((v) => v.humidityPct),
+   185→    weightKg: vals.reduce((s, v) => s + v.weightKg, 0),
+   186→    soundHz: avg((v) => v.soundHz),
+   187→    co2Ppm: avg((v) => v.co2Ppm),
+   188→    vocIndex: avg((v) => v.vocIndex),
+   189→    trafficPerMin: avg((v) => v.trafficPerMin),
+   190→    varroaPct: avg((v) => v.varroaPct),
+   191→  }
+   192→}
+   193→
+   194→/* ------------------------------------------------------------------ */
+   195→/* Мелкие блоки                                                        */
+   196→/* ------------------------------------------------------------------ */
+   197→
+   198→function LiveTile({
+   199→  icon,
+   200→  label,
+   201→  value,
+   202→  num,
+   203→  digits = 1,
+   204→  suffix,
+   205→  hint,
+   206→  badge,
+   207→  tone = 'red',
+   208→}: {
+   209→  icon: React.ReactNode
+   210→  label: string
+   211→  value?: string
+   212→  num?: number
+   213→  digits?: number
+   214→  suffix?: string
+   215→  hint?: string
+   216→  badge?: React.ReactNode
+   217→  tone?: 'red' | 'amber' | 'emerald'
+   218→}) {
+   219→  const tones = {
+   220→    red: 'border-red-50 bg-red-50/40 text-red-400',
+   221→    amber: 'border-amber-100 bg-amber-50/50 text-amber-500',
+   222→    emerald: 'border-emerald-100 bg-emerald-50/50 text-emerald-600',
+   223→  } as const
+   224→  return (
+   225→    <div className={cn('rounded-xl border px-3 py-2.5', tones[tone])}>
+   226→      <p className="flex items-center gap-1.5 text-[11px] font-semibold text-gray-500">
+   227→        <span>{icon}</span>
+   228→        {label}
+   229→      </p>
+   230→      <p className="mt-1 flex flex-wrap items-baseline gap-1.5 text-lg font-extrabold leading-none text-gray-900">
+   231→        {num !== undefined ? (
+   232→          <AnimatedNumber value={num} digits={digits} />
+   233→        ) : (
+   234→          <LiveValue value={value ?? ''} />
+   235→        )}
+   236→        {suffix && <span className="text-[11px] font-bold text-gray-400">{suffix}</span>}
+   237→        {badge}
+   238→      </p>
+   239→      {hint && <p className="mt-1 text-[10px] leading-tight text-gray-400">{hint}</p>}
+   240→    </div>
+   241→  )
+   242→}
+   243→
+   244→function MiniCard({
+   245→  title,
+   246→  value,
+   247→  note,
+   248→  icon,
+   249→  headerExtra,
+   250→  children,
+   251→}: {
+   252→  title: string
+   253→  value: React.ReactNode
+   254→  note: string
+   255→  icon: React.ReactNode
+   256→  headerExtra?: React.ReactNode
+   257→  children: React.ReactNode
+   258→}) {
+   259→  return (
+   260→    <div className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]">
+   261→      <div className="flex flex-wrap items-center justify-between gap-2">
+   262→        <h3 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   263→          <span className="text-red-400">{icon}</span>
+   264→          {title}
+   265→        </h3>
+   266→        <span className="text-base font-extrabold text-red-600">
+   267→          {typeof value === 'string' ? <LiveValue value={value} /> : value}
+   268→        </span>
+   269→      </div>
+   270→      {headerExtra && <div className="mt-1.5 flex flex-wrap items-center gap-1.5">{headerExtra}</div>}
+   271→      <div className="mt-1.5 h-[170px]">{children}</div>
+   272→      <p className="mt-1 text-[11px] leading-snug text-gray-400">{note}</p>
+   273→    </div>
+   274→  )
+   275→}
+   276→
+   277→/** GDD-прогресс до цветения ближайших медоносов. */
+   278→function GddCard() {
+   279→  const t = useT()
+   280→  const tf = useTF()
+   281→  const crops = gddForecast()
+   282→  const soon = crops.filter((c) => c.soon)
+   283→  return (
+   284→    <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   285→      <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   286→        <Flower2 className="h-4 w-4 text-red-500" /> {t('dash.gdd.title')}
+   287→      </h2>
+   288→      <p className="mt-1 text-[11px] text-gray-400">
+   289→        {t('dash.gdd.note', { cur: GDD_CURRENT, per: GDD_PER_DAY })}
+   290→      </p>
+   291→      <ul className="mt-3 space-y-3">
+   292→        {crops.map((c) => (
+   293→          <li key={c.key}>
+   294→            <div className="flex items-center justify-between text-xs">
+   295→              <span className="font-bold text-gray-800">{tf(`demo.crop.${c.key}`, c.name)}</span>
+   296→              <span className={cn('font-semibold', c.soon ? 'text-amber-600' : 'text-gray-400')}>
+   297→                {t('dash.gdd.in', { n: c.daysLeft })}
+   298→              </span>
+   299→            </div>
+   300→            <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-red-50 dark:bg-[#2C211C]">
+   301→              <motion.div
+   302→                className={cn(
+   303→                  'bar-shine h-full rounded-full bg-gradient-to-r',
+   304→                  c.soon ? 'from-amber-400 to-orange-500' : 'from-emerald-400 to-emerald-500',
+   305→                )}
+   306→                initial={{ width: 0 }}
+   307→                animate={{ width: `${c.pct}%` }}
+   308→                transition={{ duration: 0.9, ease: 'easeOut', delay: 0.15 }}
+   309→              />
+   310→            </div>
+   311→            <p className="mt-1 text-[10px] text-gray-400">
+   312→              {tf(`dash.gdd.note.${c.key}`, c.note)} · {t('dash.gdd.pct', { n: c.pct })}
+   313→            </p>
+   314→          </li>
+   315→        ))}
+   316→      </ul>
+   317→      {soon.length > 0 && (
+   318→        <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-semibold leading-relaxed text-amber-800">
+   319→          {t('dash.gdd.auto', { name: tf(`demo.crop.${soon[0].key}`, soon[0].name), n: soon[0].daysLeft })}
+   320→        </p>
+   321→      )}
+   322→    </section>
+   323→  )
+   324→}
+   325→
+   326→/* ------------------------------------------------------------------ */
+   327→/* Демо-дашборд                                                        */
+   328→/* ------------------------------------------------------------------ */
+   329→
+   330→export function DemoDashboard() {
+   331→  const hiveId = useAppState((s) => s.hiveId)
+   332→  const setHive = useAppState((s) => s.setHive)
+   333→  const ask = useAppState((s) => s.ask)
+   334→  const setView = useAppState((s) => s.setView)
+   335→  const lang = useAppState((s) => s.lang)
+   336→  const city = useAppState((s) => s.city)
+   337→  const reminders = useAppState((s) => s.reminders)
+   338→  const { toast } = useToast()
+   339→  const t = useT()
+   340→  const tf = useTF()
+   341→
+   342→  const live = useLiveTelemetry()
+   343→  const hive = demoHiveById(hiveId)
+   344→  const isAll = hive.id === 0
+   345→  const liveV = liveForSelection(live, hive)
+   346→
+   347→  // выполненные предписания (улей → список id) и проведенные обработки (улей → 0,4 %)
+   348→  const [done, setDone] = useState<Record<number, string[]>>({})
+   349→  const [treated, setTreated] = useState<Record<number, number>>({})
+   350→  // ручные замеры клеща: улей → результат (пересчитывает карточку и график)
+   351→  const [measures, setMeasures] = useState<Record<number, { pct: number; mites: number; bees: number }>>({})
+   352→  const [evidence, setEvidence] = useState<DemoFinding | null>(null)
+   353→  const [reportOpen, setReportOpen] = useState(false)
+   354→  const [measureOpen, setMeasureOpen] = useState(false)
+   355→  const [pesticideOpen, setPesticideOpen] = useState(false)
+   356→
+   357→  const doneForHive = (id: number) => done[id] ?? []
+   358→  const indexWithBoost = (id: number) => {
+   359→    const h = demoHiveById(id)
+   360→    const boosts = h.prescriptions
+   361→      .filter((f) => doneForHive(id).includes(f.id))
+   362→      .reduce((s, f) => s + f.boost, 0)
+   363→    return Math.min(10, h.index + boosts)
+   364→  }
+   365→  const gaugeValue = indexWithBoost(hive.id)
+   366→  const gauge = demoGaugeInfo(gaugeValue)
+   367→
+   368→  /** Текущая заклещенность: ручной замер → обработка → база сценария. */
+   369→  const currentVarroaBase = (id: number) =>
+   370→    measures[id]?.pct ?? treated[id] ?? demoHiveById(id).base.varroaPct
+   371→  const baseVarroa = isAll
+   372→    ? Math.round((DEMO_HIVES.reduce((s, h) => s + currentVarroaBase(h.id), 0) / DEMO_HIVES.length) * 10) / 10
+   373→    : currentVarroaBase(hive.id)
+   374→  // живое колебание ±0,02 % вокруг текущего значения (сохраняем дрейф тика)
+   375→  const varroaLive = Math.max(0.05, baseVarroa + (liveV.varroaPct - hive.base.varroaPct))
+   376→  const varroa = varroaStatus(baseVarroa)
+   377→  const varroaStatusLabel = t(`dash.varroa.status.${varroa.level}`)
+   378→  const forecast14 =
+   379→    measures[hive.id] || treated[hive.id] !== undefined
+   380→      ? Math.round((baseVarroa + (treated[hive.id] !== undefined ? 0.1 : 0.2)) * 10) / 10
+   381→      : hive.base.varroaForecast14d
+   382→
+   383→  const climate = demoClimateSeries(hive)
+   384→  const weight = demoWeightSeries(hive)
+   385→  const gain7 = demoGainSeries(hive)
+   386→  const varroaSeries = demoVarroaSeries(hive, 30, {
+   387→    overridePct: baseVarroa,
+   388→    treatedToday: treated[hive.id] !== undefined,
+   389→  })
+   390→  // живой спарклайн гула: буфер последних тиков (для «Всей пасеки» — среднее по ульям)
+   391→  const sparkHz = isAll
+   392→    ? (() => {
+   393→        const len = Math.min(30, ...DEMO_HIVES.map((h) => live.spark[h.id]?.length ?? 0))
+   394→        const out: number[] = []
+   395→        for (let i = 0; i < len; i++) {
+   396→          out.push(DEMO_HIVES.reduce((s, h) => s + (live.spark[h.id]?.[i]?.soundHz ?? 0), 0) / DEMO_HIVES.length)
+   397→        }
+   398→        return out
+   399→      })()
+   400→    : (live.spark[hive.id] ?? []).map((v) => v.soundHz)
+   401→
+   402→  const banner = SCENARIO_BANNER[isAll ? 'all' : hive.scenario]
+   403→  const BannerIcon = banner.icon
+   404→  const voc = vocState(liveV.vocIndex)
+   405→  const traffic = trafficState(liveV.trafficPerMin)
+   406→  const crops = gddForecast()
+   407→  const nearest = [...crops].sort((a, b) => a.daysLeft - b.daysLeft)[0]
+   408→  const sunflower = crops.find((c) => c.key === 'sunflower')
+   409→
+   410→  const todayLabel = format(new Date(), 'EEEE, d MMMM yyyy', { locale: LANG_DATE_LOCALE[lang] })
+   411→  const roleKey = isAll ? 'dash.passport.all' : `dash.role.${hive.scenario}`
+   412→
+   413→  // тренд температуры: сравниваем средние последних тиков (только для отдельного улья)
+   414→  const sparkBuf = isAll ? [] : (live.spark[hive.id] ?? [])
+   415→  const tempRising =
+   416→    sparkBuf.length >= 6 &&
+   417→    sparkBuf.slice(-3).reduce((s, v) => s + v.tempC, 0) / 3 >
+   418→      sparkBuf.slice(-6, -3).reduce((s, v) => s + v.tempC, 0) / 3 + 0.03
+   419→
+   420→  const complete = (f: DemoFinding) => {
+   421→    const targetHive = f.sourceHive ?? hive.id
+   422→    const before = indexWithBoost(targetHive)
+   423→    const varroaBefore = currentVarroaBase(targetHive)
+   424→    setDone((prev) => {
+   425→      const cur = prev[targetHive] ?? []
+   426→      if (cur.includes(f.id)) return prev
+   427→      return { ...prev, [targetHive]: [...cur, f.id] }
+   428→    })
+   429→    if (f.treatVarroa !== undefined) {
+   430→      setTreated((prev) => ({ ...prev, [targetHive]: f.treatVarroa as number }))
+   431→    }
+   432→    setEvidence(null)
+   433→    const after = Math.min(10, before + f.boost)
+   434→    toast({
+   435→      title: t('dash.agent.doneToast'),
+   436→      description:
+   437→        f.treatVarroa !== undefined
+   438→          ? t('dash.agent.doneToastVarroa', {
+   439→              action: tf(`demo.finding.${f.id}.action`, f.action),
+   440→              n: targetHive,
+   441→              a: fmtNum(varroaBefore),
+   442→              b: fmtNum(f.treatVarroa),
+   443→              x: fmtNum(before),
+   444→              y: fmtNum(after),
+   445→            })
+   446→          : t('dash.agent.doneToastPlain', {
+   447→              action: tf(`demo.finding.${f.id}.action`, f.action),
+   448→              n: targetHive,
+   449→              x: fmtNum(before),
+   450→              y: fmtNum(after),
+   451→            }),
+   452→    })
+   453→  }
+   454→
+   455→  const saveMeasure = (pct: number, mites: number, bees: number) => {
+   456→    setMeasures((prev) => ({ ...prev, [hive.id]: { pct, mites, bees } }))
+   457→    const st = varroaStatus(pct)
+   458→    toast({
+   459→      title: t('dash.measure.saved'),
+   460→      description: t('dash.measure.savedDesc', {
+   461→        n: hive.id,
+   462→        p: fmtNum(pct, 1),
+   463→        status: t(`dash.varroa.status.${st.level}`),
+   464→      }),
+   465→    })
+   466→  }
+   467→
+   468→  const upcomingReminders = reminders
+   469→    .filter((r) => !r.done)
+   470→    .sort((a, b) => a.remindAt.localeCompare(b.remindAt))
+   471→    .slice(0, 3)
+   472→
+   473→  return (
+   474→    <div className="space-y-4">
+   475→      {/* ── Срочное предупреждение: пестициды (глобальный баннер) ── */}
+   476→      <Rise delay={0}>
+   477→        <div className="hazard-stripes animate-sheen relative overflow-hidden rounded-2xl bg-gradient-to-r from-[#C23000] to-[#F2542D] p-4 text-white shadow-lg md:p-4.5">
+   478→          <AlertTriangle className="absolute -right-3 -top-3 h-28 w-28 rotate-12 text-white/15" />
+   479→          <div className="relative flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+   480→            <div className="flex items-start gap-3">
+   481→              <AlertTriangle className="animate-heartbeat mt-0.5 h-6 w-6 shrink-0" />
+   482→              <div>
+   483→                <p className="text-[13px] font-extrabold uppercase tracking-wide text-white/95">
+   484→                  {t('dash.pesticide.badge')}
+   485→                </p>
+   486→                <p className="mt-1 max-w-3xl text-sm leading-snug">{t('dash.pesticide.text')}</p>
+   487→              </div>
+   488→            </div>
+   489→            <Button
+   490→              className="w-fit shrink-0 bg-white font-bold text-red-700 hover:bg-red-50"
+   491→              onClick={() => setPesticideOpen(true)}
+   492→            >
+   493→              {t('dash.pesticide.cta')}
+   494→            </Button>
+   495→          </div>
+   496→        </div>
+   497→      </Rise>
+   498→
+   499→      {/* ── Заголовок «Пасека Уфа» + погода города + режим ── */}
+   500→      <Rise delay={0.05}>
+   501→        <div className="flex flex-wrap items-end justify-between gap-3">
+   502→          <div>
+   503→            <h1 className="text-2xl font-extrabold tracking-tight text-[#2A1A12] md:text-3xl">
+   504→              {t('dash.title')} · <span className="text-shine">{t('dash.demoBadge')}</span>
+   505→            </h1>
+   506→            <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-gray-500">
+   507→              <span className="flex items-center gap-1">
+   508→                <FlaskConical className="h-3.5 w-3.5 text-red-500" /> {t('dash.tiles.telemetry')}
+   509→              </span>
+   510→              <span className="flex items-center gap-1">
+   511→                <MapPin className="h-3.5 w-3.5 text-red-500" /> {city.name}
+   512→              </span>
+   513→              <span className="flex items-center gap-1">
+   514→                <CalendarDays className="h-3.5 w-3.5 text-red-500" /> {todayLabel}
+   515→              </span>
+   516→            </p>
+   517→          </div>
+   518→          <div className="flex flex-wrap items-center gap-2">
+   519→            <WeatherChip coords={[city.lat, city.lon]} place={city.name} />
+   520→            <ModeSwitcher />
+   521→          </div>
+   522→        </div>
+   523→      </Rise>
+   524→
+   525→      {/* ── Лента-переключатель ульев ── */}
+   526→      <Rise delay={0.1}>
+   527→        <div className="flex flex-wrap items-center gap-2" role="group" aria-label={t('dash.state.title')}>
+   528→          <button
+   529→            onClick={() => setHive(0)}
+   530→            aria-pressed={isAll}
+   531→            className={cn(
+   532→              'pop-in inline-flex items-center gap-2 rounded-full border px-3.5 py-2 text-sm font-bold shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md',
+   533→              isAll
+   534→                ? 'border-red-500 bg-red-50/80 text-red-700 ring-2 ring-red-500/60'
+   535→                : 'border-red-100 bg-white text-gray-600 hover:border-red-200',
+   536→            )}
+   537→          >
+   538→            <Hexagon className="h-4 w-4 text-red-500" />
+   539→            {t('dash.hivesAll')}
+   540→            <span className="text-xs font-extrabold text-red-600">{fmtNum(indexWithBoost(0))}</span>
+   541→          </button>
+   542→          {DEMO_HIVES.map((h) => (
+   543→            <button
+   544→              key={h.id}
+   545→              onClick={() => setHive(h.id)}
+   546→              aria-pressed={h.id === hive.id}
+   547→              className={cn(
+   548→                'pop-in inline-flex items-center gap-2 rounded-full border px-3.5 py-2 text-sm font-bold shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md',
+   549→                h.id === hive.id
+   550→                  ? 'border-red-500 bg-red-50/80 text-red-700 ring-2 ring-red-500/60'
+   551→                  : 'border-red-100 bg-white text-gray-600 hover:border-red-200',
+   552→              )}
+   553→            >
+   554→              <span className={cn('h-2.5 w-2.5 rounded-full', RIBBON_DOT[h.id])} />
+   555→              №{h.id} · {t(`dash.short.${h.scenario}`)}
+   556→              <span className="text-xs font-extrabold text-red-600">{fmtNum(indexWithBoost(h.id))}</span>
+   557→            </button>
+   558→          ))}
+   559→          <button
+   560→            onClick={() => setView('sensors')}
+   561→            title={t('dash.addHive')}
+   562→            className="pop-in inline-flex h-9 w-9 items-center justify-center rounded-full border border-dashed border-red-300 text-red-500 transition-all hover:rotate-90 hover:bg-red-50 hover:text-red-600"
+   563→          >
+   564→            <Plus className="h-4 w-4" />
+   565→          </button>
+   566→        </div>
+   567→      </Rise>
+   568→      {/* ── БЛОК 1: паспорт улья + статус + индекс + живые плитки ── */}
+   569→      <Rise delay={0.12}>
+   570→        <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   571→          <div className="grid gap-4 lg:grid-cols-[210px_minmax(0,1fr)]">
+   572→            {/* Индекс состояния */}
+   573→            <div className="flex flex-col items-center justify-center rounded-2xl border border-red-50 bg-red-50/30 p-3 dark:bg-[#2C211C]">
+   574→              <StatusGauge info={{ value: gaugeValue, label: t(SCEN_GAUGE_KEY[gauge.tone]), tone: gauge.tone }} />
+   575→              <p className="mt-2 text-center text-[11px] font-semibold text-gray-400">{t('dash.gauge.label')}</p>
+   576→            </div>
+   577→
+   578→            <div className="min-w-0">
+   579→              {/* Паспорт */}
+   580→              <p className="text-sm font-extrabold uppercase tracking-wide text-gray-500">
+   581→                {t('dash.passport')}
+   582→              </p>
+   583→              <p className="mt-1 text-base font-extrabold text-[#2A1A12] md:text-lg">
+   584→                {tf(`demo.hive.${hive.id}.label`, hive.label).toUpperCase()} ({t(roleKey)})
+   585→                {hive.queen && (
+   586→                  <span className="ml-2 text-sm font-semibold text-gray-600">
+   587→                    · {' '}
+   588→                    {t('dash.queen', {
+   589→                      breed: tf(`demo.hive.${hive.id}.queenBreed`, hive.queen.breed),
+   590→                      year: hive.queen.year,
+   591→                      mark: tf(`demo.hive.${hive.id}.queenMark`, hive.queen.mark),
+   592→                    })}
+   593→                  </span>
+   594→                )}
+   595→                {!hive.queen && <span className="ml-2 text-sm font-semibold text-gray-600">· {t('dash.queens.all')}</span>}
+   596→              </p>
+   597→              <p className="mt-0.5 text-xs text-gray-400">
+   598→                {tf(`demo.hive.${hive.id}.scenarioHint`, hive.scenarioHint)} ·{' '}
+   599→                {t('dash.corps', { corps: tf(`demo.hive.${hive.id}.corps`, hive.base.corps) })}
+   600→              </p>
+   601→
+   602→              {/* Статус-баннер */}
+   603→              <AnimatePresence mode="wait" initial={false}>
+   604→                <motion.div
+   605→                  key={hive.id}
+   606→                  initial={{ opacity: 0, y: -6 }}
+   607→                  animate={{ opacity: 1, y: 0 }}
+   608→                  exit={{ opacity: 0, y: 6 }}
+   609→                  transition={{ duration: 0.3 }}
+   610→                  className={cn(
+   611→                    'animate-sheen relative mt-3 overflow-hidden rounded-2xl p-4 text-white shadow-lg',
+   612→                    banner.cls,
+   613→                  )}
+   614→                >
+   615→                  <BannerIcon className="absolute -right-3 -top-3 h-24 w-24 rotate-12 text-white/15" />
+   616→                  <div className="relative flex flex-col gap-2.5 md:flex-row md:items-center md:justify-between">
+   617→                    <div className="flex items-start gap-3">
+   618→                      <BannerIcon
+   619→                        className={cn(
+   620→                          'mt-0.5 h-6 w-6 shrink-0',
+   621→                          !isAll && (hive.scenario === 'varroa' || hive.scenario === 'swarm') && 'animate-heartbeat',
+   622→                        )}
+   623→                      />
+   624→                      <div>
+   625→                        <p className="text-sm font-bold uppercase tracking-wide text-white/90">
+   626→                          {t(banner.titleKey)}
+   627→                        </p>
+   628→                        <p className="mt-1 max-w-2xl text-sm leading-snug">{t(banner.textKey)}</p>
+   629→                      </div>
+   630→                    </div>
+   631→                    <Button
+   632→                      className="w-fit shrink-0 bg-white font-semibold text-red-700 hover:bg-red-50"
+   633→                      onClick={() => setEvidence(hive.prescriptions[0])}
+   634→                    >
+   635→                      <Search className="h-4 w-4" /> {t(banner.ctaKey)}
+   636→                    </Button>
+   637→                  </div>
+   638→                </motion.div>
+   639→              </AnimatePresence>
+   640→            </div>
+   641→          </div>
+   642→
+   643→          {/* Живые плитки показателей */}
+   644→          <div className="mt-4 flex items-center justify-between gap-2">
+   645→            <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   646→              <TrendingUp className="h-4 w-4 text-red-500" /> {t('dash.state.title')}
+   647→            </h2>
+   648→            <span
+   649→              title={t('dash.liveHint')}
+   650→              className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700"
+   651→            >
+   652→              <span className="live-dot h-2 w-2 rounded-full bg-emerald-500" />
+   653→              {t('dash.liveBadge')}
+   654→            </span>
+   655→          </div>
+   656→          <div className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(140px,1fr))] gap-2">
+   657→            <LiveTile
+   658→              icon={<Thermometer className="h-3.5 w-3.5" />}
+   659→              label={t('dash.tiles.temp')}
+   660→              num={liveV.tempC}
+   661→              suffix="°C"
+   662→              hint={isAll ? t('demo.hives.all4') : t('dash.tiles.tempHint', { n: hive.id })}
+   663→            />
+   664→            <LiveTile
+   665→              icon={<Droplets className="h-3.5 w-3.5" />}
+   666→              label={t('dash.tiles.hum')}
+   667→              num={liveV.humidityPct}
+   668→              digits={0}
+   669→              suffix="%"
+   670→              hint={!isAll && hive.scenario === 'flow' ? t('dash.tiles.humHint.flow') : t('dash.tiles.humHint.norm')}
+   671→            />
+   672→            <LiveTile
+   673→              icon={<Scale className="h-3.5 w-3.5" />}
+   674→              label={isAll ? t('dash.tiles.weightAll') : t('dash.tiles.weight')}
+   675→              num={liveV.weightKg}
+   676→              suffix={t('demo.unit.kg')}
+   677→              hint={tf(`demo.hive.${hive.id}.corps`, hive.base.corps)}
+   678→            />
+   679→            <LiveTile
+   680→              icon={<Bug className="h-3.5 w-3.5" />}
+   681→              label={t('dash.tiles.varroa')}
+   682→              num={varroaLive}
+   683→              digits={2}
+   684→              suffix="%"
+   685→              tone={varroa.level === 'crit' ? 'red' : varroa.level === 'risk' ? 'amber' : 'emerald'}
+   686→              hint={t('dash.tiles.varroaHint', { status: varroaStatusLabel, p: fmtNum(forecast14) })}
+   687→              badge={
+   688→                <span className={cn('rounded-full border px-2 py-0.5 text-[10px] font-extrabold', varroa.cls)}>
+   689→                  {varroaStatusLabel}
+   690→                </span>
+   691→              }
+   692→            />
+   693→            <LiveTile
+   694→              icon={<AudioLines className="h-3.5 w-3.5" />}
+   695→              label={t('dash.tiles.sound')}
+   696→              num={liveV.soundHz}
+   697→              digits={0}
+   698→              suffix={t('demo.unit.hz')}
+   699→              hint={t('dash.tiles.soundHint')}
+   700→            />
+   701→            <LiveTile
+   702→              icon={<Wind className="h-3.5 w-3.5" />}
+   703→              label="CO₂"
+   704→              num={liveV.co2Ppm}
+   705→              digits={0}
+   706→              suffix="ppm"
+   707→              hint={t('dash.tiles.co2Hint')}
+   708→            />
+   709→            <LiveTile
+   710→              icon={<Cctv className="h-3.5 w-3.5" />}
+   711→              label={t('dash.tiles.traffic')}
+   712→              num={liveV.trafficPerMin}
+   713→              digits={0}
+   714→              suffix={t('demo.unit.beesMin')}
+   715→              hint={tf(`demo.traffic.${traffic.key}`, traffic.label).toLowerCase()}
+   716→            />
+   717→          </div>
+   718→        </section>
+   719→      </Rise>
+   720→
+   721→      {/* ── БЛОК 2: привес за сутки | накоплено за взяток ── */}
+   722→      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+   723→        <Rise delay={0.05} className="h-full">
+   724→          <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   725→            <h2 className="text-sm font-bold uppercase tracking-wide text-gray-500">{t('dash.gain.title')}</h2>
+   726→            <p className="mt-2 flex items-center gap-2 text-5xl font-extrabold leading-none text-[#2A1A12]">
+   727→              {fmtSigned(hive.base.dailyGainKg, 2)}
+   728→              <span className="text-xl font-bold text-gray-400">{t('demo.unit.kg')}</span>
+   729→              <ArrowUpRight
+   730→                className={cn(
+   731→                  'h-8 w-8',
+   732→                  hive.base.dailyGainKg >= 0.15 ? 'text-emerald-500' : 'text-amber-500',
+   733→                )}
+   734→              />
+   735→            </p>
+   736→            <p className="mt-2 text-sm font-semibold text-gray-600">
+   737→              {t('dash.gain.pure', { n: fmtNum(hive.base.dailyGainKg * 0.75, 1) })}
+   738→            </p>
+   739→            <div className="mt-auto grid grid-cols-2 gap-2 pt-3">
+   740→              <div className="rounded-xl bg-red-50 px-3 py-2 dark:bg-[#2C211C]">
+   741→                <p className="text-[10px] font-semibold text-gray-400">{t('dash.scales.morning')}</p>
+   742→                <p className="text-sm font-extrabold text-sky-600">−{fmtNum(hive.base.morningDropKg)} кг</p>
+   743→              </div>
+   744→              <div className="rounded-xl bg-red-50 px-3 py-2 dark:bg-[#2C211C]">
+   745→                <p className="text-[10px] font-semibold text-gray-400">{t('dash.scales.filter')}</p>
+   746→                <p className="text-sm font-extrabold text-gray-700">{t('dash.scales.filterOk')}</p>
+   747→              </div>
+   748→            </div>
+   749→          </section>
+   750→        </Rise>
+   751→
+   752→        <Rise delay={0.1} className="h-full">
+   753→          <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   754→            <h2 className="text-sm font-bold uppercase tracking-wide text-gray-500">{t('dash.season.title')}</h2>
+   755→            <p className="mt-2 flex items-center gap-2 text-5xl font-extrabold leading-none text-[#2A1A12]">
+   756→              +{fmtNum(hive.base.seasonGainKg, 1)}
+   757→              <span className="text-xl font-bold text-gray-400">{t('demo.unit.kg')}</span>
+   758→            </p>
+   759→            <p className="mt-2 text-sm font-semibold text-gray-600">
+   760→              {t('dash.season.total', { n: fmtNum(liveV.weightKg) })}
+   761→            </p>
+   762→            <div className="mt-auto pt-3">
+   763→              <div className="flex items-center justify-between text-xs font-semibold text-gray-500">
+   764→                <span>{t('dash.season.volume', { n: hive.base.storePct })}</span>
+   765→                <span className="text-red-600">{hive.base.storePct}%</span>
+   766→              </div>
+   767→              <div className="mt-1.5 h-3 overflow-hidden rounded-full bg-red-50 dark:bg-[#2C211C]">
+   768→                <motion.div
+   769→                  className="bar-shine h-full rounded-full bg-gradient-to-r from-amber-400 to-orange-500"
+   770→                  initial={{ width: 0 }}
+   771→                  animate={{ width: `${hive.base.storePct}%` }}
+   772→                  transition={{ duration: 0.9, ease: 'easeOut', delay: 0.2 }}
+   773→                />
+   774→              </div>
+   775→              <p className="mt-1.5 text-[11px] text-gray-400">{t('dash.corps', { corps: tf(`demo.hive.${hive.id}.corps`, hive.base.corps) })}</p>
+   776→            </div>
+   777→          </section>
+   778→        </Rise>
+   779→      </div>
+   780→
+   781→      {/* ── БЛОК 3: график привесов за 7 дней ── */}
+   782→      <Rise delay={0.1}>
+   783→        <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   784→          <div className="flex flex-wrap items-center justify-between gap-2">
+   785→            <h3 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   786→              <Scale className="h-4 w-4 text-red-500" /> {t('dash.chart.gain7')}
+   787→            </h3>
+   788→            <span
+   789→              title={t('dash.scales.quietHint')}
+   790→              className="inline-flex items-center gap-1.5 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-0.5 text-[11px] font-bold text-sky-700"
+   791→            >
+   792→              <Gauge className="h-3 w-3" /> {t('dash.scales.quiet')}
+   793→            </span>
+   794→          </div>
+   795→          <div className="mt-2">
+   796→            <GainComboChart data={gain7} />
+   797→          </div>
+   798→          <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500">
+   799→            <span className="flex items-center gap-1.5">
+   800→              <span className="h-2 w-4 rounded-full bg-gradient-to-t from-amber-300 to-orange-500" />
+   801→              {t('dash.chart.gain7.gain')}
+   802→            </span>
+   803→            <span className="flex items-center gap-1.5">
+   804→              <span className="h-0.5 w-4 rounded-full bg-red-500" />
+   805→              {t('dash.chart.gain7.temp')}
+   806→            </span>
+   807→            <span className="ml-auto text-[11px] text-gray-400">{t('dash.chart.days', { n: 7 })}</span>
+   808→          </div>
+   809→          <p className="mt-1 text-[11px] leading-snug text-gray-400">{t('dash.chart.gain7.note')}</p>
+   810→        </section>
+   811→      </Rise>
+   812→
+   813→      {/* ── Ряд из 3 графиков: температура | влажность | заклещенность ── */}
+   814→      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+   815→        <Rise delay={0.05} className="h-full">
+   816→          <MiniCard
+   817→            title={t('dash.chart.temp')}
+   818→            icon={<Thermometer className="h-4 w-4" />}
+   819→            value={`${fmtNum(liveV.tempC)} °C`}
+   820→            note={t('dash.chart.temp.note')}
+   821→          >
+   822→            <DemoClimateMini data={climate} metric="tempInC" />
+   823→          </MiniCard>
+   824→        </Rise>
+   825→        <Rise delay={0.1} className="h-full">
+   826→          <MiniCard
+   827→            title={t('dash.chart.hum')}
+   828→            icon={<Droplets className="h-4 w-4" />}
+   829→            value={`${fmtNum(liveV.humidityPct, 0)} %`}
+   830→            note={!isAll && hive.scenario === 'flow' ? t('dash.chart.hum.note.flow') : t('dash.chart.hum.note.norm')}
+   831→          >
+   832→            <DemoClimateMini data={climate} metric="humidityPct" />
+   833→          </MiniCard>
+   834→        </Rise>
+   835→        <Rise delay={0.15} className="h-full md:col-span-2 xl:col-span-1">
+   836→          <div className="h-full rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]">
+   837→            <div className="flex flex-wrap items-center justify-between gap-2">
+   838→              <h3 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   839→                <Bug className="h-4 w-4 text-red-500" /> {t('dash.chart.varroa')}
+   840→              </h3>
+   841→              <div className="flex flex-wrap items-center gap-1.5">
+   842→                <span className={cn('rounded-full border px-2 py-0.5 text-[11px] font-bold', varroa.cls)}>
+   843→                  {varroaStatusLabel}
+   844→                </span>
+   845→                <span className="rounded-full border border-red-100 bg-red-50/60 px-2 py-0.5 text-[11px] font-bold text-red-700">
+   846→                  {t('dash.varroa.forecast', { p: fmtNum(forecast14) })}
+   847→                </span>
+   848→              </div>
+   849→            </div>
+   850→            <p className="mt-1 text-[11px] leading-snug text-gray-400">{t('dash.chart.varroa.note')}</p>
+   851→            <div className="mt-1.5">
+   852→              <VarroaChart data={varroaSeries} />
+   853→            </div>
+   854→          </div>
+   855→        </Rise>
+   856→      </div>
+   857→
+   858→      {/* ── БЛОК 4: микроклимат гнезда | заклещёванность ── */}
+   859→      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+   860→        <Rise delay={0.05} className="h-full">
+   861→          <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   862→            <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   863→              <Thermometer className="h-4 w-4 text-red-500" /> {t('dash.micro.title')}
+   864→            </h2>
+   865→            <ul className="mt-3 space-y-2.5">
+   866→              <li className="flex items-center justify-between gap-3 rounded-xl bg-red-50/60 px-3 py-2.5 dark:bg-[#2C211C]">
+   867→                <span className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+   868→                  <Thermometer className="h-4 w-4 text-red-400" /> {t('dash.micro.temp')}
+   869→                </span>
+   870→                <span className="text-base font-extrabold text-[#2A1A12]">
+   871→                  <AnimatedNumber value={liveV.tempC} /> °C
+   872→                </span>
+   873→                <span
+   874→                  className={cn(
+   875→                    'rounded-full border px-2 py-0.5 text-[11px] font-bold',
+   876→                    tempRising
+   877→                      ? 'border-amber-200 bg-amber-50 text-amber-700'
+   878→                      : 'border-emerald-200 bg-emerald-50 text-emerald-700',
+   879→                  )}
+   880→                >
+   881→                  {tempRising ? t('dash.micro.rising') : t('dash.micro.stable')}
+   882→                </span>
+   883→              </li>
+   884→              <li className="flex items-center justify-between gap-3 rounded-xl bg-red-50/60 px-3 py-2.5 dark:bg-[#2C211C]">
+   885→                <span className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+   886→                  <Droplets className="h-4 w-4 text-red-400" /> {t('dash.micro.hum')}
+   887→                </span>
+   888→                <span className="text-base font-extrabold text-[#2A1A12]">
+   889→                  <AnimatedNumber value={liveV.humidityPct} digits={0} /> %
+   890→                </span>
+   891→                {!isAll && hive.scenario === 'flow' && (
+   892→                  <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-bold text-amber-700">
+   893→                    ↑ {t('dash.micro.drying')}
+   894→                  </span>
+   895→                )}
+   896→              </li>
+   897→              <li className="flex items-center justify-between gap-3 rounded-xl bg-red-50/60 px-3 py-2.5 dark:bg-[#2C211C]">
+   898→                <span className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+   899→                  <AudioLines className="h-4 w-4 text-red-400" /> {t('dash.micro.acoustics')}
+   900→                </span>
+   901→                <span className="min-w-0 truncate text-right text-[13px] font-bold text-[#2A1A12]">
+   902→                  {tf(`demo.hive.${hive.id}.acousticLabel`, hive.base.acousticLabel)}
+   903→                </span>
+   904→              </li>
+   905→              <li className="flex items-center justify-between gap-3 rounded-xl bg-red-50/60 px-3 py-2.5 dark:bg-[#2C211C]">
+   906→                <span className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+   907→                  <BatteryCharging className="h-4 w-4 text-red-400" /> {t('dash.micro.battery')}
+   908→                </span>
+   909→                <span className="flex items-center gap-2">
+   910→                  <span className="h-2 w-24 overflow-hidden rounded-full bg-red-100 dark:bg-[#3E201A]">
+   911→                    <motion.span
+   912→                      className="block h-full rounded-full bg-gradient-to-r from-emerald-400 to-emerald-500"
+   913→                      initial={{ width: 0 }}
+   914→                      animate={{ width: `${hive.base.sensorBatteryPct}%` }}
+   915→                      transition={{ duration: 0.8, ease: 'easeOut', delay: 0.2 }}
+   916→                    />
+   917→                  </span>
+   918→                  <span className="text-base font-extrabold text-emerald-600">
+   919→                    {hive.base.sensorBatteryPct}%
+   920→                  </span>
+   921→                </span>
+   922→              </li>
+   923→            </ul>
+   924→          </section>
+   925→        </Rise>
+   926→
+   927→        <Rise delay={0.1} className="h-full">
+   928→          <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   929→            <div className="flex flex-wrap items-center justify-between gap-2">
+   930→              <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   931→                <Bug className="h-4 w-4 text-red-500" /> {t('dash.varroacard.title')}
+   932→              </h2>
+   933→              <span className={cn('rounded-full border px-2.5 py-0.5 text-xs font-extrabold', varroa.cls)}>
+   934→                {varroa.level === 'crit' ? '🔴' : varroa.level === 'risk' ? '🟡' : '🟢'} {varroaStatusLabel}
+   935→              </span>
+   936→            </div>
+   937→            <p className="mt-3 text-4xl font-extrabold leading-none text-[#2A1A12]">
+   938→              <AnimatedNumber value={varroaLive} digits={2} />
+   939→              <span className="ml-1 text-sm font-bold text-gray-400">%</span>
+   940→              <span className="ml-3 align-middle text-xs font-bold text-red-500">
+   941→                {t('dash.varroa.forecast', { p: fmtNum(forecast14) })}
+   942→              </span>
+   943→            </p>
+   944→            <div className="mt-3 space-y-1.5 text-xs text-gray-600">
+   945→              <p className="flex items-center justify-between gap-2">
+   946→                <span>
+   947→                  {measures[hive.id]
+   948→                    ? t('dash.varroacard.measureJust', { n: measures[hive.id].mites, bees: measures[hive.id].bees })
+   949→                    : t('dash.varroacard.measure', { n: hive.base.lastMiteCount, d: hive.base.lastMiteDaysAgo })}
+   950→                </span>
+   951→                <span className="font-bold text-gray-700">📋</span>
+   952→              </p>
+   953→              <p className="flex items-center justify-between gap-2">
+   954→                <span>{t('dash.varroacard.measureCamera', { n: hive.base.mitesCounted })}</span>
+   955→                <span
+   956→                  className={cn(
+   957→                    'font-extrabold',
+   958→                    hive.base.mitesCounted === 0
+   959→                      ? 'text-emerald-600'
+   960→                      : hive.base.mitesCounted >= 5
+   961→                        ? 'text-red-600'
+   962→                        : 'text-amber-600',
+   963→                  )}
+   964→                >
+   965→                  {hive.base.mitesCounted}
+   966→                </span>
+   967→              </p>
+   968→            </div>
+   969→            <div className="mt-auto pt-3">
+   970→              <Button
+   971→                onClick={() => setMeasureOpen(true)}
+   972→                className="w-full gap-1.5 bg-gradient-to-r from-red-600 to-orange-500 font-bold shadow-md shadow-red-100 hover:from-red-700 hover:to-orange-600"
+   973→              >
+   974→                <Plus className="h-4 w-4" /> {t('dash.varroacard.add')}
+   975→              </Button>
+   976→            </div>
+   977→          </section>
+   978→        </Rise>
+   979→      </div>
+   980→
+   981→      {/* ── Камера | Акустика | Качество воздуха ── */}
+   982→      <div className="grid grid-cols-[repeat(auto-fit,minmax(250px,1fr))] gap-4">
+   983→        <Rise delay={0.05} className="h-full">
+   984→          <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]">
+   985→            <div className="flex items-center gap-2">
+   986→              <SensorCardIcon tone="red">
+   987→                <Cctv className="h-4 w-4" />
+   988→              </SensorCardIcon>
+   989→              <div>
+   990→                <h3 className="text-sm font-bold text-[#2A1A12]">{t('dash.camera.title')}</h3>
+   991→                <p className="text-[10px] text-gray-400">{t('dash.camera.hint')}</p>
+   992→              </div>
+   993→            </div>
+   994→            <p className="mt-3 text-2xl font-extrabold leading-none text-[#2A1A12]">
+   995→              <AnimatedNumber value={liveV.trafficPerMin} digits={0} />
+   996→              <span className="ml-1 text-xs font-bold text-gray-400">{t('demo.unit.beesMin')}</span>
+   997→            </p>
+   998→            <div className="mt-2 space-y-1.5 text-xs text-gray-600">
+   999→              <p className="flex items-center justify-between gap-2">
+  1000→                <span>{t('dash.camera.mites')}</span>
+  1001→                <span
+  1002→                  className={cn(
+  1003→                    'font-extrabold',
+  1004→                    hive.base.mitesCounted === 0
+  1005→                      ? 'text-emerald-600'
+  1006→                      : hive.base.mitesCounted >= 5
+  1007→                        ? 'text-red-600'
+  1008→                        : 'text-amber-600',
+  1009→                  )}
+  1010→                >
+  1011→                  {hive.base.mitesCounted}
+  1012→                </span>
+  1013→              </p>
+  1014→              <p className="flex items-center justify-between gap-2">
+  1015→                <span>{t('dash.camera.avg')}</span>
+  1016→                <span className="font-extrabold text-gray-700">45 {t('demo.unit.beesMin')}</span>
+  1017→              </p>
+  1018→            </div>
+  1019→            <p
+  1020→              className={cn(
+  1021→                'mt-auto rounded-xl px-3 py-2 text-[11px] font-bold leading-snug',
+  1022→                hive.base.entranceLevel === 'beard'
+  1023→                  ? 'border border-red-200 bg-red-50 text-red-700'
+  1024→                  : hive.base.entranceLevel === 'weak'
+  1025→                    ? 'border border-amber-200 bg-amber-50 text-amber-700'
+  1026→                    : 'border border-emerald-200 bg-emerald-50 text-emerald-700',
+  1027→              )}
+  1028→            >
+  1029→              {tf(`demo.hive.${hive.id}.entranceLabel`, hive.base.entranceLabel)}
+  1030→            </p>
+  1031→          </section>
+  1032→        </Rise>
+  1033→
+  1034→        <Rise delay={0.1} className="h-full">
+  1035→          <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]">
+  1036→            <div className="flex items-center gap-2">
+  1037→              <SensorCardIcon tone="amber">
+  1038→                <AudioLines className="h-4 w-4" />
+  1039→              </SensorCardIcon>
+  1040→              <div>
+  1041→                <h3 className="text-sm font-bold text-[#2A1A12]">{t('dash.acoustics.title')}</h3>
+  1042→                <p className="text-[10px] text-gray-400">{t('dash.acoustics.hint')}</p>
+  1043→              </div>
+  1044→            </div>
+  1045→            <p className="mt-3 text-2xl font-extrabold leading-none text-[#2A1A12]">
+  1046→              <AnimatedNumber value={liveV.soundHz} digits={0} />
+  1047→              <span className="ml-1 text-xs font-bold text-gray-400">{t('demo.unit.hz')}</span>
+  1048→            </p>
+  1049→            <div className="mt-2">
+  1050→              <AcousticSpark data={sparkHz} />
+  1051→            </div>
+  1052→            <p className="mt-auto rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-bold leading-snug text-amber-700">
+  1053→              {tf(`demo.hive.${hive.id}.acousticLabel`, hive.base.acousticLabel)}
+  1054→            </p>
+  1055→          </section>
+  1056→        </Rise>
+  1057→
+  1058→        <Rise delay={0.15} className="h-full">
+  1059→          <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]">
+  1060→            <div className="flex items-center gap-2">
+  1061→              <SensorCardIcon tone="sky">
+  1062→                <Wind className="h-4 w-4" />
+  1063→              </SensorCardIcon>
+  1064→              <div>
+  1065→                <h3 className="text-sm font-bold text-[#2A1A12]">{t('dash.air.title')}</h3>
+  1066→                <p className="text-[10px] text-gray-400">{t('dash.air.hint')}</p>
+  1067→              </div>
+  1068→            </div>
+  1069→            <p className="mt-3 text-2xl font-extrabold leading-none text-[#2A1A12]">
+  1070→              <AnimatedNumber value={liveV.co2Ppm} digits={0} />
+  1071→              <span className="ml-1 text-xs font-bold text-gray-400">ppm CO₂</span>
+  1072→            </p>
+  1073→            <div className="mt-2 space-y-1.5 text-xs">
+  1074→              <div className="flex items-center justify-between gap-2 text-gray-600">
+  1075→                <span>{t('dash.air.voc')}</span>
+  1076→                <span className={cn('font-extrabold', voc.cls)}>{Math.round(liveV.vocIndex)} / 100</span>
+  1077→              </div>
+  1078→              <div className="h-2 overflow-hidden rounded-full bg-red-50 dark:bg-[#2C211C]">
+  1079→                <motion.div
+  1080→                  className={cn(
+  1081→                    'h-full rounded-full',
+  1082→                    liveV.vocIndex > 60 ? 'bg-red-500' : liveV.vocIndex > 30 ? 'bg-amber-500' : 'bg-emerald-500',
+  1083→                  )}
+  1084→                  animate={{ width: `${Math.min(100, liveV.vocIndex)}%` }}
+  1085→                  transition={{ duration: 0.6 }}
+  1086→                />
+  1087→              </div>
+  1088→            </div>
+  1089→            <p
+  1090→              className={cn(
+  1091→                'mt-auto rounded-xl border border-red-100 bg-red-50/50 px-3 py-2 text-[11px] font-bold leading-snug',
+  1092→                voc.cls,
+  1093→              )}
+  1094→            >
+  1095→              {tf(`demo.voc.${voc.key}`, voc.label)}
+  1096→            </p>
+  1097→          </section>
+  1098→        </Rise>
+  1099→      </div>
+  1100→
+  1101→      {/* ── Погода на пасеке | Цветение GDD ── */}
+  1102→      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+  1103→        <Rise delay={0.05}>
+  1104→          <WeatherPanel coords={[city.lat, city.lon]} place={city.name} />
+  1105→        </Rise>
+  1106→        <Rise delay={0.1}>
+  1107→          <GddCard />
+  1108→        </Rise>
+  1109→      </div>
+  1110→
+  1111→      {/* ── БЛОК 5: предписания агента | умные напоминания и события ── */}
+  1112→      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
+  1113→        <Rise delay={0.05}>
+  1114→          <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+  1115→            <div className="flex items-center justify-between gap-2">
+  1116→              <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+  1117→                <MessageSquareText className="h-4 w-4 text-red-500" /> {t('dash.agent.title')}
+  1118→              </h2>
+  1119→              <span className="text-[11px] text-gray-400">
+  1120→                {isAll ? t('dash.agent.contextAll') : t('dash.agent.context', { n: hive.id })}
+  1121→              </span>
+  1122→            </div>
+  1123→
+  1124→            {/* Вечерний отчет (21:00) */}
+  1125→            <Button
+  1126→              variant="outline"
+  1127→              onClick={() => setReportOpen(true)}
+  1128→              className="mt-3 w-full gap-2 border-red-200 font-bold text-red-700 hover:bg-red-50 hover:text-red-700"
+  1129→            >
+  1130→              <ClipboardList className="h-4 w-4" /> {t('dash.agent.evening')}
+  1131→            </Button>
+  1132→
+  1133→            <ol className="mt-3 space-y-2">
+  1134→              {hive.prescriptions.map((f, i) => {
+  1135→                const targetHive = f.sourceHive ?? hive.id
+  1136→                const isDone = doneForHive(targetHive).includes(f.id)
+  1137→                return (
+  1138→                  <li
+  1139→                    key={f.id}
+  1140→                    className={cn(
+  1141→                      'rise-in overflow-hidden rounded-xl border transition-shadow',
+  1142→                      isDone
+  1143→                        ? 'border-emerald-200 bg-emerald-50/40'
+  1144→                        : f.urgency === 'act-now'
+  1145→                          ? 'border-red-200 hover:shadow-md hover:shadow-red-100'
+  1146→                          : 'border-red-100 hover:shadow-md hover:shadow-red-50',
+  1147→                    )}
+  1148→                  >
+  1149→                    <button
+  1150→                      onClick={() => setEvidence(f)}
+  1151→                      aria-label={`${t('dash.banner.cta.why')}: ${f.title}`}
+  1152→                      className="flex w-full items-start gap-2.5 px-3 py-2.5 text-left"
+  1153→                    >
+  1154→                      <span
+  1155→                        className={cn(
+  1156→                          'mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-extrabold',
+  1157→                          isDone
+  1158→                            ? 'bg-emerald-600 text-white'
+  1159→                            : f.urgency === 'act-now'
+  1160→                              ? 'bg-red-600 text-white'
+  1161→                              : 'bg-red-100 text-red-700',
+  1162→                        )}
+  1163→                      >
+  1164→                        {isDone ? <CheckCircle2 className="h-3.5 w-3.5" /> : i + 1}
+  1165→                      </span>
+  1166→                      <span className="min-w-0 flex-1">
+  1167→                        <span className="flex flex-wrap items-center gap-1.5">
+  1168→                          {isAll && (
+  1169→                            <span className="rounded-full bg-red-600 px-1.5 py-0.5 text-[10px] font-extrabold text-white">
+  1170→                              №{targetHive}
+  1171→                            </span>
+  1172→                          )}
+  1173→                          <span
+  1174→                            className={cn(
+  1175→                              'text-[13px] font-bold leading-snug',
+  1176→                              isDone ? 'text-emerald-800 line-through decoration-emerald-300' : 'text-gray-800',
+  1177→                            )}
+  1178→                          >
+  1179→                            {f.title}
+  1180→                          </span>
+  1181→                        </span>
+  1182→                        <span className="mt-0.5 line-clamp-2 block text-[11px] leading-snug text-gray-500">
+  1183→                          {f.summary}
+  1184→                        </span>
+  1185→                        {isDone && (
+  1186→                          <span className="mt-1 inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-extrabold text-emerald-700">
+  1187→                            <CheckCircle2 className="h-3 w-3" /> {t('dash.agent.done', { n: fmtNum(f.boost) })}
+  1188→                          </span>
+  1189→                        )}
+  1190→                      </span>
+  1191→                    </button>
+  1192→                    <div className="flex flex-wrap gap-1 px-3 pb-2">
+  1193→                      {f.basis.map((b) => (
+  1194→                        <span
+  1195→                          key={b}
+  1196→                          className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] text-red-700 dark:bg-[#2C211C]"
+  1197→                        >
+  1198→                          {b}
+  1199→                        </span>
+  1200→                      ))}
+  1201→                    </div>
+  1202→                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-red-50 px-3 py-2">
+  1203→                      <UrgencyBadge urgency={f.urgency} note={f.urgencyNote} />
+  1204→                      <div className="ml-auto flex items-center gap-1">
+  1205→                        <Button
+  1206→                          size="sm"
+  1207→                          variant="ghost"
+  1208→                          className="gap-1 text-red-600 hover:bg-red-50 hover:text-red-700"
+  1209→                          onClick={() => setEvidence(f)}
+  1210→                        >
+  1211→                          <Search className="h-3.5 w-3.5" /> {t('dash.agent.why')}
+  1212→                        </Button>
+  1213→                        <Button
+  1214→                          size="sm"
+  1215→                          variant="ghost"
+  1216→                          className="hidden gap-1 text-gray-500 hover:bg-red-50 hover:text-red-700 sm:inline-flex"
+  1217→                          onClick={() => ask(`Обсудим предписание по улью №${targetHive}: ${f.title}`)}
+  1218→                        >
+  1219→                          {t('dash.agent.discuss')}
+  1220→                        </Button>
+  1221→                      </div>
+  1222→                    </div>
+  1223→                    {/* Кнопка действия прямо на предписании */}
+  1224→                    {!isDone && (
+  1225→                      <div className="border-t border-red-50 px-3 py-2">
+  1226→                        <Button
+  1227→                          size="sm"
+  1228→                          onClick={() => complete(f)}
+  1229→                          className={cn(
+  1230→                            'w-full gap-1.5 font-bold',
+  1231→                            f.urgency === 'act-now'
+  1232→                              ? 'bg-gradient-to-r from-red-600 to-orange-500 shadow-md shadow-red-100 hover:from-red-700 hover:to-orange-600'
+  1233→                              : 'bg-red-600 hover:bg-red-700',
+  1234→                          )}
+  1235→                        >
+  1236→                          <Wrench className="h-3.5 w-3.5" /> {f.action}
+  1237→                        </Button>
+  1238→                      </div>
+  1239→                    )}
+  1240→                  </li>
+  1241→                )
+  1242→              })}
+  1243→            </ol>
+  1244→            <p className="mt-3 text-[11px] leading-relaxed text-gray-400">{t('dash.agent.note')}</p>
+  1245→          </section>
+  1246→        </Rise>
+  1247→
+  1248→        <Rise delay={0.1}>
+  1249→          <div className="space-y-4">
+  1250→            {/* Умные напоминания */}
+  1251→            <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+  1252→              <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+  1253→                <ClipboardList className="h-4 w-4 text-red-500" /> {t('dash.smart.title')}
+  1254→              </h2>
+  1255→              <ul className="mt-2.5 space-y-2">
+  1256→                <li className="flex items-start gap-2.5 rounded-xl border border-emerald-100 bg-emerald-50/50 px-3 py-2">
+  1257→                  <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-emerald-500" />
+  1258→                  <p className="text-[13px] font-semibold leading-snug text-gray-800">{t('dash.smart.1')}</p>
+  1259→                </li>
+  1260→                <li className="flex items-start gap-2.5 rounded-xl border border-amber-100 bg-amber-50/50 px-3 py-2">
+  1261→                  <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-amber-500" />
+  1262→                  <p className="text-[13px] font-semibold leading-snug text-gray-800">{t('dash.smart.2')}</p>
+  1263→                </li>
+  1264→                <li className="flex items-start gap-2.5 rounded-xl border border-sky-100 bg-sky-50/50 px-3 py-2">
+  1265→                  <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-sky-500" />
+  1266→                  <p className="text-[13px] font-semibold leading-snug text-gray-800">
+  1267→                    {t('dash.smart.3', { n: sunflower?.daysLeft ?? 6 })}
+  1268→                  </p>
+  1269→                </li>
+  1270→              </ul>
+  1271→            </section>
+  1272→
+  1273→            {/* Ближайшие события */}
+  1274→            <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+  1275→              <div className="flex items-center justify-between">
+  1276→                <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+  1277→                  <Flower2 className="h-4 w-4 text-red-500" /> {t('dash.events.title')}
+  1278→                </h2>
+  1279→                <button
+  1280→                  onClick={() => setView('reminders')}
+  1281→                  className="text-[11px] font-bold text-red-600 hover:text-red-700"
+  1282→                >
+  1283→                  {t('dash.events.all')}
+  1284→                </button>
+  1285→              </div>
+  1286→
+  1287→              {/* GDD-событие: предупреждение за 5–7 дней до цветения */}
+  1288→              <div className="mt-2 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2">
+  1289→                <Flower2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
+  1290→                <div className="min-w-0 flex-1">
+  1291→                  <p className="text-[13px] font-semibold leading-snug text-gray-800">
+  1292→                    {t('dash.events.gdd', { name: nearest.name, n: nearest.daysLeft })}
+  1293→                  </p>
+  1294→                  <p className="text-[11px] text-gray-400">
+  1295→                    {t('dash.events.gddNote', { cur: GDD_CURRENT, need: nearest.need, per: GDD_PER_DAY })}
+  1296→                  </p>
+  1297→                </div>
+  1298→              </div>
+  1299→
+  1300→              {upcomingReminders.length === 0 ? (
+  1301→                <p className="mt-2 text-sm text-gray-400">{t('dash.events.none')}</p>
+  1302→              ) : (
+  1303→                <ul className="mt-2 space-y-1.5">
+  1304→                  {upcomingReminders.map((r) => (
+  1305→                    <li
+  1306→                      key={r.id}
+  1307→                      className="flex items-start gap-2.5 rounded-xl bg-red-50/50 px-3 py-2 dark:bg-[#2C211C]"
+  1308→                    >
+  1309→                      <ClipboardList className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+  1310→                      <div className="min-w-0 flex-1">
+  1311→                        <p className="text-[13px] font-semibold leading-snug text-gray-800">{r.text}</p>
+  1312→                      </div>
+  1313→                    </li>
+  1314→                  ))}
+  1315→                </ul>
+  1316→              )}
+  1317→
+  1318→              <h3 className="mt-4 flex items-center gap-1.5 text-xs font-bold text-gray-500">
+  1319→                <Hexagon className="h-3.5 w-3.5" /> {t('dash.scenarios.title')}
+  1320→              </h3>
+  1321→              <ul className="mt-1.5 space-y-1.5">
+  1322→                {DEMO_HIVES.map((h) => (
+  1323→                  <li key={h.id}>
+  1324→                    <button
+  1325→                      onClick={() => setHive(h.id)}
+  1326→                      className="flex w-full flex-wrap items-center gap-2 rounded-xl border border-red-50 px-3 py-2 text-[13px] transition-colors hover:bg-red-50/60"
+  1327→                    >
+  1328→                      <span className={cn('h-2 w-2 rounded-full', RIBBON_DOT[h.id])} />
+  1329→                      <span className="font-semibold text-gray-700">{h.label}</span>
+  1330→                      <span className="text-gray-500">{t(`dash.scen.${h.scenario}`).toLowerCase()}</span>
+  1331→                      <span className="ml-auto text-[11px] font-bold text-red-600">
+  1332→                        {t('dash.gauge.label').toLowerCase()} {fmtNum(indexWithBoost(h.id))}
+  1333→                      </span>
+  1334→                    </button>
+  1335→                  </li>
+  1336→                ))}
+  1337→              </ul>
+  1338→            </section>
+  1339→          </div>
+  1340→        </Rise>
+  1341→      </div>
+  1342→
+  1343→      {/* Диалоги: доказательства, вечерний отчет, замер клеща, пестициды */}
+  1344→      <EvidenceDialog
+  1345→        finding={evidence}
+  1346→        hive={hive}
+  1347→        done={
+  1348→          evidence ? doneForHive(evidence.sourceHive ?? hive.id).includes(evidence.id) : false
+  1349→        }
+  1350→        onComplete={complete}
+  1351→        onOpenChange={(v) => !v && setEvidence(null)}
+  1352→      />
+  1353→      <EveningReportDialog open={reportOpen} onOpenChange={setReportOpen} doneList={done} />
+  1354→      <MeasureDialog open={measureOpen} onOpenChange={setMeasureOpen} hive={hive} onSave={saveMeasure} />
+  1355→      <PesticideDialog
+  1356→        open={pesticideOpen}
+  1357→        onOpenChange={setPesticideOpen}
+  1358→        onMigrate={() => setView('migration')}
+  1359→      />
+  1360→    </div>
+  1361→  )
+  1362→}
+  1363→

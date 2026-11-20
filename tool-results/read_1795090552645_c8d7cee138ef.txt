@@ -1,0 +1,676 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Экран «Мои пасеки» — дашборд в три колонки:
+     5→ *  — слева: погода на пасеке + прогноз на 10 дней (реальный метеосервис,
+     6→ *    без указания источника в интерфейсе);
+     7→ *  — в центре: состояние пасеки (шкала-индекс, плитки показателей,
+     8→ *    графики температуры/влажности/массы выбранного улья);
+     9→ *  — справа: предписания ИИ-агента и ближайшие события (напоминания + журнал).
+    10→ *
+    11→ * Схема пасеки и графики строятся из ОДНОГО набора точек, что на карте
+    12→ * (ApiaryPoint по кодам датчиков), показания «живые» (опрос каждые 5 с).
+    13→ * Погода берётся по фактическому центру пасеки — средним координат точек.
+    14→ */
+    15→import { useEffect, useMemo, useState } from 'react'
+    16→import {
+    17→  Activity,
+    18→  AlertTriangle,
+    19→  ArrowRight,
+    20→  CalendarDays,
+    21→  ChevronDown,
+    22→  CloudSun,
+    23→  Droplets,
+    24→  MapPin,
+    25→  MessageSquareText,
+    26→  Scale,
+    27→  SprayCan,
+    28→  Split,
+    29→  Sun,
+    30→  Thermometer,
+    31→  TrendingUp,
+    32→  Truck,
+    33→  AlarmClock,
+    34→  ClipboardList,
+    35→} from 'lucide-react'
+    36→import { format } from 'date-fns'
+    37→import { ru } from 'date-fns/locale'
+    38→import { Button } from '@/components/ui/button'
+    39→import { Card, CardContent } from '@/components/ui/card'
+    40→import { MetricLine, WeightBars, WeightChart, ClimateChart } from './charts'
+    41→import { WeatherPanel } from './WeatherPanel'
+    42→import { StatusGauge, apiaryGauge } from './StatusGauge'
+    43→import { UrgencyBadge } from './decor'
+    44→import { useAppState } from '@/lib/store'
+    45→import { cn } from '@/lib/utils'
+    46→import {
+    47→  bestHiveOf,
+    48→  fmtNum,
+    49→  fmtSigned,
+    50→  hiveStatus,
+    51→  type Hive,
+    52→  type MigrationSite,
+    53→  type WeatherDay,
+    54→} from '@/lib/hive-model'
+    55→import { findingsFor, makeContext, SCENARIO_META, type Scenario } from '@/lib/agent'
+    56→import { hiveWord, pointsCenter, pointsToHives } from '@/lib/hive-sync'
+    57→import { apiHiveToHive, periodCaption, siteDtoToSite, useRealData, weightDeltaSafe } from '@/lib/real-data'
+    58→import { DEFAULT_PLACE } from '@/lib/sensor-catalog'
+    59→import { weatherResponseToDays } from '@/lib/weather-days'
+    60→import { whenLabelShort } from './reminders-utils'
+    61→import { DemoDashboard } from './DemoDashboard'
+    62→import { ModeSwitcher } from './ModeSwitcher'
+    63→import type { EventDto, MapPointDto, WeatherResponse } from '@/lib/api-types'
+    64→
+    65→const STATUS_STYLES = {
+    66→  risk: { dot: 'bg-red-500', chip: 'bg-red-50 text-red-700 border-red-200' },
+    67→  watch: { dot: 'bg-amber-500', chip: 'bg-amber-50 text-amber-700 border-amber-200' },
+    68→  ok: { dot: 'bg-emerald-500', chip: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+    69→} as const
+    70→
+    71→function scenarioIcon(scenario: Scenario, className: string) {
+    72→  const cls = cn('h-4 w-4', className)
+    73→  switch (scenario) {
+    74→    case 'swarm':
+    75→      return <Split className={cls} />
+    76→    case 'pesticide':
+    77→      return <SprayCan className={cls} />
+    78→    case 'weather':
+    79→      return <CloudSun className={cls} />
+    80→    case 'migration':
+    81→      return <Truck className={cls} />
+    82→    default:
+    83→      return <Activity className={cls} />
+    84→  }
+    85→}
+    86→
+    87→const URGENCY_LABEL = {
+    88→  'act-now': 'Действовать сейчас',
+    89→  today: 'Сегодня',
+    90→  'this-week': 'В течение недели',
+    91→  ok: 'Наблюдать',
+    92→} as const
+    93→
+    94→/* ------------------------------------------------------------------ */
+    95→/* Контейнер дашборда                                                  */
+    96→/* ------------------------------------------------------------------ */
+    97→
+    98→export function DashboardView() {
+    99→  const mode = useAppState((s) => s.mode)
+   100→  // «Демо» — сценарные ульи с живой телеметрией; «Мои данные» — прежний режим,
+   101→  // где все диаграммы берутся с датчиков ульев на карте.
+   102→  if (mode === 'demo') return <DemoDashboard />
+   103→  return <RealDashboard />
+   104→}
+   105→
+   106→function RealDashboard() {
+   107→  const setView = useAppState((s) => s.setView)
+   108→  const hiveId = useAppState((s) => s.hiveId)
+   109→  const setHive = useAppState((s) => s.setHive)
+   110→  const { status, data, reload } = useRealData()
+   111→
+   112→  // Синхронизация с картой: ульи дашборда = точки на карте, показания — с
+   113→  // датчиков. Опрос каждые 5 секунд — числа «живут» вместе с картой.
+   114→  const [points, setPoints] = useState<MapPointDto[] | null>(null)
+   115→  const [weather, setWeather] = useState<WeatherResponse | null>(null)
+   116→  useEffect(() => {
+   117→    let alive = true
+   118→    const load = async () => {
+   119→      try {
+   120→        const res = await fetch('/api/map-points', { cache: 'no-store' })
+   121→        if (!res.ok) return
+   122→        const j = (await res.json()) as { points: MapPointDto[] }
+   123→        if (alive) setPoints(j.points)
+   124→      } catch {
+   125→        // датчики подтянутся на следующем опросе
+   126→      }
+   127→    }
+   128→    void load()
+   129→    const timer = setInterval(() => void load(), 5000)
+   130→    return () => {
+   131→      alive = false
+   132→      clearInterval(timer)
+   133→    }
+   134→  }, [])
+   135→
+   136→  // Погода по фактическому центру пасеки (среднее координат точек).
+   137→  // Эффект зависит от ЧИСЕЛ координат: пересчёт центра при каждом опросе
+   138→  // точек не вызывает перезапрос погоды, пока координаты не изменились.
+   139→  const center = useMemo<[number, number]>(
+   140→    () =>
+   141→      (points && points.length > 0 ? pointsCenter(points) : null) ?? DEFAULT_PLACE.center,
+   142→    [points],
+   143→  )
+   144→  const [wLat, wLon] = center
+   145→  useEffect(() => {
+   146→    let alive = true
+   147→    const sp = new URLSearchParams({ lat: String(wLat), lon: String(wLon), place: 'Моя пасека' })
+   148→    const load = async () => {
+   149→      try {
+   150→        const res = await fetch(`/api/weather?${sp.toString()}`, { cache: 'no-store' })
+   151→        if (!res.ok) return
+   152→        const j = (await res.json()) as WeatherResponse
+   153→        if (alive) setWeather(j)
+   154→      } catch {
+   155→        // агент честно скажет, если погоды нет
+   156→      }
+   157→    }
+   158→    void load()
+   159→    const timer = setInterval(() => void load(), 10 * 60 * 1000)
+   160→    return () => {
+   161→      alive = false
+   162→      clearInterval(timer)
+   163→    }
+   164→  }, [wLat, wLon])
+   165→  const agentWeather = useMemo(() => (weather ? weatherResponseToDays(weather) : null), [weather])
+   166→
+   167→  const syncedHives = useMemo(() => (points ? pointsToHives(points) : null), [points])
+   168→
+   169→  // выбранный улей всегда существует в синхронизированном наборе
+   170→  useEffect(() => {
+   171→    if (syncedHives && syncedHives.length > 0 && !syncedHives.some((h) => h.id === hiveId)) {
+   172→      setHive(syncedHives[0].id)
+   173→    }
+   174→  }, [syncedHives, hiveId, setHive])
+   175→
+   176→  if (status === 'idle' || status === 'loading') {
+   177→    return <DashboardSkeleton />
+   178→  }
+   179→  if (status === 'error') {
+   180→    return (
+   181→      <div className="space-y-5">
+   182→        <RealHeaderWithSwitcher note="данные недоступны" />
+   183→        <Card className="mx-auto max-w-lg border-red-100">
+   184→          <CardContent className="p-6 text-center">
+   185→            <AlertTriangle className="mx-auto h-8 w-8 text-red-400" />
+   186→            <h2 className="mt-2 font-bold text-gray-900">Не удалось загрузить данные</h2>
+   187→            <p className="mt-1 text-sm text-gray-500">
+   188→              Проверьте, что база данных доступна, и попробуйте ещё раз.
+   189→            </p>
+   190→            <Button onClick={reload} className="mt-4 bg-red-600 hover:bg-red-700">
+   191→              Повторить загрузку
+   192→            </Button>
+   193→          </CardContent>
+   194→        </Card>
+   195→      </div>
+   196→    )
+   197→  }
+   198→  // Схема и диаграммы — ТО ЖЕ точки, что на карте пасеки: один набор ульев
+   199→  // для карты, вкладки «Датчики» и дашборда. Из базы — журнал и площадки кочёвки.
+   200→  if (!points || !data || syncedHives === null) return <DashboardSkeleton />
+   201→  if (syncedHives.length === 0) {
+   202→    return (
+   203→      <div className="space-y-5">
+   204→        <RealHeaderWithSwitcher note="ульи не привязаны" />
+   205→        <EmptyMapState onOpenMap={() => setView('map')} />
+   206→      </div>
+   207→    )
+   208→  }
+   209→  return (
+   210→    <DashboardContent
+   211→      hives={syncedHives}
+   212→      sites={data.sites.map(siteDtoToSite)}
+   213→      weather={agentWeather?.days ?? null}
+   214→      events={data.events}
+   215→      center={center}
+   216→    />
+   217→  )
+   218→}
+   219→
+   220→function DashboardSkeleton() {
+   221→  return (
+   222→    <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)_340px]">
+   223→      <div className="h-96 animate-pulse rounded-2xl bg-red-50/70" />
+   224→      <div className="h-96 animate-pulse rounded-2xl bg-red-50/50" />
+   225→      <div className="h-96 animate-pulse rounded-2xl bg-red-50/40" />
+   226→      <p className="col-span-full text-center text-sm text-gray-400">Загружаем показания датчиков…</p>
+   227→    </div>
+   228→  )
+   229→}
+   230→
+   231→/** Шапка реального режима с переключателем «Демо / Мои данные» — чтобы вернуться
+   232→ *  в демо можно было с любого экрана (пустой база, ошибка, обычный дашборд). */
+   233→function RealHeaderWithSwitcher({ note }: { note: string }) {
+   234→  return (
+   235→    <div className="flex flex-wrap items-end justify-between gap-3">
+   236→      <div>
+   237→        <h1 className="text-2xl font-extrabold tracking-tight text-[#2A1A12] md:text-3xl">
+   238→          Моя пасека · данные с датчиков
+   239→        </h1>
+   240→        <p className="mt-1 text-sm text-gray-500">{note}</p>
+   241→      </div>
+   242→      <ModeSwitcher />
+   243→    </div>
+   244→  )
+   245→}
+   246→
+   247→/** Карта пуста — диаграммам не с чего брать данные: честный экран-подсказка. */
+   248→function EmptyMapState({ onOpenMap }: { onOpenMap: () => void }) {
+   249→  return (
+   250→    <Card className="mx-auto max-w-lg border-dashed border-red-300 bg-red-50/40">
+   251→      <CardContent className="p-8 text-center">
+   252→        <MapPin className="mx-auto h-8 w-8 text-red-300" />
+   253→        <h2 className="mt-3 text-lg font-extrabold text-[#2A1A12]">
+   254→          Ульи на карте ещё не привязаны
+   255→        </h2>
+   256→        <p className="mx-auto mt-1.5 max-w-sm text-sm leading-relaxed text-gray-500">
+   257→          Диаграммы дашборда берут данные с датчиков ульев на карте. Откройте карту и введите код с корпуса датчика — улей привяжется в точке GPS, и его показания появятся здесь.
+   258→        </p>
+   259→        <Button
+   260→          onClick={onOpenMap}
+   261→          className="mt-5 bg-gradient-to-r from-red-600 to-orange-500 hover:from-red-700 hover:to-orange-600"
+   262→        >
+   263→          Перейти на карту пасеки
+   264→        </Button>
+   265→      </CardContent>
+   266→    </Card>
+   267→  )
+   268→}
+   269→
+   270→/* ------------------------------------------------------------------ */
+   271→/* Содержимое дашборда                                                 */
+   272→/* ------------------------------------------------------------------ */
+   273→
+   274→interface ContentProps {
+   275→  hives: Hive[]
+   276→  sites: MigrationSite[]
+   277→  weather: WeatherDay[] | null
+   278→  events: EventDto[]
+   279→  /** Центр пасеки (среднее координат точек на карте) — для панели погоды. */
+   280→  center: [number, number]
+   281→}
+   282→
+   283→function DashboardContent({ hives, sites, weather, events, center }: ContentProps) {
+   284→  const hiveId = useAppState((s) => s.hiveId)
+   285→  const setHive = useAppState((s) => s.setHive)
+   286→  const setView = useAppState((s) => s.setView)
+   287→  const ask = useAppState((s) => s.ask)
+   288→  const reminders = useAppState((s) => s.reminders)
+   289→  const [openFinding, setOpenFinding] = useState<string | null>(null)
+   290→
+   291→  const hive = hives.find((x) => x.id === hiveId) ?? hives[0]
+   292→  const status = hiveStatus(hive, hives)
+   293→  const ctx = makeContext(hives, { weather, sites, apiaryName: 'Моя пасека' })
+   294→  const findings = findingsFor(hive.id, ctx)
+   295→
+   296→  const riskyHive = hives.find((x) => hiveStatus(x, hives).level === 'risk')
+   297→  const watchHive = hives.find((x) => hiveStatus(x, hives).level === 'watch' && x.id !== riskyHive?.id)
+   298→
+   299→  const lastPoint = hive.series[hive.series.length - 1]
+   300→  const d2 = weightDeltaSafe(hive, 2)
+   301→  const lastWeight = lastPoint?.weightKg ?? null
+   302→  const lastTemp = lastPoint?.tempInC ?? null
+   303→  const lastHum = lastPoint?.humidityPct ?? null
+   304→  const period = periodCaption(hive)
+   305→
+   306→  // показатели пасеки целиком
+   307→  const withTelemetry = hives.filter((h) => h.series.length > 0 && h.series[h.series.length - 1].weightKg !== null)
+   308→  const gauge = apiaryGauge(hives.map((h) => hiveStatus(h, hives).level), hives.length)
+   309→  const leader = bestHiveOf(hives)
+   310→
+   311→  const upcomingReminders = reminders
+   312→    .filter((r) => !r.done)
+   313→    .sort((a, b) => a.remindAt.localeCompare(b.remindAt))
+   314→    .slice(0, 4)
+   315→
+   316→  const todayLabel = format(new Date(), 'EEEE, d MMMM yyyy', { locale: ru })
+   317→
+   318→  return (
+   319→    <div className="space-y-5">
+   320→      {/* Верхний баннер срочности */}
+   321→      {riskyHive ? (
+   322→        <div className="relative overflow-hidden rounded-2xl bg-gradient-to-r from-[#D93E00] to-[#FF5A1F] p-4 text-white shadow-lg shadow-red-100 md:p-5">
+   323→          <Split className="absolute -right-3 -top-3 h-28 w-28 rotate-12 text-white/15" />
+   324→          <div className="relative flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+   325→            <div className="flex items-start gap-3">
+   326→              <AlertTriangle className="mt-0.5 h-6 w-6 shrink-0" />
+   327→              <div>
+   328→                <p className="text-sm font-bold uppercase tracking-wide text-white/90">
+   329→                  Сигнал данных · возможное роение
+   330→                </p>
+   331→                <p className="mt-1 text-sm leading-snug md:text-base">
+   332→                  Улей №{riskyHive.id}: вес снизился на {fmtSigned(weightDeltaSafe(riskyHive, 2) ?? 0)} кг за 2 дня при
+   333→                  тёплой погоде — похоже на подготовку семьи к делению.
+   334→                </p>
+   335→              </div>
+   336→            </div>
+   337→            <Button
+   338→              className="w-fit shrink-0 bg-white font-semibold text-orange-700 hover:bg-orange-50"
+   339→              onClick={() => ask(`Что происходит с ульем №${riskyHive.id}?`)}
+   340→            >
+   341→              Что делать? <ArrowRight className="h-4 w-4" />
+   342→            </Button>
+   343→          </div>
+   344→        </div>
+   345→      ) : watchHive ? (
+   346→        <div className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-amber-800">
+   347→          <AlertTriangle className="h-5 w-5 shrink-0 text-amber-500" />
+   348→          <p className="text-sm">
+   349→            Улей №{watchHive.id}: {hiveStatus(watchHive, hives).label.toLowerCase()} — проверьте семью в ближайшие дни.
+   350→          </p>
+   351→        </div>
+   352→      ) : (
+   353→        <div className="flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-emerald-800">
+   354→          <Sun className="h-5 w-5 shrink-0 text-emerald-500" />
+   355→          <p className="text-sm">
+   356→            По данным датчиков тревожных сигналов нет — все семьи с телеметрией работают штатно.
+   357→          </p>
+   358→        </div>
+   359→      )}
+   360→
+   361→      {/* Заголовок пасеки */}
+   362→      <div className="flex flex-wrap items-end justify-between gap-3">
+   363→        <div>
+   364→          <h1 className="text-2xl font-extrabold tracking-tight text-[#2A1A12] md:text-3xl">
+   365→            Моя пасека · данные с датчиков
+   366→          </h1>
+   367→          <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-gray-500">
+   368→            <span className="flex items-center gap-1">
+   369→              <MapPin className="h-3.5 w-3.5 text-red-500" />
+   370→              {`${hives.length} ${hiveWord(hives.length)} на карте · данные с датчиков`}
+   371→            </span>
+   372→            <span className="flex items-center gap-1">
+   373→              <CalendarDays className="h-3.5 w-3.5 text-red-500" /> {todayLabel}
+   374→            </span>
+   375→          </p>
+   376→        </div>
+   377→        <ModeSwitcher />
+   378→      </div>
+   379→
+   380→      {/* Три колонки, как на референсе */}
+   381→      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[320px_minmax(0,1fr)_340px]">
+   382→        {/* Колонка 1: погода пасеки (по координатам её точек на карте) */}
+   383→        <div className="order-2 xl:order-1">
+   384→          <WeatherPanel coords={center} place="Моя пасека" />
+   385→        </div>
+   386→
+   387→        {/* Колонка 2: состояние пасеки */}
+   388→        <div className="order-1 space-y-4 xl:order-2">
+   389→          <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   390→            <div className="flex flex-wrap items-center justify-between gap-3">
+   391→              <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   392→                <TrendingUp className="h-4 w-4 text-red-500" /> Состояние пасеки
+   393→              </h2>
+   394→              <span className="text-[11px] text-gray-400">
+   395→                {withTelemetry.length} из {hives.length} семей с телеметрией
+   396→              </span>
+   397→            </div>
+   398→
+   399→            <StatusGauge info={gauge} className="mx-auto mt-2" />
+   400→
+   401→            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+   402→              <Tile icon={<Scale className="h-3.5 w-3.5" />} label="Всего ульев" value={String(hives.length)} />
+   403→              <Tile
+   404→                icon={<Activity className="h-3.5 w-3.5" />}
+   405→                label="С датчиками"
+   406→                value={String(withTelemetry.length)}
+   407→              />
+   408→              <Tile
+   409→                icon={<Thermometer className="h-3.5 w-3.5" />}
+   410→                label="Темп. внутри"
+   411→                value={lastTemp !== null ? `${fmtNum(lastTemp)} °C` : '—'}
+   412→                hint={`улей №${hive.id}`}
+   413→              />
+   414→              <Tile
+   415→                icon={<Droplets className="h-3.5 w-3.5" />}
+   416→                label="Влажность"
+   417→                value={lastHum !== null ? `${fmtNum(lastHum, 0)} %` : '—'}
+   418→                hint={`улей №${hive.id}`}
+   419→              />
+   420→              <Tile
+   421→                icon={<Scale className="h-3.5 w-3.5" />}
+   422→                label="Масса улья"
+   423→                value={lastWeight !== null ? `${fmtNum(lastWeight)} кг` : '—'}
+   424→                hint={`улей №${hive.id}`}
+   425→              />
+   426→              <Tile
+   427→                icon={<TrendingUp className="h-3.5 w-3.5" />}
+   428→                label={`Привес ${period}`}
+   429→                value={`${fmtSigned(weightDeltaSafe(leader, 30) ?? weightTotal(leader))} кг`}
+   430→                hint={`лидер — №${leader.id}`}
+   431→              />
+   432→            </div>
+   433→
+   434→            {/* Выбор улья */}
+   435→            <div className="mt-4 flex flex-wrap gap-2" role="group" aria-label="Выбор улья">
+   436→              {hives.map((h) => {
+   437→                const st = hiveStatus(h, hives)
+   438→                const active = h.id === hive.id
+   439→                return (
+   440→                  <button
+   441→                    key={h.id}
+   442→                    onClick={() => setHive(h.id)}
+   443→                    aria-pressed={active}
+   444→                    className={cn(
+   445→                      'flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-bold transition-all',
+   446→                      active
+   447→                        ? 'border-red-400 bg-red-50 text-red-700 shadow-sm'
+   448→                        : 'border-red-100 text-gray-600 hover:border-red-200 hover:bg-red-50/60',
+   449→                    )}
+   450→                  >
+   451→                    <span className={cn('h-2 w-2 rounded-full', STATUS_STYLES[st.level].dot)} />
+   452→                    {h.label.replace('Улей №', '№')}
+   453→                  </button>
+   454→                )
+   455→              })}
+   456→            </div>
+   457→          </section>
+   458→
+   459→          {/* Графики выбранного улья */}
+   460→          <div className="grid gap-4 md:grid-cols-2">
+   461→            <MiniChartCard
+   462→              title="Температура"
+   463→              value={lastTemp !== null ? `${fmtNum(lastTemp)} °C` : '—'}
+   464→              note="норма семьи ≈ 34,5 °C"
+   465→            >
+   466→              <MetricLine hive={hive} metric="tempInC" />
+   467→            </MiniChartCard>
+   468→            <MiniChartCard
+   469→              title="Влажность"
+   470→              value={lastHum !== null ? `${fmtNum(lastHum, 0)} %` : '—'}
+   471→              note={hive.humiditySensorOk ? 'норма 50–66 %' : 'датчик не отвечает'}
+   472→            >
+   473→              <MetricLine hive={hive} metric="humidityPct" />
+   474→            </MiniChartCard>
+   475→            <MiniChartCard
+   476→              title="Масса улья"
+   477→              value={lastWeight !== null ? `${fmtNum(lastWeight)} кг` : '—'}
+   478→              note={d2 !== null ? `${fmtSigned(d2)} кг за 2 дня` : 'нет данных о весе'}
+   479→              className="md:col-span-2"
+   480→            >
+   481→              <WeightBars hive={hive} />
+   482→            </MiniChartCard>
+   483→          </div>
+   484→
+   485→          {/* Развёрнутые графики (как раньше) */}
+   486→          <details className="group rounded-2xl border border-red-100 bg-white shadow-sm dark:bg-[#221814]">
+   487→            <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm font-bold text-[#2A1A12] md:px-5">
+   488→              Подробные графики улья №{hive.id}
+   489→              <ChevronDown className="h-4 w-4 text-gray-400 transition-transform group-open:rotate-180" />
+   490→            </summary>
+   491→            <div className="grid gap-4 border-t border-red-50 px-4 pb-5 pt-4 md:grid-cols-2 md:px-5">
+   492→              <div>
+   493→                <WeightChart hive={hive} risky={status.level === 'risk'} />
+   494→              </div>
+   495→              <div>
+   496→                <ClimateChart hive={hive} />
+   497→              </div>
+   498→            </div>
+   499→          </details>
+   500→        </div>
+   501→
+   502→        {/* Колонка 3: предписания и события */}
+   503→        <div className="order-3 space-y-4">
+   504→          {/* Предписания ИИ-агента */}
+   505→          <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   506→            <div className="flex items-center justify-between">
+   507→              <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   508→                <MessageSquareText className="h-4 w-4 text-red-500" /> Предписания агента
+   509→              </h2>
+   510→              <span className="text-[11px] text-gray-400">контекст: {hive.label.replace('Улей ', '№')}</span>
+   511→            </div>
+   512→            <ol className="mt-3 space-y-2">
+   513→              {findings.map((f, i) => {
+   514→                const open = openFinding === f.id
+   515→                return (
+   516→                  <li key={f.id} className={cn('rounded-xl border', open ? 'border-red-200 bg-red-50/40' : 'border-red-50', f.urgency === 'act-now' && 'border-red-200')}>
+   517→                    <button
+   518→                      onClick={() => setOpenFinding(open ? null : f.id)}
+   519→                      aria-expanded={open}
+   520→                      className="flex w-full items-start gap-2.5 px-3 py-2.5 text-left"
+   521→                    >
+   522→                      <span className={cn(
+   523→                        'mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-extrabold',
+   524→                        f.urgency === 'act-now' ? 'bg-red-600 text-white' : 'bg-red-100 text-red-700',
+   525→                      )}>
+   526→                        {i + 1}
+   527→                      </span>
+   528→                      <span className="min-w-0 flex-1">
+   529→                        <span className="block text-[13px] font-bold leading-snug text-gray-800">{f.title}</span>
+   530→                        {!open && (
+   531→                          <span className="mt-0.5 block text-[11px] text-gray-400">
+   532→                            {SCENARIO_META[f.scenario].label} · {f.urgencyNote ?? URGENCY_LABEL[f.urgency]}
+   533→                          </span>
+   534→                        )}
+   535→                      </span>
+   536→                      <ChevronDown className={cn('mt-1 h-4 w-4 shrink-0 text-gray-400 transition-transform', open && 'rotate-180')} />
+   537→                    </button>
+   538→                    {open && (
+   539→                      <div className="border-t border-red-100 px-3 pb-3 pt-2">
+   540→                        <p className="text-[13px] leading-relaxed text-gray-600">{f.text}</p>
+   541→                        {f.basis.length > 0 && (
+   542→                          <div className="mt-2 flex flex-wrap gap-1">
+   543→                            {f.basis.map((b) => (
+   544→                              <span key={b} className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] text-red-700">
+   545→                                {b}
+   546→                              </span>
+   547→                            ))}
+   548→                          </div>
+   549→                        )}
+   550→                        <div className="mt-2.5 flex items-center justify-between gap-2">
+   551→                          <UrgencyBadge urgency={f.urgency} note={f.urgencyNote ?? URGENCY_LABEL[f.urgency]} />
+   552→                          <Button
+   553→                            size="sm"
+   554→                            variant="ghost"
+   555→                            className="gap-1 text-red-600 hover:bg-red-50 hover:text-red-700"
+   556→                            onClick={() => ask(f.prefill)}
+   557→                          >
+   558→                            Обсудить <ArrowRight className="h-3.5 w-3.5" />
+   559→                          </Button>
+   560→                        </div>
+   561→                      </div>
+   562→                    )}
+   563→                  </li>
+   564→                )
+   565→              })}
+   566→            </ol>
+   567→            <p className="mt-3 text-[11px] leading-relaxed text-gray-400">
+   568→              Агент показывает вероятность и уровень риска — решение принимает пчеловод.
+   569→            </p>
+   570→          </section>
+   571→
+   572→          {/* Ближайшие события: напоминания + журнал */}
+   573→          <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   574→            <div className="flex items-center justify-between">
+   575→              <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   576→                <AlarmClock className="h-4 w-4 text-red-500" /> Ближайшие события
+   577→              </h2>
+   578→              <button onClick={() => setView('reminders')} className="text-[11px] font-bold text-red-600 hover:text-red-700">
+   579→                все напоминания →
+   580→              </button>
+   581→            </div>
+   582→
+   583→            {upcomingReminders.length === 0 ? (
+   584→              <p className="mt-2 text-sm text-gray-400">
+   585→                Напоминаний нет — поставьте первое в разделе «Напоминания».
+   586→              </p>
+   587→            ) : (
+   588→              <ul className="mt-2 space-y-1.5">
+   589→                {upcomingReminders.map((r) => (
+   590→                  <li key={r.id} className="flex items-start gap-2.5 rounded-xl bg-red-50/50 px-3 py-2 dark:bg-[#2C211C]">
+   591→                    <AlarmClock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+   592→                    <div className="min-w-0 flex-1">
+   593→                      <p className="text-[13px] font-semibold leading-snug text-gray-800">{r.text}</p>
+   594→                      <p className="text-[11px] text-gray-400">{whenLabelShort(r.remindAt)}</p>
+   595→                    </div>
+   596→                  </li>
+   597→                ))}
+   598→              </ul>
+   599→            )}
+   600→
+   601→            <h3 className="mt-4 flex items-center gap-1.5 text-xs font-bold text-gray-500">
+   602→              <ClipboardList className="h-3.5 w-3.5" /> Журнал пасеки
+   603→            </h3>
+   604→            {events.length === 0 ? (
+   605→              <p className="mt-1.5 text-sm text-gray-400">Журнал пуст — добавьте запись в разделе «Данные».</p>
+   606→            ) : (
+   607→              <ul className="mt-1.5 space-y-1.5">
+   608→                {events.slice(0, 3).map((e) => (
+   609→                  <li key={e.id} className="flex flex-wrap items-center gap-2 rounded-xl border border-red-50 px-3 py-2 text-[13px]">
+   610→                    <span className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-bold text-red-700">{e.type}</span>
+   611→                    <span className="font-semibold text-gray-700">{e.hiveName}</span>
+   612→                    <span className="text-gray-500">{e.note}</span>
+   613→                    <span className="ml-auto text-[11px] text-gray-400">
+   614→                      {format(new Date(e.ts), 'd MMM, HH:mm', { locale: ru })}
+   615→                    </span>
+   616→                  </li>
+   617→                ))}
+   618→              </ul>
+   619→            )}
+   620→          </section>
+   621→        </div>
+   622→      </div>
+   623→    </div>
+   624→  )
+   625→}
+   626→
+   627→/* ------------------------------------------------------------------ */
+   628→/* Вспомогательные элементы                                            */
+   629→/* ------------------------------------------------------------------ */
+   630→
+   631→function Tile({ icon, label, value, hint }: { icon: React.ReactNode; label: string; value: string; hint?: string }) {
+   632→  return (
+   633→    <div className="rounded-xl border border-red-50 bg-red-50/40 px-3 py-2.5 dark:bg-[#2C211C]">
+   634→      <p className="flex items-center gap-1.5 text-[11px] font-semibold text-gray-500">
+   635→        <span className="text-red-400">{icon}</span>
+   636→        {label}
+   637→      </p>
+   638→      <p className="mt-1 text-lg font-extrabold leading-none text-gray-900">{value}</p>
+   639→      {hint && <p className="mt-1 text-[10px] text-gray-400">{hint}</p>}
+   640→    </div>
+   641→  )
+   642→}
+   643→
+   644→function MiniChartCard({
+   645→  title,
+   646→  value,
+   647→  note,
+   648→  className,
+   649→  children,
+   650→}: {
+   651→  title: string
+   652→  value: string
+   653→  note?: string
+   654→  className?: string
+   655→  children: React.ReactNode
+   656→}) {
+   657→  return (
+   658→    <div className={cn('rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]', className)}>
+   659→      <div className="flex items-center justify-between gap-2">
+   660→        <h3 className="text-sm font-bold text-[#2A1A12]">{title}</h3>
+   661→        <span className="text-base font-extrabold text-red-600">{value}</span>
+   662→      </div>
+   663→      <div className="mt-1 h-[150px]">{children}</div>
+   664→      {note && <p className="mt-1 text-[11px] text-gray-400">{note}</p>}
+   665→    </div>
+   666→  )
+   667→}
+   668→
+   669→/** Итоговое изменение веса за период наблюдений (для KPI «привес»). */
+   670→function weightTotal(h: Hive): number {
+   671→  const w = h.series[h.series.length - 1]?.weightKg ?? null
+   672→  const first = h.series[0]?.weightKg ?? null
+   673→  if (w === null || first === null) return 0
+   674→  return Math.round((w - first) * 10) / 10
+   675→}
+   676→

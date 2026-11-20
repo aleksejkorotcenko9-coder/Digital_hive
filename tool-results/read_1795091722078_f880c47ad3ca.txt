@@ -1,0 +1,712 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Экран «Данные»: управление телеметрией и справочниками.
+     5→ *  — загрузка CSV (шаблон + импорт с отчётом);
+     6→ *  — ручное внесение измерения;
+     7→ *  — журнал осмотров и действий;
+     8→ *  — справочник ульев и площадок кочёвки;
+     9→ *  — API-эндпоинт для датчиков (ключ видит только пасечник).
+    10→ * Правила доступа: пасечник вносит изменения, помощник — только просмотр.
+    11→ */
+    12→import { useState } from 'react'
+    13→import { format } from 'date-fns'
+    14→import { ru } from 'date-fns/locale'
+    15→import {
+    16→  CalendarPlus,
+    17→  Database,
+    18→  Download,
+    19→  FileUp,
+    20→  MapPinned,
+    21→  Pencil,
+    22→  Plus,
+    23→  RefreshCw,
+    24→  TerminalSquare,
+    25→  UserMinus,
+    26→  Waypoints,
+    27→} from 'lucide-react'
+    28→import { Button } from '@/components/ui/button'
+    29→import { Card, CardContent } from '@/components/ui/card'
+    30→import { Input } from '@/components/ui/input'
+    31→import { Label } from '@/components/ui/label'
+    32→import {
+    33→  Select,
+    34→  SelectContent,
+    35→  SelectItem,
+    36→  SelectTrigger,
+    37→  SelectValue,
+    38→} from '@/components/ui/select'
+    39→import { Textarea } from '@/components/ui/textarea'
+    40→import { useToast } from '@/hooks/use-toast'
+    41→import { useAppState } from '@/lib/store'
+    42→import { useRealData } from '@/lib/real-data'
+    43→import { cn } from '@/lib/utils'
+    44→
+    45→const EVENT_TYPES = ['осмотр', 'подкормка', 'расширение', 'лечение', 'кочёвка', 'прочее'] as const
+    46→
+    47→export function DataView() {
+    48→  const { status, data, reload } = useRealData()
+    49→
+    50→  if (status === 'idle' || status === 'loading') {
+    51→    return <div className="grid gap-4 md:grid-cols-2"><div className="h-64 animate-pulse rounded-2xl bg-red-100/50" /><div className="h-64 animate-pulse rounded-2xl bg-red-100/50" /></div>
+    52→  }
+    53→  if (status === 'error' || !data) {
+    54→    return (
+    55→      <Card className="mx-auto max-w-lg border-red-100">
+    56→        <CardContent className="p-6 text-center">
+    57→          <p className="text-sm text-gray-600">Данные не загрузились.</p>
+    58→          <Button onClick={reload} className="mt-3 bg-red-600 hover:bg-red-700">Повторить</Button>
+    59→        </CardContent>
+    60→      </Card>
+    61→    )
+    62→  }
+    63→
+    64→  const hivesApi = data.hives
+    65→  const isBeekeeper = data.user.role === 'BEEKEEPER'
+    66→  const totalReadings = hivesApi.reduce((acc, h) => acc + h.readingCount, 0)
+    67→  const lastTs = hivesApi
+    68→    .map((h) => h.lastTs)
+    69→    .filter((x): x is string => x !== null)
+    70→    .sort()
+    71→    .at(-1)
+    72→
+    73→  return (
+    74→    <div className="space-y-6">
+    75→      <div>
+    76→        <h1 className="text-2xl font-extrabold tracking-tight text-[#2A1A12] md:text-3xl">Данные и журнал</h1>
+    77→        <p className="mt-1 text-sm text-gray-500">
+    78→          Телеметрия хранится в SQLite: загружайте CSV, вносите показания вручную или принимайте их по API.
+    79→        </p>
+    80→      </div>
+    81→
+    82→      {/* Статистика */}
+    83→      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+    84→        <StatCard label="Ульев в справочнике" value={String(hivesApi.length)} />
+    85→        <StatCard label="Измерений всего" value={String(totalReadings)} />
+    86→        <StatCard label="Записей в журнале" value={String(data.counts.events)} />
+    87→        <StatCard
+    88→          label="Последнее измерение"
+    89→          value={lastTs ? format(new Date(lastTs), 'd MMM, HH:mm', { locale: ru }) : '—'}
+    90→        />
+    91→      </div>
+    92→
+    93→      {!isBeekeeper && (
+    94→        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+    95→          Вы вошли как помощник: раздел доступен только для просмотра. Вносить изменения может пасечник.
+    96→        </div>
+    97→      )}
+    98→
+    99→      <div className="grid gap-4 xl:grid-cols-2">
+   100→        <CsvCard isBeekeeper={isBeekeeper} hivesApi={hivesApi.map((h) => ({ number: h.number, name: h.name }))} reload={reload} />
+   101→        <ManualCard isBeekeeper={isBeekeeper} hivesApi={hivesApi.map((h) => ({ number: h.number, name: h.name }))} reload={reload} />
+   102→        <EventsCard isBeekeeper={isBeekeeper} reload={reload} />
+   103→        <ApiCard isBeekeeper={isBeekeeper} apiKey={data.apiKey} reload={reload} />
+   104→        <HivesCard isBeekeeper={isBeekeeper} reload={reload} />
+   105→        <SitesCard isBeekeeper={isBeekeeper} reload={reload} />
+   106→      </div>
+   107→    </div>
+   108→  )
+   109→}
+   110→
+   111→/* ------------------------------------------------------------------ */
+   112→
+   113→function StatCard({ label, value }: { label: string; value: string }) {
+   114→  return (
+   115→    <Card className="border-red-100 shadow-sm">
+   116→      <CardContent className="p-4">
+   117→        <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">{label}</p>
+   118→        <p className="mt-1.5 text-xl font-extrabold text-[#2A1A12]">{value}</p>
+   119→      </CardContent>
+   120→    </Card>
+   121→  )
+   122→}
+   123→
+   124→function HiveSelect({ hivesApi, value, onChange }: {
+   125→  hivesApi: Array<{ number: number; name: string }>
+   126→  value: string
+   127→  onChange: (v: string) => void
+   128→}) {
+   129→  return (
+   130→    <Select value={value} onValueChange={onChange}>
+   131→      <SelectTrigger className="border-red-200 focus:ring-red-300">
+   132→        <SelectValue placeholder="Выберите улей" />
+   133→      </SelectTrigger>
+   134→      <SelectContent>
+   135→        {hivesApi.length === 0 && (
+   136→          <SelectItem value="_none" disabled>Сначала добавьте улей</SelectItem>
+   137→        )}
+   138→        {hivesApi.map((h) => (
+   139→          <SelectItem key={h.number} value={String(h.number)}>
+   140→            №{h.number} · {h.name}
+   141→          </SelectItem>
+   142→        ))}
+   143→      </SelectContent>
+   144→    </Select>
+   145→  )
+   146→}
+   147→
+   148→/* CSV -------------------------------------------------------------- */
+   149→
+   150→function CsvCard({ isBeekeeper, hivesApi, reload }: {
+   151→  isBeekeeper: boolean
+   152→  hivesApi: Array<{ number: number; name: string }>
+   153→  reload: () => void
+   154→}) {
+   155→  const { toast } = useToast()
+   156→  const [file, setFile] = useState<File | null>(null)
+   157→  const [fallbackHive, setFallbackHive] = useState('')
+   158→  const [busy, setBusy] = useState(false)
+   159→  const [report, setReport] = useState<string | null>(null)
+   160→
+   161→  const upload = async () => {
+   162→    if (!file || busy) return
+   163→    setBusy(true)
+   164→    setReport(null)
+   165→    try {
+   166→      const fd = new FormData()
+   167→      fd.append('file', file)
+   168→      if (fallbackHive) fd.append('hiveNumber', fallbackHive)
+   169→      const res = await fetch('/api/csv', { method: 'POST', body: fd })
+   170→      const j = (await res.json()) as {
+   171→        ok?: boolean
+   172→        inserted?: number
+   173→        skipped?: number
+   174→        errors?: string[]
+   175→        byHive?: Record<string, number>
+   176→        error?: string
+   177→      }
+   178→      if (!res.ok) {
+   179→        toast({ title: 'Ошибка загрузки', description: j.error ?? `HTTP ${res.status}`, variant: 'destructive' })
+   180→        return
+   181→      }
+   182→      const byHive = j.byHive ? Object.entries(j.byHive).map(([k, v]) => `№${k} — ${v}`).join(', ') : '—'
+   183→      setReport(
+   184→        `Загружено измерений: ${j.inserted ?? 0}${j.skipped ? `, пропущено: ${j.skipped}` : ''}. По ульям: ${byHive}` +
+   185→        (j.errors && j.errors.length ? `\nПредупреждения:\n• ${j.errors.join('\n• ')}` : ''),
+   186→      )
+   187→      toast({ title: 'CSV обработан', description: `Добавлено измерений: ${j.inserted ?? 0}` })
+   188→      setFile(null)
+   189→      reload()
+   190→    } catch {
+   191→      toast({ title: 'Ошибка сети', description: 'Не удалось отправить файл', variant: 'destructive' })
+   192→    } finally {
+   193→      setBusy(false)
+   194→    }
+   195→  }
+   196→
+   197→  return (
+   198→    <Card className="border-red-100 shadow-sm">
+   199→      <CardContent className="space-y-3 p-5">
+   200→        <p className="flex items-center gap-2 font-bold text-[#2A1A12]">
+   201→          <FileUp className="h-4.5 w-4.5 text-red-600" /> Загрузка CSV
+   202→        </p>
+   203→        <p className="text-xs leading-relaxed text-gray-500">
+   204→          Экспорт из программы датчиков: колонки «дата», «улей», «вес», «температура», «влажность»
+   205→          (в любом порядке, разделитель «;» или «,», кодировка UTF-8 или windows-1251).
+   206→          Если колонки «улей» нет — выберите её ниже.
+   207→        </p>
+   208→        {isBeekeeper ? (
+   209→          <>
+   210→            <div className="flex flex-wrap items-center gap-2">
+   211→              <Input
+   212→                type="file"
+   213→                accept=".csv,text/csv"
+   214→                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+   215→                className="border-red-200 file:mr-3 file:rounded-lg file:border-0 file:bg-red-100 file:px-3 file:py-1.5 file:text-xs file:font-bold file:text-red-700"
+   216→              />
+   217→              <a href="/api/csv" download className="shrink-0">
+   218→                <Button variant="outline" className="border-red-200 text-red-700 hover:bg-red-50">
+   219→                  <Download className="h-4 w-4" /> Шаблон
+   220→                </Button>
+   221→              </a>
+   222→            </div>
+   223→            <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+   224→              <HiveSelect hivesApi={hivesApi} value={fallbackHive} onChange={setFallbackHive} />
+   225→              <Button onClick={() => void upload()} disabled={!file || busy} className="bg-orange-500 hover:bg-orange-600">
+   226→                <FileUp className="h-4 w-4" /> {busy ? 'Загружаем…' : 'Загрузить'}
+   227→              </Button>
+   228→            </div>
+   229→            {report && (
+   230→              <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded-xl bg-red-50 p-3 text-xs leading-relaxed text-gray-700">
+   231→                {report}
+   232→              </pre>
+   233→            )}
+   234→          </>
+   235→        ) : (
+   236→          <p className="text-xs text-gray-400">Доступно только пасечнику.</p>
+   237→        )}
+   238→      </CardContent>
+   239→    </Card>
+   240→  )
+   241→}
+   242→
+   243→/* Ручное измерение -------------------------------------------------- */
+   244→
+   245→function ManualCard({ isBeekeeper, hivesApi, reload }: {
+   246→  isBeekeeper: boolean
+   247→  hivesApi: Array<{ number: number; name: string }>
+   248→  reload: () => void
+   249→}) {
+   250→  const { toast } = useToast()
+   251→  const [hive, setHive] = useState('')
+   252→  const [dt, setDt] = useState(() => format(new Date(), "yyyy-MM-dd'T'HH:mm"))
+   253→  const [weight, setWeight] = useState('')
+   254→  const [temp, setTemp] = useState('')
+   255→  const [hum, setHum] = useState('')
+   256→  const [busy, setBusy] = useState(false)
+   257→
+   258→  const submit = async () => {
+   259→    if (busy) return
+   260→    setBusy(true)
+   261→    try {
+   262→      const res = await fetch('/api/measurements', {
+   263→        method: 'POST',
+   264→        headers: { 'Content-Type': 'application/json' },
+   265→        body: JSON.stringify({ hiveNumber: Number(hive), ts: dt, weightKg: weight, tempC: temp, humidityPct: hum }),
+   266→      })
+   267→      const j = (await res.json()) as { ok?: boolean; error?: string }
+   268→      if (!res.ok) {
+   269→        toast({ title: 'Не сохранено', description: j.error ?? `HTTP ${res.status}`, variant: 'destructive' })
+   270→        return
+   271→      }
+   272→      toast({ title: 'Показание записано', description: `Улей №${hive}, ${dt.replace('T', ' ')}` })
+   273→      setWeight('')
+   274→      setTemp('')
+   275→      setHum('')
+   276→      reload()
+   277→    } catch {
+   278→      toast({ title: 'Ошибка сети', variant: 'destructive' })
+   279→    } finally {
+   280→      setBusy(false)
+   281→    }
+   282→  }
+   283→
+   284→  return (
+   285→    <Card className="border-red-100 shadow-sm">
+   286→      <CardContent className="space-y-3 p-5">
+   287→        <p className="flex items-center gap-2 font-bold text-[#2A1A12]">
+   288→          <Waypoints className="h-4.5 w-4.5 text-red-600" /> Внести показание вручную
+   289→        </p>
+   290→        {isBeekeeper ? (
+   291→          <>
+   292→            <div className="grid gap-3 sm:grid-cols-2">
+   293→              <div className="space-y-1.5">
+   294→                <Label className="text-xs text-gray-500">Улей</Label>
+   295→                <HiveSelect hivesApi={hivesApi} value={hive} onChange={setHive} />
+   296→              </div>
+   297→              <div className="space-y-1.5">
+   298→                <Label className="text-xs text-gray-500">Дата и время</Label>
+   299→                <Input type="datetime-local" value={dt} onChange={(e) => setDt(e.target.value)} className="border-red-200" />
+   300→              </div>
+   301→            </div>
+   302→            <div className="grid grid-cols-3 gap-2">
+   303→              <div className="space-y-1.5">
+   304→                <Label className="text-xs text-gray-500">Вес, кг</Label>
+   305→                <Input inputMode="decimal" placeholder="67,9" value={weight} onChange={(e) => setWeight(e.target.value)} className="border-red-200" />
+   306→              </div>
+   307→              <div className="space-y-1.5">
+   308→                <Label className="text-xs text-gray-500">Темп., °C</Label>
+   309→                <Input inputMode="decimal" placeholder="35,7" value={temp} onChange={(e) => setTemp(e.target.value)} className="border-red-200" />
+   310→              </div>
+   311→              <div className="space-y-1.5">
+   312→                <Label className="text-xs text-gray-500">Влажн., %</Label>
+   313→                <Input inputMode="numeric" placeholder="66" value={hum} onChange={(e) => setHum(e.target.value)} className="border-red-200" />
+   314→              </div>
+   315→            </div>
+   316→            <Button onClick={() => void submit()} disabled={!hive || busy || (!weight && !temp && !hum)} className="w-full bg-red-600 hover:bg-red-700">
+   317→              Сохранить показание
+   318→            </Button>
+   319→          </>
+   320→        ) : (
+   321→          <p className="text-xs text-gray-400">Доступно только пасечнику.</p>
+   322→        )}
+   323→      </CardContent>
+   324→    </Card>
+   325→  )
+   326→}
+   327→
+   328→/* Журнал ------------------------------------------------------------ */
+   329→
+   330→function EventsCard({ isBeekeeper, reload }: { isBeekeeper: boolean; reload: () => void }) {
+   331→  const { toast } = useToast()
+   332→  const data = useAppState((s) => s.real)
+   333→  const [hive, setHive] = useState('')
+   334→  const [type, setType] = useState('осмотр')
+   335→  const [note, setNote] = useState('')
+   336→  const [busy, setBusy] = useState(false)
+   337→  const events = data?.events ?? []
+   338→  const hivesApi = (data?.hives ?? []).map((h) => ({ number: h.number, name: h.name }))
+   339→
+   340→  const submit = async () => {
+   341→    if (busy || !hive || !note.trim()) return
+   342→    setBusy(true)
+   343→    try {
+   344→      const res = await fetch('/api/events', {
+   345→        method: 'POST',
+   346→        headers: { 'Content-Type': 'application/json' },
+   347→        body: JSON.stringify({ hiveNumber: Number(hive), type, note }),
+   348→      })
+   349→      const j = (await res.json()) as { ok?: boolean; error?: string }
+   350→      if (!res.ok) {
+   351→        toast({ title: 'Не сохранено', description: j.error ?? `HTTP ${res.status}`, variant: 'destructive' })
+   352→        return
+   353→      }
+   354→      toast({ title: 'Запись добавлена в журнал' })
+   355→      setNote('')
+   356→      reload()
+   357→    } catch {
+   358→      toast({ title: 'Ошибка сети', variant: 'destructive' })
+   359→    } finally {
+   360→      setBusy(false)
+   361→    }
+   362→  }
+   363→
+   364→  return (
+   365→    <Card className="border-red-100 shadow-sm">
+   366→      <CardContent className="space-y-3 p-5">
+   367→        <p className="flex items-center gap-2 font-bold text-[#2A1A12]">
+   368→          <CalendarPlus className="h-4.5 w-4.5 text-red-600" /> Журнал осмотров и действий
+   369→        </p>
+   370→        {isBeekeeper && (
+   371→          <div className="space-y-2 rounded-xl bg-red-50/60 p-3">
+   372→            <div className="grid gap-2 sm:grid-cols-2">
+   373→              <HiveSelect hivesApi={hivesApi} value={hive} onChange={setHive} />
+   374→              <Select value={type} onValueChange={setType}>
+   375→                <SelectTrigger className="border-red-200"><SelectValue /></SelectTrigger>
+   376→                <SelectContent>
+   377→                  {EVENT_TYPES.map((t) => (
+   378→                    <SelectItem key={t} value={t}>{t}</SelectItem>
+   379→                  ))}
+   380→                </SelectContent>
+   381→              </Select>
+   382→            </div>
+   383→            <Textarea
+   384→              value={note}
+   385→              onChange={(e) => setNote(e.target.value)}
+   386→              placeholder="Например: осмотрен, маточников нет, поставил второй корпус"
+   387→              className="min-h-[44px] resize-none border-red-200"
+   388→            />
+   389→            <Button onClick={() => void submit()} disabled={!hive || !note.trim() || busy} size="sm" className="bg-red-600 hover:bg-red-700">
+   390→              Добавить запись
+   391→            </Button>
+   392→          </div>
+   393→        )}
+   394→        <ul className="max-h-64 space-y-2 overflow-y-auto pr-1">
+   395→          {events.length === 0 && (
+   396→            <li className="text-sm text-gray-400">Записей пока нет.</li>
+   397→          )}
+   398→          {events.map((e) => (
+   399→            <li key={e.id} className="rounded-xl border border-red-50 bg-white px-3 py-2">
+   400→              <div className="flex flex-wrap items-center gap-2 text-xs text-gray-400">
+   401→                <span className="rounded-full bg-red-100 px-2 py-0.5 font-bold text-red-700">{e.type}</span>
+   402→                <span className="font-semibold text-gray-600">{e.hiveName}</span>
+   403→                <span className="ml-auto">{format(new Date(e.ts), 'd MMM yyyy, HH:mm', { locale: ru })} · {e.authorName}</span>
+   404→              </div>
+   405→              <p className="mt-1 text-sm text-gray-700">{e.note}</p>
+   406→            </li>
+   407→          ))}
+   408→        </ul>
+   409→      </CardContent>
+   410→    </Card>
+   411→  )
+   412→}
+   413→
+   414→/* API-ключ ---------------------------------------------------------- */
+   415→
+   416→function ApiCard({ isBeekeeper, apiKey, reload }: { isBeekeeper: boolean; apiKey: string | null; reload: () => void }) {
+   417→  const { toast } = useToast()
+   418→  const [busy, setBusy] = useState(false)
+   419→  const origin = typeof window !== 'undefined' ? window.location.origin : ''
+   420→
+   421→  const regen = async () => {
+   422→    if (busy) return
+   423→    setBusy(true)
+   424→    try {
+   425→      const res = await fetch('/api/apikey', { method: 'POST' })
+   426→      const j = (await res.json()) as { ok?: boolean; error?: string }
+   427→      if (!res.ok) {
+   428→        toast({ title: 'Ошибка', description: j.error ?? `HTTP ${res.status}`, variant: 'destructive' })
+   429→        return
+   430→      }
+   431→      toast({ title: 'API-ключ обновлён', description: 'Старый ключ больше не работает' })
+   432→      reload()
+   433→    } finally {
+   434→      setBusy(false)
+   435→    }
+   436→  }
+   437→
+   438→  const curl =
+   439→    `curl -X POST ${origin || '<адрес-приложения>'}/api/telemetry ` +
+   440→    `-H "Content-Type: application/json" ` +
+   441→    `-H "x-api-key: ${apiKey ?? '<ключ>'}" ` +
+   442→    `-d '{"hiveNumber":1,"weightKg":67.9,"tempC":35.7,"humidityPct":66}'`
+   443→
+   444→  return (
+   445→    <Card className="border-red-100 shadow-sm">
+   446→      <CardContent className="space-y-3 p-5">
+   447→        <p className="flex items-center gap-2 font-bold text-[#2A1A12]">
+   448→          <TerminalSquare className="h-4.5 w-4.5 text-red-600" /> Приём телеметрии по API
+   449→        </p>
+   450→        <p className="text-xs leading-relaxed text-gray-500">
+   451→          Датчики или ваш скрипт присылают JSON на <code className="rounded bg-red-50 px-1">POST /api/telemetry</code> —
+   452→          можно отправлять одно измерение или массив. Авторизация — ключ в заголовке <code className="rounded bg-red-50 px-1">x-api-key</code>.
+   453→        </p>
+   454→        {isBeekeeper && apiKey ? (
+   455→          <>
+   456→            <div className="flex items-center gap-2">
+   457→              <code className="flex-1 truncate rounded-xl bg-gray-900 px-3 py-2 font-mono text-xs text-emerald-300" title={apiKey}>
+   458→                {apiKey}
+   459→              </code>
+   460→              <Button variant="outline" onClick={() => void regen()} disabled={busy} className="shrink-0 border-red-200 text-red-700 hover:bg-red-50">
+   461→                <RefreshCw className={cn('h-4 w-4', busy && 'animate-spin')} /> Новый ключ
+   462→              </Button>
+   463→            </div>
+   464→            <pre className="max-h-32 overflow-auto rounded-xl bg-red-50 p-3 text-[11px] leading-relaxed text-gray-700">
+   465→              {curl}
+   466→            </pre>
+   467→          </>
+   468→        ) : (
+   469→          <p className="text-xs text-gray-400">Ключ виден только пасечнику.</p>
+   470→        )}
+   471→      </CardContent>
+   472→    </Card>
+   473→  )
+   474→}
+   475→
+   476→/* Справочник ульев --------------------------------------------------- */
+   477→
+   478→function HivesCard({ isBeekeeper, reload }: { isBeekeeper: boolean; reload: () => void }) {
+   479→  const { toast } = useToast()
+   480→  const data = useAppState((s) => s.real)
+   481→  const [number, setNumber] = useState('')
+   482→  const [note, setNote] = useState('')
+   483→  const [busy, setBusy] = useState(false)
+   484→  const [editingId, setEditingId] = useState<string | null>(null)
+   485→  const [editNote, setEditNote] = useState('')
+   486→  const hivesApi = data?.hives ?? []
+   487→
+   488→  const addHive = async () => {
+   489→    if (busy || !number) return
+   490→    setBusy(true)
+   491→    try {
+   492→      const res = await fetch('/api/hives', {
+   493→        method: 'POST',
+   494→        headers: { 'Content-Type': 'application/json' },
+   495→        body: JSON.stringify({ number: Number(number), familyNote: note }),
+   496→      })
+   497→      const j = (await res.json()) as { ok?: boolean; error?: string }
+   498→      if (!res.ok) {
+   499→        toast({ title: 'Не добавлено', description: j.error ?? `HTTP ${res.status}`, variant: 'destructive' })
+   500→        return
+   501→      }
+   502→      toast({ title: `Улей №${number} добавлен` })
+   503→      setNumber('')
+   504→      setNote('')
+   505→      reload()
+   506→    } finally {
+   507→      setBusy(false)
+   508→    }
+   509→  }
+   510→
+   511→  const saveNote = async (id: string) => {
+   512→    try {
+   513→      const res = await fetch('/api/hives', {
+   514→        method: 'PATCH',
+   515→        headers: { 'Content-Type': 'application/json' },
+   516→        body: JSON.stringify({ id, familyNote: editNote }),
+   517→      })
+   518→      if (!res.ok) {
+   519→        toast({ title: 'Не сохранено', variant: 'destructive' })
+   520→        return
+   521→      }
+   522→      toast({ title: 'Описание обновлено' })
+   523→      setEditingId(null)
+   524→      reload()
+   525→    } catch {
+   526→      toast({ title: 'Ошибка сети', variant: 'destructive' })
+   527→    }
+   528→  }
+   529→
+   530→  return (
+   531→    <Card className="border-red-100 shadow-sm">
+   532→      <CardContent className="space-y-3 p-5">
+   533→        <p className="flex items-center gap-2 font-bold text-[#2A1A12]">
+   534→          <Database className="h-4.5 w-4.5 text-red-600" /> Справочник ульев
+   535→        </p>
+   536→        {isBeekeeper && (
+   537→          <div className="flex flex-wrap items-end gap-2 rounded-xl bg-red-50/60 p-3">
+   538→            <div className="w-24 space-y-1.5">
+   539→              <Label className="text-xs text-gray-500">Номер</Label>
+   540→              <Input inputMode="numeric" placeholder="5" value={number} onChange={(e) => setNumber(e.target.value)} className="border-red-200" />
+   541→            </div>
+   542→            <div className="min-w-[180px] flex-1 space-y-1.5">
+   543→              <Label className="text-xs text-gray-500">Описание семьи</Label>
+   544→              <Input placeholder="например, новая семья-отводок" value={note} onChange={(e) => setNote(e.target.value)} className="border-red-200" />
+   545→            </div>
+   546→            <Button onClick={() => void addHive()} disabled={!number || busy} className="bg-red-600 hover:bg-red-700">
+   547→              <Plus className="h-4 w-4" /> Добавить
+   548→            </Button>
+   549→          </div>
+   550→        )}
+   551→        <ul className="space-y-2">
+   552→          {hivesApi.map((h) => (
+   553→            <li key={h.id} className="rounded-xl border border-red-50 bg-white px-3 py-2.5">
+   554→              <div className="flex flex-wrap items-center gap-2">
+   555→                <span className="font-bold text-[#2A1A12]">{h.name}</span>
+   556→                <span className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-semibold text-red-700">
+   557→                  {h.readingCount} изм.
+   558→                </span>
+   559→                {h.lastTs && (
+   560→                  <span className="text-[11px] text-gray-400">последнее: {format(new Date(h.lastTs), 'd MMM, HH:mm', { locale: ru })}</span>
+   561→                )}
+   562→                {isBeekeeper && editingId !== h.id && (
+   563→                  <button
+   564→                    onClick={() => { setEditingId(h.id); setEditNote(h.familyNote) }}
+   565→                    className="ml-auto rounded-lg p-1.5 text-gray-400 hover:bg-red-50 hover:text-red-700"
+   566→                    aria-label="Изменить описание"
+   567→                  >
+   568→                    <Pencil className="h-3.5 w-3.5" />
+   569→                  </button>
+   570→                )}
+   571→              </div>
+   572→              {editingId === h.id ? (
+   573→                <div className="mt-2 flex items-center gap-2">
+   574→                  <Input value={editNote} onChange={(e) => setEditNote(e.target.value)} className="border-red-200" />
+   575→                  <Button size="sm" onClick={() => void saveNote(h.id)} className="bg-red-600 hover:bg-red-700">Сохранить</Button>
+   576→                </div>
+   577→              ) : (
+   578→                <p className="mt-0.5 text-xs text-gray-500">{h.familyNote || 'описание семьи не задано'}</p>
+   579→              )}
+   580→            </li>
+   581→          ))}
+   582→        </ul>
+   583→      </CardContent>
+   584→    </Card>
+   585→  )
+   586→}
+   587→
+   588→/* Площадки кочёвки --------------------------------------------------- */
+   589→
+   590→function SitesCard({ isBeekeeper, reload }: { isBeekeeper: boolean; reload: () => void }) {
+   591→  const { toast } = useToast()
+   592→  const setView = useAppState((s) => s.setView)
+   593→  const data = useAppState((s) => s.real)
+   594→  const sites = data?.sites ?? []
+   595→  const [name, setName] = useState('')
+   596→  const [honeyPlant, setHoneyPlant] = useState('')
+   597→  const [bloom, setBloom] = useState('')
+   598→  const [distance, setDistance] = useState('')
+   599→  const [score, setScore] = useState('')
+   600→  const [verdict, setVerdict] = useState('backup')
+   601→  const [busy, setBusy] = useState(false)
+   602→
+   603→  const addSite = async () => {
+   604→    if (busy || !name.trim()) return
+   605→    setBusy(true)
+   606→    try {
+   607→      const res = await fetch('/api/sites', {
+   608→        method: 'POST',
+   609→        headers: { 'Content-Type': 'application/json' },
+   610→        body: JSON.stringify({
+   611→          name,
+   612→          honeyPlant,
+   613→          bloomWindow: bloom,
+   614→          distanceKm: distance === '' ? 0 : Number(distance.replace(',', '.')),
+   615→          score: score === '' ? 5 : Number(score.replace(',', '.')),
+   616→          verdict,
+   617→        }),
+   618→      })
+   619→      const j = (await res.json()) as { ok?: boolean; error?: string }
+   620→      if (!res.ok) {
+   621→        toast({ title: 'Не добавлено', description: j.error ?? `HTTP ${res.status}`, variant: 'destructive' })
+   622→        return
+   623→      }
+   624→      toast({ title: 'Площадка добавлена в справочник' })
+   625→      setName('')
+   626→      setHoneyPlant('')
+   627→      setBloom('')
+   628→      setDistance('')
+   629→      setScore('')
+   630→      setVerdict('backup')
+   631→      reload()
+   632→    } finally {
+   633→      setBusy(false)
+   634→    }
+   635→  }
+   636→
+   637→  const removeSite = async (id: string, siteName: string) => {
+   638→    const res = await fetch(`/api/sites?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+   639→    if (!res.ok) {
+   640→      toast({ title: 'Не удалено', variant: 'destructive' })
+   641→      return
+   642→    }
+   643→    toast({ title: `«${siteName}» удалена из справочника` })
+   644→    reload()
+   645→  }
+   646→
+   647→  return (
+   648→    <Card className="border-red-100 shadow-sm xl:col-span-2">
+   649→      <CardContent className="space-y-3 p-5">
+   650→        <div className="flex flex-wrap items-center justify-between gap-2">
+   651→          <p className="flex items-center gap-2 font-bold text-[#2A1A12]">
+   652→            <MapPinned className="h-4.5 w-4.5 text-red-600" /> Площадки для кочёвки
+   653→          </p>
+   654→          <button
+   655→            onClick={() => setView('migration')}
+   656→            className="text-xs font-bold text-red-600 hover:text-red-800"
+   657→          >
+   658→            смотреть в разделе «Кочёвка» →
+   659→          </button>
+   660→        </div>
+   661→        {isBeekeeper && (
+   662→          <div className="grid gap-2 rounded-xl bg-red-50/60 p-3 md:grid-cols-3">
+   663→            <Input placeholder="Название участка" value={name} onChange={(e) => setName(e.target.value)} className="border-red-200" />
+   664→            <Input placeholder="Медонос (гречиха…)" value={honeyPlant} onChange={(e) => setHoneyPlant(e.target.value)} className="border-red-200" />
+   665→            <Input placeholder="Цветение (с 25 июля…)" value={bloom} onChange={(e) => setBloom(e.target.value)} className="border-red-200" />
+   666→            <Input inputMode="decimal" placeholder="Расстояние, км" value={distance} onChange={(e) => setDistance(e.target.value)} className="border-red-200" />
+   667→            <Input inputMode="decimal" placeholder="Оценка 0–10" value={score} onChange={(e) => setScore(e.target.value)} className="border-red-200" />
+   668→            <div className="flex items-center gap-2">
+   669→              <Select value={verdict} onValueChange={setVerdict}>
+   670→                <SelectTrigger className="border-red-200"><SelectValue /></SelectTrigger>
+   671→                <SelectContent>
+   672→                  <SelectItem value="recommend">Рекомендую</SelectItem>
+   673→                  <SelectItem value="backup">Запасной вариант</SelectItem>
+   674→                  <SelectItem value="avoid">Не рекомендую</SelectItem>
+   675→                </SelectContent>
+   676→              </Select>
+   677→              <Button onClick={() => void addSite()} disabled={!name.trim() || busy} className="shrink-0 bg-red-600 hover:bg-red-700">
+   678→                <Plus className="h-4 w-4" />
+   679→              </Button>
+   680→            </div>
+   681→          </div>
+   682→        )}
+   683→        <ul className="grid gap-2 md:grid-cols-3">
+   684→          {sites.length === 0 && (
+   685→            <li className="text-sm text-gray-400 md:col-span-3">Площадок пока нет — добавьте первую, и агент сравнит их в разделе «Кочёвка».</li>
+   686→          )}
+   687→          {sites.map((s) => (
+   688→            <li key={s.id} className="relative rounded-xl border border-red-50 bg-white px-3 py-2.5">
+   689→              <div className="flex flex-wrap items-center gap-2 pr-7">
+   690→                <span className="font-bold text-[#2A1A12]">{s.name}</span>
+   691→                <span className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-bold text-red-700">{s.score} / 10</span>
+   692→              </div>
+   693→              <p className="mt-1 text-xs text-gray-500">
+   694→                {s.honeyPlant || '—'} · {s.bloomWindow || '—'} · {s.distanceKm} км
+   695→              </p>
+   696→              {isBeekeeper && (
+   697→                <button
+   698→                  onClick={() => void removeSite(s.id, s.name)}
+   699→                  className="absolute right-2 top-2 rounded-lg p-1.5 text-gray-300 hover:bg-red-50 hover:text-red-500"
+   700→                  aria-label={`Удалить ${s.name}`}
+   701→                >
+   702→                  <UserMinus className="h-3.5 w-3.5" />
+   703→                </button>
+   704→              )}
+   705→            </li>
+   706→          ))}
+   707→        </ul>
+   708→      </CardContent>
+   709→    </Card>
+   710→  )
+   711→}
+   712→

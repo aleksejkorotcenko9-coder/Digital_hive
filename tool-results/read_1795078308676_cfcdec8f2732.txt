@@ -1,0 +1,756 @@
+     1→     1→'use client'
+     2→     2→
+     3→     3→/**
+     4→     4→ * «Карта пасеки» (Яндекс Карты, JS API 2.1 — без ключа, подключение через src/lib/ymaps.ts).
+     5→     5→ * — Карта показывает ульи пользователя (точки ApiaryPoint в БД, привязанные
+     6→     6→ *   по кодам датчиков).
+     7→     7→ * — Клик по карте выбирает точку: карточка погоды в этом месте (реальные данные
+     8→     8→ *   через /api/weather?lat&lon: сейчас + 3 дня, влажность, ветер, давление).
+     9→     9→ * — Кнопка «Добавить улей»: вводим код датчика с его корпуса — датчик находится
+    10→    10→ *   в каталоге (lib/sensor-catalog.ts), его GPS-позиция сразу показывается на
+    11→    11→ *   карте (синяя метка-превью), после подтверждения улей привязывается в этой
+    12→    12→ *   точке. Лимита на число ульев нет — один датчик ставится в один улей.
+    13→    13→ * — Список точек справа: переключение датчика, удаление, перелёт к точке.
+    14→    14→ * Анимации: появление карточки погоды, маркеров, превью GPS и пунктов списка.
+    15→    15→ */
+    16→    16→import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+    17→    17→import { AnimatePresence, motion } from 'framer-motion'
+    18→    18→import { CircleAlert, CircleCheck, MapPin, MapPinPlus, RefreshCcw, Trash2 } from 'lucide-react'
+    19→    19→import { Button } from '@/components/ui/button'
+    20→    20→import { Card, CardContent } from '@/components/ui/card'
+    21→    21→import {
+    22→    22→  Dialog,
+    23→    23→  DialogContent,
+    24→    24→  DialogDescription,
+    25→    25→  DialogFooter,
+    26→    26→  DialogHeader,
+    27→    27→  DialogTitle,
+    28→    28→} from '@/components/ui/dialog'
+    29→    29→import { Input } from '@/components/ui/input'
+    30→    30→import { Label } from '@/components/ui/label'
+    31→    31→import { Switch } from '@/components/ui/switch'
+    32→    32→import { useToast } from '@/hooks/use-toast'
+    33→    33→import { useAppState } from '@/lib/store'
+    34→    34→import { cn } from '@/lib/utils'
+    35→    35→import { WeatherGlyph } from './weather-glyph'
+    36→    36→import type { MapPointDto, WeatherResponse } from '@/lib/api-types'
+    37→    37→import { findSensor, normalizeCode, DEFAULT_PLACE, SENSOR_CATALOG } from '@/lib/sensor-catalog'
+    38→    38→import { loadYmaps } from '@/lib/ymaps'
+    39→    39→import type {
+    40→    40→  YmapsApi,
+    41→    41→  YmapsCoords,
+    42→    42→  YmapsGeoCollection,
+    43→    43→  YmapsGeoObject,
+    44→    44→  YmapsMap,
+    45→    45→} from '@/lib/ymaps'
+    46→    46→import type { SensorDevice } from '@/lib/sensor-catalog'
+    47→    47→
+    48→    48→const ease = { duration: 0.3, ease: 'easeOut' as const }
+    49→    49→
+    50→    50→const SENSOR_LABEL = { active: 'активен', off: 'выключен', none: 'не установлен' } as const
+    51→    51→
+    52→    52→/** Подписи зон в подсказке диалога привязки. */
+    53→    53→const ZONE_LABEL: Record<SensorDevice['zone'], string> = {
+    54→    54→  field: 'Поля в стороне от города',
+    55→    55→  city: 'Рядом с городом (Уфа)',
+    56→    56→  sterlitamak: 'Поля за Стерлитамаком',
+    57→    57→}
+    58→    58→
+    59→    59→/** HTML-макет метки улья для Яндекс Карт: круг с 🐝 + подпись «N ул.» снизу. */
+    60→    60→const HIVE_ICON_TPL =
+    61→    61→  '<div style="position:relative;width:34px;height:34px;">' +
+    62→    62→  '<div style="display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:50%;background:{{ properties.color }};border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.3);font-size:16px;">🐝</div>' +
+    63→    63→  '<span style="position:absolute;left:50%;top:37px;transform:translateX(-50%);background:#2A1A12;color:#fff;font-size:10px;font-weight:700;padding:1px 6px;border-radius:9999px;white-space:nowrap;">{{ properties.label }}</span>' +
+    64→    64→  '</div>'
+    65→    65→
+    66→    66→/** Область клика метки: круг + подпись (пиксели относительно точки привязки). */
+    67→    67→const HIVE_ICON_SHAPE = { type: 'Rectangle', coordinates: [[-17, -17], [17, 39]] }
+    68→    68→
+    69→    69→export function MapPointsView() {
+    70→    70→  const user = useAppState((s) => s.user)
+    71→    71→  const { toast } = useToast()
+    72→    72→  const isBeekeeper = user?.role === 'BEEKEEPER'
+    73→    73→
+    74→    74→  // В диалоге привязки показываем весь каталог: датчики полей и города
+    75→    75→  const zones: SensorDevice['zone'][] = ['field', 'city', 'sterlitamak']
+    76→    76→
+    77→    77→  const containerRef = useRef<HTMLDivElement | null>(null)
+    78→    78→  const mapRef = useRef<YmapsMap | null>(null)
+    79→    79→  const ymRef = useRef<YmapsApi | null>(null)
+    80→    80→  const pointsColRef = useRef<YmapsGeoCollection | null>(null)
+    81→    81→  const selColRef = useRef<YmapsGeoCollection | null>(null)
+    82→    82→  const prevColRef = useRef<YmapsGeoCollection | null>(null)
+    83→    83→  const markerRefs = useRef<Map<string, YmapsGeoObject>>(new Map())
+    84→    84→  const layoutRef = useRef<unknown>(null)
+    85→    85→  const clickRef = useRef<(lat: number, lon: number) => void>(() => undefined)
+    86→    86→  const [mapReady, setMapReady] = useState(false)
+    87→    87→  const [mapError, setMapError] = useState<string | null>(null)
+    88→    88→
+    89→    89→  const [points, setPoints] = useState<MapPointDto[] | null>(null)
+    90→    90→  const [selected, setSelected] = useState<{ lat: number; lon: number } | null>(null)
+    91→    91→  const [weather, setWeather] = useState<WeatherResponse | null>(null)
+    92→    92→  const [weatherLoading, setWeatherLoading] = useState(false)
+    93→    93→
+    94→    94→  // диалог привязки улья по коду датчика
+    95→    95→  const [dialogOpen, setDialogOpen] = useState(false)
+    96→    96→  const [code, setCode] = useState('')
+    97→    97→  const [name, setName] = useState('')
+    98→    98→  const [busy, setBusy] = useState(false)
+    99→    99→
+   100→   100→  // Как только введён код из каталога — сразу знаем GPS-позицию датчика
+   101→   101→  const found = useMemo(() => findSensor(code), [code])
+   102→   102→  const showNotFound = normalizeCode(code).length >= 4 && !found
+   103→   103→
+   104→   104→  /* ---------- карта (Яндекс Карты) ---------- */
+   105→   105→  useEffect(() => {
+   106→   106→    let disposed = false
+   107→   107→    void (async () => {
+   108→   108→      let ym: YmapsApi
+   109→   109→      try {
+   110→   110→        ym = await loadYmaps()
+   111→   111→      } catch (err) {
+   112→   112→        if (!disposed) {
+   113→   113→          setMapError(err instanceof Error ? err.message : 'Не удалось загрузить карту — проверьте соединение')
+   114→   114→        }
+   115→   115→        return
+   116→   116→      }
+   117→   117→      if (disposed || !containerRef.current) return
+   118→   118→
+   119→   119→      // controls: переключатель «Схема / Спутник / Гибрид» + масштаб и геолокация;
+   120→   120→      // suppressMapOpenBlock — без блока «Открыть в Яндекс Картах»
+   121→   121→      const map = new ym.Map(containerRef.current, {
+   122→   122→        // стартовый центр — запасной; как только точки загрузятся, перелетаем к пасеке
+   123→   123→        center: [...DEFAULT_PLACE.center] as YmapsCoords,
+   124→   124→        zoom: 12,
+   125→   125→        controls: ['zoomControl', 'typeSelector', 'fullscreenControl', 'geolocationControl', 'rulerControl'],
+   126→   126→        suppressMapOpenBlock: true,
+   127→   127→      })
+   128→   128→      map.behaviors.enable('scrollZoom')
+   129→   129→
+   130→   130→      // События меток всплывают до карты: выбираем точку только по клику «в пустое место»
+   131→   131→      map.events.add('click', (e) => {
+   132→   132→        if (e.get('target') !== map) return
+   133→   133→        const coords = e.get('coords') as YmapsCoords | undefined
+   134→   134→        if (!coords) return
+   135→   135→        clickRef.current(coords[0], coords[1])
+   136→   136→      })
+   137→   137→
+   138→   138→      const pointsCol = new ym.GeoObjectCollection()
+   139→   139→      const selCol = new ym.GeoObjectCollection()
+   140→   140→      const prevCol = new ym.GeoObjectCollection()
+   141→   141→      map.geoObjects.add(pointsCol).add(selCol).add(prevCol)
+   142→   142→
+   143→   143→      // HTML-макет метки улья (круг 🐝 + подпись с числом ульев)
+   144→   144→      layoutRef.current = ym.templateLayoutFactory.createClass(HIVE_ICON_TPL)
+   145→   145→
+   146→   146→      ymRef.current = ym
+   147→   147→      mapRef.current = map
+   148→   148→      pointsColRef.current = pointsCol
+   149→   149→      selColRef.current = selCol
+   150→   150→      prevColRef.current = prevCol
+   151→   151→      setMapReady(true)
+   152→   152→    })()
+   153→   153→    return () => {
+   154→   154→      disposed = true
+   155→   155→      mapRef.current?.destroy()
+   156→   156→      mapRef.current = null
+   157→   157→      pointsColRef.current = null
+   158→   158→      selColRef.current = null
+   159→   159→      prevColRef.current = null
+   160→   160→      markerRefs.current.clear()
+   161→   161→      setMapReady(false)
+   162→   162→    }
+   163→   163→  }, [])
+   164→   164→
+   165→   165→  /* ---------- данные точек ---------- */
+   166→   166→  const load = useCallback(async () => {
+   167→   167→    try {
+   168→   168→      const res = await fetch('/api/map-points', { cache: 'no-store' })
+   169→   169→      if (!res.ok) return
+   170→   170→      const j = (await res.json()) as { points: MapPointDto[] }
+   171→   171→      setPoints(j.points)
+   172→   172→    } catch {
+   173→   173→      // карта и погода продолжают работать, точки подтянутся при следующем обновлении
+   174→   174→    }
+   175→   175→  }, [])
+   176→   176→
+   177→   177→  useEffect(() => {
+   178→   178→    void load()
+   179→   179→  }, [load])
+   180→   180→
+   181→   181→  // Первый успешный приход точек: перелетаем к фактическому центру пасеки.
+   182→   182→  // pannedRef — чтобы не дёргать камеру на каждом опросе.
+   183→   183→  const pannedRef = useRef(false)
+   184→   184→  useEffect(() => {
+   185→   185→    if (!mapReady || pannedRef.current) return
+   186→   186→    if (!points || points.length === 0) return
+   187→   187→    pannedRef.current = true
+   188→   188→    const map = mapRef.current
+   189→   189→    if (!map) return
+   190→   190→    const lat = points.reduce((s, p) => s + p.lat, 0) / points.length
+   191→   191→    const lon = points.reduce((s, p) => s + p.lon, 0) / points.length
+   192→   192→    map.panTo([lat, lon], { duration: 700, flying: true })
+   193→   193→  }, [points, mapReady])
+   194→   194→
+   195→   195→  /* ---------- курсор и клики ---------- */
+   196→   196→  const onMapClick = useCallback((lat: number, lon: number) => {
+   197→   197→    // Клик по карте — только выбор точки для погоды; улей привязывается
+   198→   198→    // по коду датчика в диалоге, вручную координаты не задаются
+   199→   199→    setSelected({ lat, lon })
+   200→   200→  }, [])
+   201→   201→
+   202→   202→  useEffect(() => {
+   203→   203→    clickRef.current = onMapClick
+   204→   204→  }, [onMapClick])
+   205→   205→
+   206→   206→  useEffect(() => {
+   207→   207→    if (!mapReady) return
+   208→   208→    // Стандартный курсор «ладошка»: точки больше не ставятся кликом —
+   209→   209→    // улей привязывается по коду датчика в диалоге
+   210→   210→    mapRef.current?.cursors.push('grab')
+   211→   211→  }, [mapReady])
+   212→   212→
+   213→   213→  /* ---------- маркеры точек ---------- */
+   214→   214→  useEffect(() => {
+   215→   215→    const ym = ymRef.current
+   216→   216→    const col = pointsColRef.current
+   217→   217→    const layout = layoutRef.current
+   218→   218→    if (!mapReady || !ym || !col || layout === null || !points) return
+   219→   219→    col.removeAll()
+   220→   220→    markerRefs.current.clear()
+   221→   221→    for (const p of points) {
+   222→   222→      const active = p.sensor.reason === 'active'
+   223→   223→      const color = active ? '#22c55e' : p.hasSensor ? '#f59e0b' : '#94a3b8'
+   224→   224→      const readings = active
+   225→   225→        ? `<br>🌡 ${p.sensor.tempC} °C · 💧 ${p.sensor.humidityPct} %<br>⚖ ${p.sensor.weightKg} кг · 🔊 ${p.sensor.noiseDb} дБ`
+   226→   226→        : `<br><i>Данных об улье нет — датчик ${SENSOR_LABEL[p.sensor.reason]}.</i>`
+   227→   227→      const pm = new ym.Placemark(
+   228→   228→        [p.lat, p.lon],
+   229→   229→        {
+   230→   230→          color,
+   231→   231→          label: `${p.hiveCount} ул.`,
+   232→   232→          balloonContentHeader: p.name,
+   233→   233→          balloonContentBody: `Датчик: <b>${p.sensorCode ?? '—'}</b><br>GPS: ${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}<br>Состояние: ${SENSOR_LABEL[p.sensor.reason]}${readings}`,
+   234→   234→        },
+   235→   235→        {
+   236→   236→          iconLayout: layout,
+   237→   237→          iconShape: HIVE_ICON_SHAPE,
+   238→   238→          iconOffset: [-17, -17],
+   239→   239→          hideIconOnBalloonOpen: false,
+   240→   240→        },
+   241→   241→      )
+   242→   242→      col.add(pm)
+   243→   243→      markerRefs.current.set(p.id, pm)
+   244→   244→    }
+   245→   245→  }, [points, mapReady])
+   246→   246→
+   247→   247→  /* ---------- маркер выбранной точки ---------- */
+   248→   248→  useEffect(() => {
+   249→   249→    const ym = ymRef.current
+   250→   250→    const col = selColRef.current
+   251→   251→    if (!mapReady || !ym || !col) return
+   252→   252→    col.removeAll()
+   253→   253→    if (!selected) return
+   254→   254→    col.add(
+   255→   255→      new ym.Placemark(
+   256→   256→        [selected.lat, selected.lon],
+   257→   257→        { balloonContentBody: 'Выбранная точка — погода справа' },
+   258→   258→        { preset: 'islands#redDotIcon', iconColor: '#ef4444', hideIconOnBalloonOpen: false },
+   259→   259→      ),
+   260→   260→    )
+   261→   261→  }, [selected, mapReady])
+   262→   262→
+   263→   263→  /* ---------- превью GPS-позиции датчика при вводе кода ---------- */
+   264→   264→  useEffect(() => {
+   265→   265→    const ym = ymRef.current
+   266→   266→    const col = prevColRef.current
+   267→   267→    const map = mapRef.current
+   268→   268→    if (!mapReady || !ym || !col) return
+   269→   269→    col.removeAll()
+   270→   270→    if (!dialogOpen || !found) return
+   271→   271→    // Синяя метка «здесь будет улей»: позиция, которую передаёт датчик
+   272→   272→    col.add(
+   273→   273→      new ym.Placemark(
+   274→   274→        [found.lat, found.lon],
+   275→   275→        {
+   276→   276→          balloonContentHeader: 'Позиция по GPS датчика',
+   277→   277→          balloonContentBody: `Датчик: <b>${found.code}</b> · ${found.model}<br>GPS: ${found.lat.toFixed(4)}, ${found.lon.toFixed(4)}<br>${found.note}`,
+   278→   278→        },
+   279→   279→        { preset: 'islands#blueCircleDotIcon', iconColor: '#2563eb', hideIconOnBalloonOpen: false },
+   280→   280→      ),
+   281→   281→    )
+   282→   282→    if (map) {
+   283→   283→      if (map.getZoom() < 12) map.setZoom(12)
+   284→   284→      map.panTo([found.lat, found.lon], { duration: 700, flying: true })
+   285→   285→    }
+   286→   286→  }, [dialogOpen, found, mapReady])
+   287→   287→
+   288→   288→  /* ---------- погода выбранной точки ---------- */
+   289→   289→  useEffect(() => {
+   290→   290→    if (!selected) {
+   291→   291→      setWeather(null)
+   292→   292→      return
+   293→   293→    }
+   294→   294→    const ctl = new AbortController()
+   295→   295→    setWeatherLoading(true)
+   296→   296→    setWeather(null)
+   297→   297→    fetch(`/api/weather?lat=${selected.lat}&lon=${selected.lon}`, {
+   298→   298→      signal: ctl.signal,
+   299→   299→      cache: 'no-store',
+   300→   300→    })
+   301→   301→      .then((r) => r.json() as Promise<WeatherResponse>)
+   302→   302→      .then((j) => setWeather(j))
+   303→   303→      .catch(() => undefined)
+   304→   304→      .finally(() => {
+   305→   305→        if (!ctl.signal.aborted) setWeatherLoading(false)
+   306→   306→      })
+   307→   307→    return () => ctl.abort()
+   308→   308→  }, [selected])
+   309→   309→
+   310→   310→  /** Плавный перелёт к точке: зум до 12, полёт Яндекса, затем открываем балун метки. */
+   311→   311→  const flyMapTo = (lat: number, lon: number, balloonId?: string) => {
+   312→   312→    const map = mapRef.current
+   313→   313→    if (!map) return
+   314→   314→    if (map.getZoom() < 12) map.setZoom(12)
+   315→   315→    map.panTo([lat, lon], { duration: 700, flying: true })
+   316→   316→    if (balloonId) {
+   317→   317→      setTimeout(() => markerRefs.current.get(balloonId)?.balloon.open(), 750)
+   318→   318→    }
+   319→   319→  }
+   320→   320→
+   321→   321→  /* ---------- привязать улей по коду датчика ---------- */
+   322→   322→  const place = async () => {
+   323→   323→    if (!found) return
+   324→   324→    setBusy(true)
+   325→   325→    try {
+   326→   326→      const res = await fetch('/api/map-points', {
+   327→   327→        method: 'POST',
+   328→   328→        headers: { 'Content-Type': 'application/json' },
+   329→   329→        body: JSON.stringify({ sensorCode: found.code, name: name.trim() }),
+   330→   330→      })
+   331→   331→      const j = (await res.json().catch(() => ({}))) as { point?: MapPointDto; error?: string }
+   332→   332→      if (!res.ok || !j.point) {
+   333→   333→        toast({ title: 'Не получилось', description: j.error ?? 'Ошибка сервера', variant: 'destructive' })
+   334→   334→        return
+   335→   335→      }
+   336→   336→      setPoints((prev) => [...(prev ?? []), j.point as MapPointDto])
+   337→   337→      toast({
+   338→   338→        title: 'Улей добавлен',
+   339→   339→        description: `Позиция определена по датчику ${j.point.sensorCode}: ${j.point.lat.toFixed(4)}, ${j.point.lon.toFixed(4)}`,
+   340→   340→      })
+   341→   341→      setDialogOpen(false)
+   342→   342→      setCode('')
+   343→   343→      setName('')
+   344→   344→      flyMapTo(j.point.lat, j.point.lon, j.point.id)
+   345→   345→    } finally {
+   346→   346→      setBusy(false)
+   347→   347→    }
+   348→   348→  }
+   349→   349→
+   350→   350→  const patchSensor = async (
+   351→   351→    p: MapPointDto,
+   352→   352→    body: { sensorOn?: boolean; hasSensor?: boolean },
+   353→   353→    okMsg: string,
+   354→   354→  ) => {
+   355→   355→    const res = await fetch(`/api/map-points/${p.id}`, {
+   356→   356→      method: 'PATCH',
+   357→   357→      headers: { 'Content-Type': 'application/json' },
+   358→   358→      body: JSON.stringify(body),
+   359→   359→    })
+   360→   360→    if (!res.ok) {
+   361→   361→      toast({ title: 'Не получилось', variant: 'destructive' })
+   362→   362→      return
+   363→   363→    }
+   364→   364→    toast({ title: okMsg })
+   365→   365→    // оптимистично правим карточку, серверный ответ уточнит детали
+   366→   366→    setPoints((prev) =>
+   367→   367→      prev
+   368→   368→        ? prev.map((x) => {
+   369→   369→            if (x.id !== p.id) return x
+   370→   370→            const hasSensor = body.hasSensor ?? x.hasSensor
+   371→   371→            const sensorOn = body.sensorOn ?? (body.hasSensor !== undefined ? body.hasSensor : x.sensorOn)
+   372→   372→            return { ...x, hasSensor, sensorOn }
+   373→   373→          })
+   374→   374→        : prev,
+   375→   375→    )
+   376→   376→    void load()
+   377→   377→  }
+   378→   378→
+   379→   379→  const removePoint = async (p: MapPointDto) => {
+   380→   380→    const res = await fetch(`/api/map-points/${p.id}`, { method: 'DELETE' })
+   381→   381→    if (!res.ok) {
+   382→   382→      toast({ title: 'Не удалось удалить точку', variant: 'destructive' })
+   383→   383→      return
+   384→   384→    }
+   385→   385→    setPoints((prev) => prev?.filter((x) => x.id !== p.id) ?? null)
+   386→   386→    toast({ title: 'Точка удалена с карты' })
+   387→   387→  }
+   388→   388→
+   389→   389→  const flyTo = (p: MapPointDto) => flyMapTo(p.lat, p.lon, p.id)
+   390→   390→
+   391→   391→  const list = points ?? []
+   392→   392→  const summary = useMemo(() => {
+   393→   393→    const hives = list.reduce((s, p) => s + p.hiveCount, 0)
+   394→   394→    const sensors = list.filter((p) => p.hasSensor && p.sensorOn).length
+   395→   395→    return { hives, sensors }
+   396→   396→  }, [list])
+   397→   397→
+   398→   398→  return (
+   399→   399→    <div className="mx-auto max-w-6xl space-y-5">
+   400→   400→      {/* Шапка */}
+   401→   401→      <div className="flex flex-wrap items-center justify-between gap-2">
+   402→   402→        <div>
+   403→   403→          <h1 className="text-2xl font-extrabold tracking-tight text-[#2A1A12]">
+   404→   404→            Карта пасеки
+   405→   405→          </h1>
+   406→   406→          <p className="mt-1 max-w-2xl text-sm text-gray-500">
+   407→   407→            Кликните по карте — покажу погоду в этой точке. Улей привязывается по коду датчика:
+   408→   408→            позицию задаёт GPS самого датчика.
+   409→   409→          </p>
+   410→   410→        </div>
+   411→   411→        {isBeekeeper && (
+   412→   412→          <Button
+   413→   413→            onClick={() => setDialogOpen(true)}
+   414→   414→            className="gap-1.5 bg-gradient-to-r from-red-600 to-orange-500 font-bold active:scale-95"
+   415→   415→          >
+   416→   416→            <MapPinPlus className="h-4 w-4" />
+   417→   417→            Добавить улей
+   418→   418→          </Button>
+   419→   419→        )}
+   420→   420→      </div>
+   421→   421→
+   422→   422→      {/* Карта + правая колонка */}
+   423→   423→      <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
+   424→   424→        <motion.div
+   425→   425→          initial={{ opacity: 0, scale: 0.98 }}
+   426→   426→          animate={{ opacity: 1, scale: 1 }}
+   427→   427→          transition={ease}
+   428→   428→          className="relative overflow-hidden rounded-2xl border border-red-100 shadow-sm"
+   429→   429→        >
+   430→   430→          <div ref={containerRef} className="h-[440px] w-full md:h-[520px]" />
+   431→   431→          {!mapReady && !mapError && (
+   432→   432→            <div className="absolute inset-0 flex items-center justify-center gap-2 bg-red-50/60 text-xs font-semibold text-gray-500">
+   433→   433→              <RefreshCcw className="h-4 w-4 animate-spin" /> Загружаем карту…
+   434→   434→            </div>
+   435→   435→          )}
+   436→   436→          {mapError && (
+   437→   437→            <div className="absolute inset-0 flex items-center justify-center bg-red-50/90 px-6 text-center text-xs font-semibold text-red-700">
+   438→   438→              {mapError}
+   439→   439→            </div>
+   440→   440→          )}
+   441→   441→        </motion.div>
+   442→   442→
+   443→   443→        <div className="space-y-4">
+   444→   444→          {/* Погода выбранной точки */}
+   445→   445→          <Card className="border-red-100 shadow-sm">
+   446→   446→            <CardContent className="p-4">
+   447→   447→              <h2 className="flex items-center gap-2 text-sm font-bold text-[#2A1A12]">
+   448→   448→                <MapPin className="h-4 w-4 text-red-600" />
+   449→   449→                Погода в точке
+   450→   450→                {selected && (
+   451→   451→                  <span className="ml-auto text-[10px] font-medium tabular-nums text-gray-400">
+   452→   452→                    {selected.lat.toFixed(3)}, {selected.lon.toFixed(3)}
+   453→   453→                  </span>
+   454→   454→                )}
+   455→   455→              </h2>
+   456→   456→
+   457→   457→              {!selected && (
+   458→   458→                <p className="mt-3 text-xs text-gray-500">
+   459→   459→                  Выберите точку на карте — покажу все условия: температуру, ветер, влажность,
+   460→   460→                  давление и прогноз на 3 дня.
+   461→   461→                </p>
+   462→   462→              )}
+   463→   463→
+   464→   464→              <AnimatePresence mode="wait">
+   465→   465→                {selected && (
+   466→   466→                  <motion.div
+   467→   467→                    key={`${selected.lat.toFixed(4)},${selected.lon.toFixed(4)}`}
+   468→   468→                    initial={{ opacity: 0, y: 12 }}
+   469→   469→                    animate={{ opacity: 1, y: 0 }}
+   470→   470→                    exit={{ opacity: 0, y: -8 }}
+   471→   471→                    transition={ease}
+   472→   472→                    className="mt-3"
+   473→   473→                  >
+   474→   474→                    {weatherLoading || !weather ? (
+   475→   475→                      <div className="flex items-center justify-center gap-2 py-8 text-xs text-gray-400">
+   476→   476→                        <RefreshCcw className="h-4 w-4 animate-spin" /> Запрашиваем погоду…
+   477→   477→                      </div>
+   478→   478→                    ) : (
+   479→   479→                      <>
+   480→   480→                        <div className="flex items-center gap-3">
+   481→   481→                          <WeatherGlyph kind={weather.now.icon} className="h-9 w-9" />
+   482→   482→                          <div>
+   483→   483→                            <p className="text-3xl font-extrabold leading-none text-[#2A1A12]">
+   484→   484→                              {Math.round(weather.now.tempC)}°
+   485→   485→                            </p>
+   486→   486→                            <p className="mt-1 text-xs font-semibold text-gray-500">{weather.now.text}</p>
+   487→   487→                          </div>
+   488→   488→                        </div>
+   489→   489→
+   490→   490→                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+   491→   491→                          {[
+   492→   492→                            ['Ощущается', `${Math.round(weather.now.feelsC)}°`],
+   493→   493→                            ['Влажность', `${weather.now.humidityPct} %`],
+   494→   494→                            ['Ветер', `${weather.now.windKmh} км/ч`],
+   495→   495→                            ['Давление', `${weather.now.pressureMm} мм`],
+   496→   496→                          ].map(([k, v], i) => (
+   497→   497→                            <motion.div
+   498→   498→                              key={k}
+   499→   499→                              initial={{ opacity: 0, y: 6 }}
+   500→   500→                              animate={{ opacity: 1, y: 0 }}
+   501→   501→                              transition={{ ...ease, delay: 0.05 * i }}
+   502→   502→                              className="flex items-center justify-between rounded-lg border border-red-100 bg-red-50/40 px-2.5 py-1.5 dark:bg-[#2C211C]"
+   503→   503→                            >
+   504→   504→                              <span className="text-gray-500">{k}</span>
+   505→   505→                              <span className="font-bold text-[#2A1A12]">{v}</span>
+   506→   506→                            </motion.div>
+   507→   507→                          ))}
+   508→   508→                        </div>
+   509→   509→
+   510→   510→                        <div className="mt-3 grid grid-cols-3 gap-2">
+   511→   511→                          {weather.days.slice(0, 3).map((d) => (
+   512→   512→                            <div
+   513→   513→                              key={d.date}
+   514→   514→                              className="flex flex-col items-center gap-0.5 rounded-lg border border-red-100 px-1 py-2 text-center"
+   515→   515→                            >
+   516→   516→                              <span className="text-[10px] font-bold uppercase text-gray-400">{d.weekday}</span>
+   517→   517→                              <WeatherGlyph kind={d.icon} className="h-4 w-4" />
+   518→   518→                              <span className="text-[11px] font-bold text-[#2A1A12]">
+   519→   519→                                {d.tMax}° <span className="font-medium text-gray-400">{d.tMin}°</span>
+   520→   520→                              </span>
+   521→   521→                              <span className="text-[9px] text-sky-500">💧 {d.precipProb} %</span>
+   522→   522→                            </div>
+   523→   523→                          ))}
+   524→   524→                        </div>
+   525→   525→                      </>
+   526→   526→                    )}
+   527→   527→                  </motion.div>
+   528→   528→                )}
+   529→   529→              </AnimatePresence>
+   530→   530→            </CardContent>
+   531→   531→          </Card>
+   532→   532→
+   533→   533→          {/* Точки с ульями */}
+   534→   534→          <Card className="border-red-100 shadow-sm">
+   535→   535→            <CardContent className="p-4">
+   536→   536→              <h2 className="flex items-center gap-2 text-sm font-bold text-[#2A1A12]">
+   537→   537→                🐝 Ульи на карте
+   538→   538→                <span className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-bold text-red-600 dark:bg-[#2C211C]">
+   539→   539→                  {list.length}
+   540→   540→                </span>
+   541→   541→                <span className="ml-auto text-[10px] font-medium tabular-nums text-gray-400">
+   542→   542→                  {summary.hives} ульев · датчиков: {summary.sensors}
+   543→   543→                </span>
+   544→   544→              </h2>
+   545→   545→
+   546→   546→              {!points ? (
+   547→   547→                <div className="mt-3 space-y-2">
+   548→   548→                  {[0, 1, 2].map((i) => (
+   549→   549→                    <div key={i} className="h-12 animate-pulse rounded-xl bg-red-100/50" />
+   550→   550→                  ))}
+   551→   551→                </div>
+   552→   552→              ) : list.length === 0 ? (
+   553→   553→                <p className="mt-3 text-xs text-gray-500">
+   554→   554→                  {isBeekeeper
+   555→   555→                    ? 'Ульи ещё не привязаны. Нажмите «Добавить улей» и введите код с корпуса датчика — улей сразу появится в точке, которую передаёт его GPS.'
+   556→   556→                    : 'Ульи ещё не привязаны: точки на карте добавляет пасечник по коду датчика.'}
+   557→   557→                </p>
+   558→   558→              ) : (
+   559→   559→                <ul className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
+   560→   560→                  <AnimatePresence initial={false}>
+   561→   561→                    {list.map((p, i) => (
+   562→   562→                      <motion.li
+   563→   563→                        key={p.id}
+   564→   564→                        layout
+   565→   565→                        initial={{ opacity: 0, y: 10 }}
+   566→   566→                        animate={{ opacity: 1, y: 0 }}
+   567→   567→                        exit={{ opacity: 0, x: -20 }}
+   568→   568→                        transition={{ ...ease, delay: Math.min(i * 0.04, 0.2) }}
+   569→   569→                        className="rounded-xl border border-red-100 bg-white px-3 py-2.5 dark:bg-[#221814]"
+   570→   570→                      >
+   571→   571→                        <button onClick={() => flyTo(p)} className="min-w-0 flex-1 text-left" aria-label={`Показать ${p.name} на карте`}>
+   572→   572→                          <p className="truncate text-sm font-bold text-[#2A1A12]">{p.name}</p>
+   573→   573→                          <p className="mt-0.5 text-[11px] text-gray-400">
+   574→   574→                            <span className="font-mono font-bold text-gray-500">{p.sensorCode ?? '—'}</span> ·{' '}
+   575→   575→                            {p.lat.toFixed(3)}, {p.lon.toFixed(3)} · датчик{' '}
+   576→   576→                            <span
+   577→   577→                              className={cn(
+   578→   578→                                'font-bold',
+   579→   579→                                p.sensor.reason === 'active'
+   580→   580→                                  ? 'text-emerald-600'
+   581→   581→                                  : p.sensor.reason === 'off'
+   582→   582→                                    ? 'text-amber-600'
+   583→   583→                                    : 'text-gray-400',
+   584→   584→                              )}
+   585→   585→                            >
+   586→   586→                              {SENSOR_LABEL[p.sensor.reason]}
+   587→   587→                            </span>
+   588→   588→                          </p>
+   589→   589→                        </button>
+   590→   590→                        {isBeekeeper && (
+   591→   591→                          <div className="mt-2 flex items-center justify-between border-t border-red-50 pt-2">
+   592→   592→                            {p.hasSensor ? (
+   593→   593→                              <div className="flex items-center gap-1.5">
+   594→   594→                                <span className="text-[10px] font-semibold text-gray-400">датчик</span>
+   595→   595→                                <Switch
+   596→   596→                                  checked={p.sensorOn}
+   597→   597→                                  onCheckedChange={(v) =>
+   598→   598→                                    void patchSensor(p, { sensorOn: v }, v ? 'Датчик включён' : 'Датчик выключен')
+   599→   599→                                  }
+   600→   600→                                  aria-label="Датчик включён"
+   601→   601→                                />
+   602→   602→                              </div>
+   603→   603→                            ) : (
+   604→   604→                              <button
+   605→   605→                                onClick={() => void patchSensor(p, { hasSensor: true }, 'Датчик установлен и включён')}
+   606→   606→                                className="text-[10px] font-bold text-red-600 hover:underline"
+   607→   607→                              >
+   608→   608→                                установить датчик
+   609→   609→                              </button>
+   610→   610→                            )}
+   611→   611→                            <button
+   612→   612→                              onClick={() => void removePoint(p)}
+   613→   613→                              aria-label="Удалить точку"
+   614→   614→                              className="rounded-lg p-1.5 text-gray-300 transition-colors hover:bg-red-50 hover:text-red-500 dark:hover:bg-[#2C211C]"
+   615→   615→                            >
+   616→   616→                              <Trash2 className="h-3.5 w-3.5" />
+   617→   617→                            </button>
+   618→   618→                          </div>
+   619→   619→                        )}
+   620→   620→                      </motion.li>
+   621→   621→                    ))}
+   622→   622→                  </AnimatePresence>
+   623→   623→                </ul>
+   624→   624→              )}
+   625→   625→            </CardContent>
+   626→   626→          </Card>
+   627→   627→        </div>
+   628→   628→      </div>
+   629→   629→
+   630→   630→      {/* Диалог привязки улья по коду датчика */}
+   631→   631→      <Dialog open={dialogOpen} onOpenChange={(v) => { if (!busy) setDialogOpen(v) }}>
+   632→   632→        <DialogContent className="max-w-sm rounded-2xl">
+   633→   633→          <DialogHeader>
+   634→   634→            <DialogTitle className="text-[#2A1A12]">Добавить улей</DialogTitle>
+   635→   635→            <DialogDescription>
+   636→   636→              Введите код с корпуса датчика — улей сразу встанет в точку, которую передаёт GPS
+   637→   637→              датчика.
+   638→   638→            </DialogDescription>
+   639→   639→          </DialogHeader>
+   640→   640→          <form
+   641→   641→            className="space-y-3"
+   642→   642→            onSubmit={(e) => {
+   643→   643→              e.preventDefault()
+   644→   644→              void place()
+   645→   645→            }}
+   646→   646→          >
+   647→   647→            <div className="space-y-1.5">
+   648→   648→              <Label htmlFor="pt-code">Код датчика</Label>
+   649→   649→              <Input
+   650→   650→                id="pt-code"
+   651→   651→                value={code}
+   652→   652→                onChange={(e) => setCode(e.target.value)}
+   653→   653→                placeholder="Например: SN-2518-0147"
+   654→   654→                aria-label="Код датчика"
+   655→   655→                className="font-mono uppercase"
+   656→   656→                maxLength={20}
+   657→   657→                autoFocus
+   658→   658→              />
+   659→   659→            </div>
+   660→   660→
+   661→   661→            <AnimatePresence mode="wait">
+   662→   662→              {found ? (
+   663→   663→                <motion.div
+   664→   664→                  key="found"
+   665→   665→                  initial={{ opacity: 0, y: 8 }}
+   666→   666→                  animate={{ opacity: 1, y: 0 }}
+   667→   667→                  exit={{ opacity: 0, y: -6 }}
+   668→   668→                  transition={ease}
+   669→   669→                  className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-xs dark:bg-[#1C2A20]"
+   670→   670→                >
+   671→   671→                  <p className="flex items-center gap-1.5 font-bold text-emerald-700">
+   672→   672→                    <CircleCheck className="h-4 w-4 shrink-0" /> Датчик найден — {found.model}
+   673→   673→                  </p>
+   674→   674→                  <p className="mt-1.5 font-semibold text-[#2A1A12]">
+   675→   675→                    GPS датчика: {found.lat.toFixed(4)}, {found.lon.toFixed(4)}
+   676→   676→                  </p>
+   677→   677→                  <p className="mt-0.5 text-gray-500">{found.note}</p>
+   678→   678→                </motion.div>
+   679→   679→              ) : showNotFound ? (
+   680→   680→                <motion.div
+   681→   681→                  key="notfound"
+   682→   682→                  initial={{ opacity: 0, y: 8 }}
+   683→   683→                  animate={{ opacity: 1, y: 0 }}
+   684→   684→                  exit={{ opacity: 0, y: -6 }}
+   685→   685→                  transition={ease}
+   686→   686→                  className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs dark:bg-[#2C2416]"
+   687→   687→                >
+   688→   688→                  <p className="flex items-center gap-1.5 font-bold text-amber-700">
+   689→   689→                    <CircleAlert className="h-4 w-4 shrink-0" /> Датчик с таким кодом не найден
+   690→   690→                  </p>
+   691→   691→                  <p className="mt-1 text-gray-500">Проверьте код — он напечатан на корпусе датчика.</p>
+   692→   692→                </motion.div>
+   693→   693→              ) : (
+   694→   694→                <motion.div
+   695→   695→                  key="hint"
+   696→   696→                  initial={{ opacity: 0 }}
+   697→   697→                  animate={{ opacity: 1 }}
+   698→   698→                  exit={{ opacity: 0 }}
+   699→   699→                  transition={ease}
+   700→   700→                  className="text-[11px] leading-relaxed text-gray-400"
+   701→   701→                >
+   702→   702→                  {zones.map((zone) => (
+   703→   703→                    <div key={zone} className="mt-1.5 first:mt-0">
+   704→   704→                      <p className="text-[10px] font-bold uppercase tracking-wide text-gray-400">{ZONE_LABEL[zone]}</p>
+   705→   705→                      <div className="mt-1 flex flex-wrap gap-1">
+   706→   706→                        {SENSOR_CATALOG.filter((s) => s.zone === zone).map((s) => (
+   707→   707→                          <button
+   708→   708→                            key={s.code}
+   709→   709→                            type="button"
+   710→   710→                            onClick={() => setCode(s.code)}
+   711→   711→                            aria-label={`Подставить код ${s.code}`}
+   712→   712→                            className="rounded-md bg-white px-1.5 py-0.5 font-mono text-[10px] font-bold text-gray-600 shadow-sm ring-1 ring-red-100 transition hover:bg-red-50 hover:text-red-700 dark:bg-[#221814] dark:ring-[#2C211C]"
+   713→   713→                          >
+   714→   714→                            {s.code}
+   715→   715→                          </button>
+   716→   716→                        ))}
+   717→   717→                      </div>
+   718→   718→                    </div>
+   719→   719→                  ))}
+   720→   720→                </motion.div>
+   721→   721→              )}
+   722→   722→            </AnimatePresence>
+   723→   723→
+   724→   724→            <div className="space-y-1.5">
+   725→   725→              <Label htmlFor="pt-name">
+   726→   726→                Название улья <span className="font-normal text-gray-400">(необязательно)</span>
+   727→   727→              </Label>
+   728→   728→              <Input
+   729→   729→                id="pt-name"
+   730→   730→                value={name}
+   731→   731→                onChange={(e) => setName(e.target.value)}
+   732→   732→                placeholder="Мой улей"
+   733→   733→                aria-label="Название улья"
+   734→   734→                maxLength={60}
+   735→   735→              />
+   736→   736→            </div>
+   737→   737→
+   738→   738→            <DialogFooter>
+   739→   739→              <Button type="button" variant="outline" onClick={() => setDialogOpen(false)}>
+   740→   740→                Отмена
+   741→   741→              </Button>
+   742→   742→              <Button
+   743→   743→                type="submit"
+   744→   744→                disabled={!found || busy}
+   745→   745→                className="gap-1 bg-gradient-to-r from-red-600 to-orange-500 font-bold"
+   746→   746→              >
+   747→   747→                <MapPinPlus className="h-4 w-4" /> Привязать улей
+   748→   748→              </Button>
+   749→   749→            </DialogFooter>
+   750→   750→          </form>
+   751→   751→        </DialogContent>
+   752→   752→      </Dialog>
+   753→   753→    </div>
+   754→   754→  )
+   755→   755→}
+   756→   756→

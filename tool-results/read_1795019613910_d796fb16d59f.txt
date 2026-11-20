@@ -1,0 +1,1323 @@
+     1→/**
+     2→ * Логика ИИ-агента «Цифровой улей» (правиловая версия).
+     3→ *
+     4→ * Принципы из кейса:
+     5→ *  1. Data Driven — совет опирается на показатели, агент показывает, какие данные использовал.
+     6→ *  2. Честность — если данных не хватает, агент прямо об этом говорит.
+     7→ *  3. Вероятность и уровень риска, а не 100% прогноз; решение принимает пчеловод.
+     8→ *
+     9→ * Агент работает через AgentContext: один и тот же набор правил применяется
+    10→ * и к демо-данным (DEMO_CONTEXT), и к реальным данным из базы (buildRealContext).
+    11→ */
+    12→import {
+    13→  apiary,
+    14→  fmtNum,
+    15→  fmtSigned,
+    16→  hives,
+    17→  hiveStatus,
+    18→  migrationSites,
+    19→  pesticideAlert,
+    20→  weather,
+    21→  type Hive,
+    22→  type MigrationSite,
+    23→  type PesticideAlert,
+    24→  type WeatherDay,
+    25→} from './demo-data'
+    26→import type { SensorReading } from './api-types'
+    27→import type { AgentWeatherNow } from './weather-days'
+    28→
+    29→/* ------------------------------------------------------------------ */
+    30→/* Типы                                                                */
+    31→/* ------------------------------------------------------------------ */
+    32→
+    33→export type Urgency = 'act-now' | 'today' | 'this-week' | 'ok'
+    34→export type Scenario = 'pesticide' | 'swarm' | 'weather' | 'migration' | 'status' | 'offtopic'
+    35→
+    36→export const URGENCY_META: Record<Urgency, { label: string; cls: string }> = {
+    37→  'act-now': { label: 'Действовать сейчас', cls: 'bg-red-100 text-red-700 border-red-200' },
+    38→  today: { label: 'Сегодня', cls: 'bg-orange-100 text-orange-700 border-orange-200' },
+    39→  'this-week': { label: 'В течение недели', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+    40→  ok: { label: 'Наблюдать', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+    41→}
+    42→
+    43→export const SCENARIO_META: Record<Scenario, { label: string }> = {
+    44→  pesticide: { label: 'Пестициды' },
+    45→  swarm: { label: 'Роение' },
+    46→  weather: { label: 'Погода и медосбор' },
+    47→  migration: { label: 'Кочёвка' },
+    48→  status: { label: 'Состояние улья' },
+    49→  offtopic: { label: 'Не по теме' },
+    50→}
+    51→
+    52→export interface AgentMetric {
+    53→  label: string
+    54→  value: string
+    55→}
+    56→
+    57→export interface AgentMessage {
+    58→  scenario: Scenario
+    59→  text: string
+    60→  basis: string[]
+    61→  urgency: Urgency
+    62→  urgencyNote?: string
+    63→  probability?: string
+    64→  metrics: AgentMetric[]
+    65→  hiveId: number | null
+    66→  /** Кто ответил: LLM или встроенный правиловый движок (fallback). Модель не раскрывается. */
+    67→  engine?: 'llm' | 'rules'
+    68→}
+    69→
+    70→export interface AgentFinding extends AgentMessage {
+    71→  id: string
+    72→  title: string
+    73→  prefill: string
+    74→}
+    75→
+    76→/** Точка пасеки на карте (ульи с датчиком) — тот же DTO, что отдаёт /api/map-points. */
+    77→export interface AgentPoint {
+    78→  id: string
+    79→  name: string
+    80→  lat: number
+    81→  lon: number
+    82→  hiveCount: number
+    83→  hasSensor: boolean
+    84→  sensorOn: boolean
+    85→  sensor: SensorReading
+    86→}
+    87→
+    88→/** Контекст данных, по которым агент отвечает: демо или реальная база. */
+    89→export interface AgentContext {
+    90→  hives: Hive[]
+    91→  weather: WeatherDay[] | null
+    92→  /** Погода «прямо сейчас» (Open-Meteo); в демо — сюжетное значение. */
+    93→  weatherNow?: AgentWeatherNow | null
+    94→  pesticide: PesticideAlert | null
+    95→  sites: MigrationSite[]
+    96→  /** Точки пасеки на карте с датчиками (температура, вес, влажность, шум). */
+    97→  points?: AgentPoint[]
+    98→  apiaryName: string
+    99→}
+   100→
+   101→/**
+   102→ * Демо-точки на карте: 2 улья с активными датчиками + 1 без датчика
+   103→ * (как в стартовом наборе /api/map-points), чтобы агент в демо тоже
+   104→ * говорил про датчики, шум и правило «нет датчика — нет данных».
+   105→ */
+   106→const DEMO_POINTS: AgentPoint[] = [
+   107→  {
+   108→    id: 'demo-pt-1',
+   109→    name: 'Пасека Лесная',
+   110→    lat: 54.755,
+   111→    lon: 56.035,
+   112→    hiveCount: 10,
+   113→    hasSensor: true,
+   114→    sensorOn: true,
+   115→    sensor: { on: true, reason: 'active', tempC: 34.7, humidityPct: 61, weightKg: 64.2, noiseDb: 47, updatedAt: '2026-07-18T12:00:00.000Z' },
+   116→  },
+   117→  {
+   118→    id: 'demo-pt-2',
+   119→    name: 'Точка Гречишный лог',
+   120→    lat: 54.795,
+   121→    lon: 56.155,
+   122→    hiveCount: 8,
+   123→    hasSensor: true,
+   124→    sensorOn: true,
+   125→    sensor: { on: true, reason: 'active', tempC: 34.9, humidityPct: 58, weightKg: 61.8, noiseDb: 52, updatedAt: '2026-07-18T12:00:00.000Z' },
+   126→  },
+   127→  {
+   128→    id: 'demo-pt-3',
+   129→    name: 'Точка Луговая',
+   130→    lat: 54.715,
+   131→    lon: 55.94,
+   132→    hiveCount: 6,
+   133→    hasSensor: false,
+   134→    sensorOn: false,
+   135→    sensor: { on: false, reason: 'none', tempC: null, humidityPct: null, weightKg: null, noiseDb: null, updatedAt: '2026-07-18T12:00:00.000Z' },
+   136→  },
+   137→]
+   138→
+   139→export const DEMO_CONTEXT: AgentContext = {
+   140→  hives,
+   141→  weather,
+   142→  weatherNow: { tempC: 24.6, feelsC: 24.1, humidityPct: 48, windKmh: 11, pressureMm: 752, text: 'Ясно, тепло', source: 'open-meteo' },
+   143→  pesticide: pesticideAlert,
+   144→  sites: migrationSites,
+   145→  points: DEMO_POINTS,
+   146→  apiaryName: apiary.name,
+   147→}
+   148→
+   149→/** Пустой контекст (реальная база без данных): агент честно говорит, чего не хватает. */
+   150→export function makeContext(hives_: Hive[], opts?: Partial<Omit<AgentContext, 'hives'>>): AgentContext {
+   151→  return {
+   152→    hives: hives_,
+   153→    weather: opts?.weather ?? null,
+   154→    weatherNow: opts?.weatherNow ?? null,
+   155→    pesticide: opts?.pesticide ?? null,
+   156→    sites: opts?.sites ?? [],
+   157→    points: opts?.points,
+   158→    apiaryName: opts?.apiaryName ?? 'Моя пасека',
+   159→  }
+   160→}
+   161→
+   162→/* ------------------------------------------------------------------ */
+   163→/* Метрики по рядам (безопасны к пропускам значений)                   */
+   164→/* ------------------------------------------------------------------ */
+   165→
+   166→function lastPoint(h: Hive) {
+   167→  return h.series[h.series.length - 1] ?? null
+   168→}
+   169→
+   170→function lastWeight(h: Hive): number | null {
+   171→  return lastPoint(h)?.weightKg ?? null
+   172→}
+   173→
+   174→/** Изменение веса за `backDays` календарных дней; null, если точек не хватает.
+   175→ *  Календарный поиск с допуском ±1,5 дня — корректен при пропусках дней. */
+   176→function weightDelta(h: Hive, backDays: number): number | null {
+   177→  const s = h.series
+   178→  if (s.length === 0) return null
+   179→  const lastPoint = s[s.length - 1]
+   180→  if (lastPoint.weightKg === null) return null
+   181→  const target = new Date(lastPoint.date).getTime() - backDays * 86400000
+   182→  let best: number | null = null
+   183→  let bestDiff = Infinity
+   184→  for (const p of s) {
+   185→    if (p.weightKg === null || p === lastPoint) continue
+   186→    const diff = Math.abs(new Date(p.date).getTime() - target)
+   187→    if (diff <= 1.5 * 86400000 && diff < bestDiff) {
+   188→      bestDiff = diff
+   189→      best = p.weightKg
+   190→    }
+   191→  }
+   192→  if (best === null) return null
+   193→  return Math.round((lastPoint.weightKg - best) * 10) / 10
+   194→}
+   195→
+   196→const delta2d = (h: Hive) => weightDelta(h, 2)
+   197→const delta30d = (h: Hive) => weightDelta(h, Math.min(29, Math.max(1, spanDays(h) - 1)))
+   198→
+   199→function maxTempRecent(h: Hive, n = 3): number | null {
+   200→  const temps = h.series.slice(-n).map((p) => p.tempInC).filter((t): t is number => t !== null)
+   201→  return temps.length ? Math.max(...temps) : null
+   202→}
+   203→
+   204→function lastHumidity(h: Hive): number | null {
+   205→  return lastPoint(h)?.humidityPct ?? null
+   206→}
+   207→
+   208→/** Лидер пасеки по 30-дневному привесу. */
+   209→function leaderOf(list: Hive[]): Hive | null {
+   210→  const withW = list.filter((x) => delta30d(x) !== null)
+   211→  if (!withW.length) return null
+   212→  return [...withW].sort((a, b) => (delta30d(b) ?? 0) - (delta30d(a) ?? 0))[0]
+   213→}
+   214→
+   215→/** Сколько дней охватывает ряд (для честных подписей «за N дн.»). */
+   216→function spanDays(h: Hive): number {
+   217→  if (h.series.length < 2) return h.series.length
+   218→  const a = new Date(h.series[0].date).getTime()
+   219→  const b = new Date(h.series[h.series.length - 1].date).getTime()
+   220→  if (Number.isNaN(a) || Number.isNaN(b)) return h.series.length
+   221→  return Math.round((b - a) / 86400000) + 1
+   222→}
+   223→
+   224→function periodLabel(h: Hive): string {
+   225→  const d = spanDays(h)
+   226→  if (d >= 25) return 'за месяц'
+   227→  if (d === 1) return 'за день'
+   228→  if (d === 0) return '—'
+   229→  return `за ${d} дн.`
+   230→}
+   231→
+   232→/** Порог срабатывания «падения веса» (признак возможного роения). */
+   233→const SWARM_DROP = -1.0
+   234→
+   235→function swarmProbability(drop: number): string {
+   236→  const p = drop <= -3 ? 80 : drop <= -2 ? 70 : drop <= -1.5 ? 62 : 55
+   237→  return `Вероятность подготовки к роению — около ${p} %`
+   238→}
+   239→
+   240→/* ------------------------------------------------------------------ */
+   241→/* Находки агента (карточки на дашборде)                               */
+   242→/* ------------------------------------------------------------------ */
+   243→
+   244→function hiveFinding(h: Hive, ctx: AgentContext): AgentFinding {
+   245→  const status = hiveStatus(h, ctx.hives)
+   246→  const d2 = delta2d(h)
+   247→  const d30 = delta30d(h)
+   248→  const t = lastPoint(h)?.tempInC ?? null
+   249→  const hum = lastHumidity(h)
+   250→
+   251→  if (h.series.length === 0 || (lastWeight(h) === null && t === null)) {
+   252→    return {
+   253→      id: `nodata-${h.id}`,
+   254→      scenario: 'status',
+   255→      hiveId: h.id,
+   256→      title: `Улей №${h.id}: пока нет данных`,
+   257→      text: `По улью №${h.id} в базе нет измерений. Я не буду гадать: как только появятся показания — загрузите их в разделе «Данные» (CSV, вручную или через API), и я сразу начну следить за весом, температурой и влажностью.`,
+   258→      basis: ['База данных платформы', 'Измерения улья №' + h.id],
+   259→      urgency: 'this-week',
+   260→      urgencyNote: 'Загрузить данные',
+   261→      probability: 'Оценка невозможна — данных нет',
+   262→      metrics: [{ label: 'Измерений', value: String(h.series.length) }],
+   263→      prefill: `Что происходит с ульем №${h.id}?`,
+   264→    }
+   265→  }
+   266→
+   267→  if (status.level === 'risk' && d2 !== null) {
+   268→    const peak = Math.max(...h.series.slice(-3).map((p) => p.weightKg ?? -Infinity))
+   269→    const now = lastWeight(h) ?? peak
+   270→    return {
+   271→      id: `swarm-${h.id}`,
+   272→      scenario: 'swarm',
+   273→      hiveId: h.id,
+   274→      title: 'Похоже, семья готовится к роению',
+   275→      text: `За последние 2 дня вес улья №${h.id} снизился на ${fmtNum(Math.abs(d2))} кг — с ${fmtNum(peak)} до ${fmtNum(now)} кг, хотя до этого семья стабильно набирала мед.${
+   276→        t !== null ? ` Температура внутри поднималась до ${fmtNum(t)} °C (норма около 34,5 °C).` : ''
+   277→      }${hum !== null ? ` Влажность держится на отметке ${fmtNum(hum, 0)} % — выше обычной для этого улья.` : ''} Июль — пик сезона роения: часть пчёл с маткой может улететь, и медосбор остановится на 2–3 недели.`,
+   278→      basis: [
+   279→        `График веса улья №${h.id}`,
+   280→        `Вес: ${fmtSigned(d2)} кг за 2 дня`,
+   281→        ...(t !== null ? [`Температура: ${fmtNum(t)} °C при норме 34,5 °C`] : []),
+   282→        'Сезон: июль — период роения',
+   283→      ],
+   284→      urgency: 'today',
+   285→      urgencyNote: 'Осмотреть улей сегодня до вечера',
+   286→      probability: swarmProbability(d2),
+   287→      metrics: [
+   288→        { label: 'Вес за 2 дня', value: `${fmtSigned(d2)} кг` },
+   289→        ...(t !== null ? [{ label: 'Темп. внутри', value: `${fmtNum(t)} °C` }] : []),
+   290→        ...(hum !== null ? [{ label: 'Влажность', value: `${fmtNum(hum, 0)} %` }] : []),
+   291→      ],
+   292→      prefill: `Что происходит с ульем №${h.id}?`,
+   293→    }
+   294→  }
+   295→
+   296→  if (status.level === 'watch' && h.label !== undefined) {
+   297→    const leader = leaderOf(ctx.hives)
+   298→    const reason = !h.humiditySensorOk && h.humidityOfflineFrom
+   299→      ? 'отдельно: датчик влажности не отвечает'
+   300→      : 'привес хуже, чем у лидера пасеки'
+   301→    return {
+   302→      id: `slow-${h.id}`,
+   303→      scenario: 'status',
+   304→      hiveId: h.id,
+   305→      title: 'Слабый набор веса',
+   306→      text: `Улей №${h.id} прибавил только ${fmtSigned(d30 ?? 0)} кг ${periodLabel(h)}${
+   307→        leader && leader.id !== h.id ? ` — у лидера (улей №${leader.id}) ${fmtSigned(delta30d(leader) ?? 0)} кг` : ''
+   308→      }. Температура${t !== null ? ` ${fmtNum(t)} °C` : ''} в норме. Причин может быть две: слабая семья или бедная кормовая база вокруг. ${reason.charAt(0).toUpperCase() + reason.slice(1)}${
+   309→        h.humidityOfflineFrom ? ` — молчит с ${h.humidityOfflineFrom}, возможно, сел аккумулятор` : ' — стоит сверить привес с соседними ульями'
+   310→      }.`,
+   311→      basis: [
+   312→        'Сравнение привеса по ульям пасеки',
+   313→        `Привес улья №${h.id}: ${fmtSigned(d30 ?? 0)} кг`,
+   314→        ...(h.humidityOfflineFrom ? [`Датчик влажности: нет данных с ${h.humidityOfflineFrom}`] : []),
+   315→      ],
+   316→      urgency: 'this-week',
+   317→      urgencyNote: 'Проверить датчик и семью в ближайшие дни',
+   318→      probability: 'Диагноз по косвенным признакам — нужна проверка',
+   319→      metrics: [
+   320→        { label: `Привес ${periodLabel(h)}`, value: `${fmtSigned(d30 ?? 0)} кг` },
+   321→        ...(leader && leader.id !== h.id
+   322→          ? [{ label: `У лидера (№${leader.id})`, value: `${fmtSigned(delta30d(leader) ?? 0)} кг` }]
+   323→          : []),
+   324→        ...(hum !== null ? [{ label: 'Влажность', value: `${fmtNum(hum, 0)} %` }] : [{ label: 'Влажность', value: 'нет данных' }]),
+   325→      ],
+   326→      prefill: `Почему в улье №${h.id} слабый привес?`,
+   327→    }
+   328→  }
+   329→
+   330→  return {
+   331→    id: `ok-${h.id}`,
+   332→    scenario: 'status',
+   333→    hiveId: h.id,
+   334→    title: 'Семья работает штатно',
+   335→    text: `Улей №${h.id} развивается штатно: вес ${fmtNum(lastWeight(h) ?? 0)} кг, привес ${fmtSigned(d30 ?? 0)} кг ${periodLabel(h)}, за последние 2 дня ${fmtSigned(d2 ?? 0)} кг.${
+   336→      t !== null ? ` Температура ${fmtNum(t)} °C — в норме.` : ''
+   337→    } Признаков роения нет: вес растёт ровно, без провалов.`,
+   338→    basis: [
+   339→      `График веса улья №${h.id}`,
+   340→      `Привес: ${fmtSigned(d30 ?? 0)} кг`,
+   341→      'Температура в норме семьи',
+   342→    ],
+   343→    urgency: 'ok',
+   344→    urgencyNote: 'Продолжать наблюдение',
+   345→    metrics: [
+   346→      { label: `Привес ${periodLabel(h)}`, value: `${fmtSigned(d30 ?? 0)} кг` },
+   347→      ...(t !== null ? [{ label: 'Темп. внутри', value: `${fmtNum(t)} °C` }] : []),
+   348→      ...(hum !== null ? [{ label: 'Влажность', value: `${fmtNum(hum, 0)} %` }] : []),
+   349→    ],
+   350→    prefill: `Что происходит с улье №${h.id}?`,
+   351→  }
+   352→}
+   353→
+   354→function pesticideFindingOf(ctx: AgentContext): AgentFinding | null {
+   355→  const a = ctx.pesticide
+   356→  if (!a) return null
+   357→  return {
+   358→    id: 'pesticide',
+   359→    scenario: 'pesticide',
+   360→    hiveId: null,
+   361→    title: `Обработка поля в ${fmtNum(a.distanceKm)} км — риск для пчёл`,
+   362→    text: `${a.dateLabel} поле ${a.crop} ${a.field} (${fmtNum(a.distanceKm)} км от пасеки) обработают химикатом, ${a.windNote}. Радиус продуктивного лёта пчёл — 3–5 км, поле попадает в зону сбора. Летящая на обработанное поле семья может потерять большинство лётных пчёл.`,
+   363→    basis: [
+   364→      'Координаты пасеки и поля — ГИС',
+   365→      `${a.source.charAt(0).toUpperCase() + a.source.slice(1)}: обработка ${a.dateLabel}`,
+   366→      `Расстояние ${fmtNum(a.distanceKm)} км — внутри радиуса разлёта`,
+   367→      'Прогноз ветра на день обработки',
+   368→    ],
+   369→    urgency: 'act-now',
+   370→    urgencyNote: 'До вечера 19 июля закрыть летки или вывезти пасеку',
+   371→    probability: 'Риск для семей — высокий',
+   372→    metrics: [
+   373→      { label: 'Расстояние', value: `${fmtNum(a.distanceKm)} км` },
+   374→      { label: 'Дата обработки', value: a.dateLabel },
+   375→      { label: 'Радиус лёта пчёл', value: '3–5 км' },
+   376→    ],
+   377→    prefill: 'Чем опасна обработка поля рядом и что делать?',
+   378→  }
+   379→}
+   380→
+   381→function weatherFindingOf(ctx: AgentContext): AgentFinding | null {
+   382→  const w = ctx.weather
+   383→  if (!w || w.length === 0) return null
+   384→  const good = w.filter((d) => d.flight === 'good')
+   385→  const bad = w.filter((d) => d.flight === 'bad')
+   386→  const tMax = Math.max(...w.map((d) => d.tMax))
+   387→  const rainProb = bad.length ? Math.max(...bad.map((d) => d.precipProb)) : 0
+   388→  return {
+   389→    id: 'weather',
+   390→    scenario: 'weather',
+   391→    hiveId: null,
+   392→    title: good.length
+   393→      ? `Окно лёта: ${good.map((d) => `${Number(d.date.slice(8))} ${monthGen(d.date)}`).join(', ').slice(0, 80)}`
+   394→      : 'Ближайшие дни — не для лёта',
+   395→    text: good.length
+   396→      ? `Ближайшие дни с хорошими условиями: ${good.map((d) => d.full).join(', ')} — до ${fmtSigned(tMax, 0)} °C, ветер до ${Math.max(...good.map((d) => d.windMs))} м/с, осадки маловероятны.${
+   397→          bad.length ? ` Затем, ${bad.map((d) => d.full).join(' и ')}, — дожди (до ${rainProb} %) и ветер до ${Math.max(...bad.map((d) => d.windMs))} м/с: пчёлы останутся в ульях, привес остановится.` : ''
+   398→        }`
+   399→      : `По прогнозу на неделю погода не летная: дожди и ветер. Пчёлы останутся в ульях, привес остановится — следите за запасами корма по графику веса.`,
+   400→    basis: ['Прогноз погоды платформы', 'Календарь цветения медоносов — ГИС'],
+   401→    urgency: 'ok',
+   402→    urgencyNote: good.length ? 'Использовать окно лёта' : 'Наблюдать за погодой',
+   403→    metrics: [
+   404→      { label: 'Максимум', value: `${fmtSigned(tMax, 0)} °C` },
+   405→      ...(bad.length ? [{ label: 'Дождь', value: `до ${rainProb} %` }] : []),
+   406→      ...(ctx.sites.length
+   407→        ? [{ label: 'Кандидатов кочёвки', value: String(ctx.sites.length) }]
+   408→        : []),
+   409→    ],
+   410→    prefill: 'Когда пчёлам лучше летать за взятком?',
+   411→  }
+   412→}
+   413→
+   414→function monthGen(date: string): string {
+   415→  // «2026-07-20» → «июля» (родительный падеж)
+   416→  const months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+   417→  const m = Number(date.slice(5, 7))
+   418→  return months[m - 1] ?? ''
+   419→}
+   420→
+   421→function migrationFindingOf(ctx: AgentContext): AgentFinding | null {
+   422→  const sites = [...ctx.sites].sort((a, b) => b.score - a.score)
+   423→  if (!sites.length) return null
+   424→  const best = sites[0]
+   425→  const worst = sites[sites.length - 1]
+   426→  return {
+   427→    id: 'migration',
+   428→    scenario: 'migration',
+   429→    hiveId: null,
+   430→    title: `Лучшее место для кочёвки — «${best.name}»`,
+   431→    text: `Сравнил ${sites.length} ${
+   432→      sites.length === 1 ? 'участок' : sites.length < 5 ? 'участка' : 'участков'
+   433→    } вокруг пасеки по 4 факторам: медоносы, погода, расстояние и риски. Лучший — «${best.name}»: ${best.honeyPlant.toLowerCase()} цветёт ${best.bloomWindow}, ${fmtNum(best.distanceKm)} км от пасеки, погода: ${best.weatherNote.toLowerCase()}.${
+   434→      best.risks ? ` Учтите: ${best.risks.toLowerCase()}.` : ''
+   435→    }${sites.length > 1 && worst.verdict === 'avoid' ? ` «${worst.name.replace(/^Донниковое поле \(/, '').replace(/\)$/, '')}» не советую: ${worst.risks.toLowerCase() || 'низкая оценка участка'}.` : ''}`,
+   436→    basis: ['ГИС: медоносы и расстояния', 'Прогноз погоды по участкам', 'Реестр обработок полей'],
+   437→    urgency: 'this-week',
+   438→    urgencyNote: 'Решить до начала цветения',
+   439→    metrics: [
+   440→      { label: 'Лучший участок', value: `${fmtNum(best.score)} / 10` },
+   441→      { label: 'Расстояние', value: `${fmtNum(best.distanceKm)} км` },
+   442→      { label: 'Цветение', value: best.bloomWindow },
+   443→    ],
+   444→    prefill: 'Куда перевезти пасеку?',
+   445→  }
+   446→}
+   447→
+   448→/** Список находок: по выбранному улью + глобальные сценарии, отсортированы по срочности. */
+   449→export function findingsFor(hiveId: number, ctx: AgentContext = DEMO_CONTEXT): AgentFinding[] {
+   450→  const hive = ctx.hives.find((x) => x.id === hiveId) ?? ctx.hives[0]
+   451→  const list: AgentFinding[] = []
+   452→  if (hive) list.push(hiveFinding(hive, ctx))
+   453→  const pesticide = pesticideFindingOf(ctx)
+   454→  if (pesticide) list.push(pesticide)
+   455→  const weatherF = weatherFindingOf(ctx)
+   456→  if (weatherF) list.push(weatherF)
+   457→  const migrationF = migrationFindingOf(ctx)
+   458→  if (migrationF) list.push(migrationF)
+   459→  const rank: Record<Urgency, number> = { 'act-now': 0, today: 1, 'this-week': 2, ok: 3 }
+   460→  return list.sort((a, b) => rank[a.urgency] - rank[b.urgency])
+   461→}
+   462→
+   463→/* ------------------------------------------------------------------ */
+   464→/* Ответы на вопросы пчеловода                                         */
+   465→/* ------------------------------------------------------------------ */
+   466→
+   467→function norm(s: string): string {
+   468→  return s.toLowerCase().replace(/ё/g, 'е')
+   469→}
+   470→
+   471→function extractHiveId(q: string, ctx: AgentContext): number | null {
+   472→  const m = q.match(/(?:№|улье|улья|улью|улье|hive)\s*№?\s*(\d+)/)
+   473→  if (!m) return null
+   474→  const id = Number(m[1])
+   475→  return ctx.hives.some((h) => h.id === id) ? id : null
+   476→}
+   477→
+   478→function swarmAnswer(h: Hive, ctx: AgentContext): AgentMessage {
+   479→  const status = hiveStatus(h, ctx.hives)
+   480→  const d2 = delta2d(h)
+   481→  const t = lastPoint(h)?.tempInC ?? null
+   482→  const hum = lastHumidity(h)
+   483→
+   484→  if (h.series.length === 0 || (lastWeight(h) === null && d2 === null)) {
+   485→    return {
+   486→      scenario: 'swarm',
+   487→      hiveId: h.id,
+   488→      text: `Честный ответ: по улью №${h.id} нет данных о весе — оценить риск роения я не могу. Загрузите показания в разделе «Данные» (CSV, ручной ввод или API), и я начну следить за привесом: именно резкое падение веса при тёплой погоде выдаёт подготовку к роению.\n\nПока могу напомнить признаки для ручного осмотра: маточники по краям рамок и «борода» из пчёл на летке.`,
+   489→      basis: ['База данных платформы', 'Измерения улья №' + h.id],
+   490→      urgency: 'this-week',
+   491→      urgencyNote: 'Загрузить данные',
+   492→      probability: 'Оценка невозможна — данных нет',
+   493→      metrics: [{ label: 'Данные веса', value: 'нет' }],
+   494→    }
+   495→  }
+   496→
+   497→  if (status.level === 'risk' && d2 !== null) {
+   498→    const peak = Math.max(...h.series.slice(-3).map((p) => p.weightKg ?? -Infinity))
+   499→    const now = lastWeight(h) ?? peak
+   500→    return {
+   501→      scenario: 'swarm',
+   502→      hiveId: h.id,
+   503→      text: `Да, риск высокий. За последние 2 дня вес улья №${h.id} упал на ${fmtNum(Math.abs(d2))} кг (с ${fmtNum(peak)} до ${fmtNum(now)} кг) при том, что до этого шёл устойчивый привес.${
+   504→        t !== null ? ` Внутри стало теплее нормы: ${fmtNum(t)} °C вместо обычных 34,5 °C.` : ''
+   505→      }${hum !== null ? ` Влажность выросла до ${fmtNum(hum, 0)} %.` : ''} Июль — пик сезона роения. Похоже, семья готовится делиться.\n\nОсмотрите улей сегодня: признаки роения — маточники по краям рамок и «борода» из пчёл на летке. Если подтверждается, отройте рой вечером или расширьте гнездо вощиной.`,
+   506→      basis: [
+   507→        `График веса улья №${h.id}`,
+   508→        `Вес: ${fmtSigned(d2)} кг за 2 дня`,
+   509→        ...(t !== null ? [`Температура: ${fmtNum(t)} °C (норма 34,5 °C)`] : []),
+   510→        'Сезон: июль — период роения',
+   511→      ],
+   512→      urgency: 'today',
+   513→      urgencyNote: 'Осмотреть улей сегодня',
+   514→      probability: swarmProbability(d2),
+   515→      metrics: [
+   516→        { label: 'Вес за 2 дня', value: `${fmtSigned(d2)} кг` },
+   517→        ...(t !== null ? [{ label: 'Темп. внутри', value: `${fmtNum(t)} °C` }] : []),
+   518→        ...(hum !== null ? [{ label: 'Влажность', value: `${fmtNum(hum, 0)} %` }] : []),
+   519→      ],
+   520→    }
+   521→  }
+   522→
+   523→  return {
+   524→    scenario: 'swarm',
+   525→    hiveId: h.id,
+   526→    text: `Выраженных признаков роения в улье №${h.id} не вижу: вес растёт ровно (за 2 дня ${fmtSigned(d2 ?? 0)} кг), температура${t !== null ? ` ${fmtNum(t)} °C` : ''} — в норме. Провалов веса, как это бывает перед роением, на графике нет.\n\nЧто делаю: продолжаю сравнивать вес и температуру за каждый день. Если появится резкий привес с последующим падением — сразу предупрежу.`,
+   527→    basis: [
+   528→      `График веса улья №${h.id}`,
+   529→      'Сравнение с признаками роения',
+   530→      'Температура в норме семьи',
+   531→    ],
+   532→    urgency: 'ok',
+   533→    urgencyNote: 'Наблюдать, сигнал придёт при изменениях',
+   534→    probability: 'Признаков роения сейчас нет',
+   535→    metrics: [
+   536→      { label: 'Вес за 2 дня', value: `${fmtSigned(d2 ?? 0)} кг` },
+   537→      ...(t !== null ? [{ label: 'Темп. внутри', value: `${fmtNum(t)} °C` }] : []),
+   538→      { label: 'Влажность', value: hum !== null ? `${fmtNum(hum, 0)} %` : 'нет данных' },
+   539→    ],
+   540→  }
+   541→}
+   542→
+   543→function statusAnswer(h: Hive, ctx: AgentContext): AgentMessage {
+   544→  const status = hiveStatus(h, ctx.hives)
+   545→  const d2 = delta2d(h)
+   546→  const d30 = delta30d(h)
+   547→  const t = lastPoint(h)?.tempInC ?? null
+   548→  const hum = lastHumidity(h)
+   549→  const w = lastWeight(h)
+   550→
+   551→  if (h.series.length === 0) {
+   552→    return {
+   553→      scenario: 'status',
+   554→      hiveId: h.id,
+   555→      text: `По улью №${h.id} данных в базе пока нет — честно говорю: состояние семьи я оценить не могу. Загрузите телеметрию в разделе «Данные» или внесите показание вручную. Как только появятся измерения, я начну сравнивать привес с другими ульями и следить за климатом.`,
+   556→      basis: ['База данных платформы'],
+   557→      urgency: 'this-week',
+   558→      urgencyNote: 'Загрузить данные',
+   559→      probability: 'Данных недостаточно',
+   560→      metrics: [{ label: 'Измерений', value: '0' }],
+   561→    }
+   562→  }
+   563→
+   564→  if (status.level === 'risk' && d2 !== null) {
+   565→    const peak = Math.max(...h.series.slice(-3).map((p) => p.weightKg ?? -Infinity))
+   566→    return {
+   567→      scenario: 'swarm',
+   568→      hiveId: h.id,
+   569→      text: `С улеем №${h.id} не всё спокойно. Два дня назад вес достиг пика ${fmtNum(peak)} кг, а сейчас — ${fmtNum(w ?? 0)} кг: падение на ${fmtNum(Math.abs(d2))} кг при том, что остальные ульи продолжают набирать мед.${
+   570→        t !== null ? ` Температура внутри выше нормы (${fmtNum(t)} °C).` : ''
+   571→      } Сезон — июль, время роения.\n\nРекомендую осмотреть улей сегодня: проверить маточники и «бороду» пчёл на летке. Это вероятностная оценка, окончательное решение за вами.`,
+   572→      basis: [
+   573→        `График веса улья №${h.id}`,
+   574→        `Вес: ${fmtSigned(d2)} кг за 2 дня`,
+   575→        ...(t !== null ? ['Температура выше нормы семьи'] : []),
+   576→        'Сезон: июль — период роения',
+   577→      ],
+   578→      urgency: 'today',
+   579→      urgencyNote: 'Осмотреть сегодня',
+   580→      probability: swarmProbability(d2),
+   581→      metrics: [
+   582→        { label: 'Вес сейчас', value: `${fmtNum(w ?? 0)} кг` },
+   583→        { label: 'Вес за 2 дня', value: `${fmtSigned(d2)} кг` },
+   584→        ...(t !== null ? [{ label: 'Темп. внутри', value: `${fmtNum(t)} °C` }] : []),
+   585→      ],
+   586→    }
+   587→  }
+   588→
+   589→  if (status.level === 'watch') {
+   590→    const leader = leaderOf(ctx.hives)
+   591→    return {
+   592→      scenario: 'status',
+   593→      hiveId: h.id,
+   594→      text: `Улей №${h.id} жив, но развивается медленно: привес ${fmtSigned(d30 ?? 0)} кг ${periodLabel(h)}${
+   595→        leader && leader.id !== h.id ? ` — хуже, чем у лидера (улей №${leader.id}: ${fmtSigned(delta30d(leader) ?? 0)} кг)` : ''
+   596→      }. Температура${t !== null ? ` ${fmtNum(t)} °C` : ''} в норме, резких провалов нет. Похоже на слабую семью или бедную кормовую базу вокруг.\n\n${
+   597→        !h.humiditySensorOk && h.humidityOfflineFrom
+   598→          ? `Важно и честно: датчик влажности в этом улье не отвечает с ${h.humidityOfflineFrom} — возможно, сел аккумулятор. Проверьте датчик и загляните в улей в ближайшие дни.`
+   599→          : 'Загляните в улей в ближайшие дни и сверьте привес с соседними семьями.'
+   600→      }`,
+   601→      basis: [
+   602→        'Сравнение привеса по ульям пасеки',
+   603→        ...(h.humidityOfflineFrom ? [`Датчик влажности: нет данных с ${h.humidityOfflineFrom}`] : []),
+   604→        'Температура в норме',
+   605→      ],
+   606→      urgency: 'this-week',
+   607→      urgencyNote: 'Проверить семью в ближайшие дни',
+   608→      probability: 'Оценка по косвенным признакам',
+   609→      metrics: [
+   610→        { label: `Привес ${periodLabel(h)}`, value: `${fmtSigned(d30 ?? 0)} кг` },
+   611→        ...(leader && leader.id !== h.id
+   612→          ? [{ label: `У лидера (№${leader.id})`, value: `${fmtSigned(delta30d(leader) ?? 0)} кг` }]
+   613→          : []),
+   614→        { label: 'Влажность', value: hum !== null ? `${fmtNum(hum, 0)} %` : 'нет данных' },
+   615→      ],
+   616→    }
+   617→  }
+   618→
+   619→  return {
+   620→    scenario: 'status',
+   621→    hiveId: h.id,
+   622→    text: `С улеем №${h.id} всё в порядке: вес ${fmtNum(w ?? 0)} кг, привес ${fmtSigned(d30 ?? 0)} кг ${periodLabel(h)}, за последние 2 дня ${fmtSigned(d2 ?? 0)} кг. Температура${t !== null ? ` ${fmtNum(t)} °C` : ''} и влажность${hum !== null ? ` ${fmtNum(hum, 0)} %` : ''} в норме. Семья активно работает на медосборе.`,
+   623→    basis: [
+   624→      `График веса улья №${h.id}`,
+   625→      `Привес: ${fmtSigned(d30 ?? 0)} кг`,
+   626→      'Температура и влажность в норме',
+   627→    ],
+   628→    urgency: 'ok',
+   629→    urgencyNote: 'Продолжать наблюдение',
+   630→    metrics: [
+   631→      { label: 'Вес сейчас', value: `${fmtNum(w ?? 0)} кг` },
+   632→      { label: 'Привес месяц', value: `${fmtSigned(d30 ?? 0)} кг` },
+   633→      ...(t !== null ? [{ label: 'Темп. внутри', value: `${fmtNum(t)} °C` }] : []),
+   634→    ],
+   635→  }
+   636→}
+   637→
+   638→function weightAnswer(h: Hive, ctx: AgentContext): AgentMessage {
+   639→  const d2 = delta2d(h)
+   640→  const d30 = delta30d(h)
+   641→  const w = lastWeight(h)
+   642→  const risky = d2 !== null && d2 <= SWARM_DROP
+   643→
+   644→  if (h.series.length === 0 || w === null) {
+   645→    return {
+   646→      scenario: 'status',
+   647→      hiveId: h.id,
+   648→      text: `По весу улья №${h.id} данных пока нет — не буду называть цифр. Внесите показание вручную в разделе «Данные» или загрузите CSV: после этого я покажу вес, привес за 2 дня и за месяц и сравню с остальными ульями.`,
+   649→      basis: ['База данных платформы'],
+   650→      urgency: 'this-week',
+   651→      urgencyNote: 'Загрузить данные',
+   652→      probability: 'Данных недостаточно',
+   653→      metrics: [{ label: 'Вес', value: 'нет данных' }],
+   654→    }
+   655→  }
+   656→
+   657→  const others = ctx.hives
+   658→    .map((x) => ({ x, d: delta30d(x) }))
+   659→    .filter((o): o is { x: Hive; d: number } => o.d !== null)
+   660→    .map((o) => `№${o.x.id} — ${fmtSigned(o.d)} кг`)
+   661→    .join(', ')
+   662→
+   663→  return {
+   664→    scenario: 'status',
+   665→    hiveId: h.id,
+   666→    text: `Вес улья №${h.id} сейчас ${fmtNum(w)} кг. За последние 2 дня ${fmtSigned(d2 ?? 0)} кг, ${periodLabel(h)} ${fmtSigned(d30 ?? 0)} кг.${risky ? ` Настораживает само падение веса при тёплой погоде.` : ''}\n\nДля сравнения по пасеке: ${others || 'весов с данными больше нет'}. Набор веса — главный признак медосбора: резкое падение при растущей температуре часто означает начало роения.`,
+   667→    basis: [
+   668→      `График веса улья №${h.id}`,
+   669→      'Привес всех ульёв пасеки',
+   670→      'Правило: привес = интенсивность медосбора',
+   671→    ],
+   672→    urgency: risky ? 'today' : 'ok',
+   673→    urgencyNote: risky ? 'Проверить улей сегодня' : 'Наблюдать',
+   674→    probability: risky ? 'Совпадает с признаками роения' : undefined,
+   675→    metrics: [
+   676→      { label: 'Вес сейчас', value: `${fmtNum(w)} кг` },
+   677→      { label: 'За 2 дня', value: `${fmtSigned(d2 ?? 0)} кг` },
+   678→      { label: periodLabel(h).charAt(0).toUpperCase() + periodLabel(h).slice(1), value: `${fmtSigned(d30 ?? 0)} кг` },
+   679→    ],
+   680→  }
+   681→}
+   682→
+   683→function humidityAnswer(h: Hive): AgentMessage {
+   684→  const hum = lastHumidity(h)
+   685→  const offline = !h.humiditySensorOk && h.humidityOfflineFrom
+   686→
+   687→  if (h.series.length === 0) {
+   688→    return {
+   689→      scenario: 'status',
+   690→      hiveId: h.id,
+   691→      text: `По улью №${h.id} измерений в базе нет — про влажность ответить честно не могу: данных ноль. Загрузите показания датчика влажности в разделе «Данные», и я оценю, комфортно ли семье (норма для летнего улья — 50–66 %).`,
+   692→      basis: ['База данных платформы'],
+   693→      urgency: 'this-week',
+   694→      urgencyNote: 'Загрузить данные',
+   695→      probability: 'Данных недостаточно',
+   696→      metrics: [{ label: 'Влажность', value: 'нет данных' }],
+   697→    }
+   698→  }
+   699→
+   700→  if (offline || hum === null) {
+   701→    const t = lastPoint(h)?.tempInC
+   702→    const d30 = delta30d(h)
+   703→    return {
+   704→      scenario: 'status',
+   705→      hiveId: h.id,
+   706→      text: `Честный ответ: данных по влажности улья №${h.id} нет — датчик передаёт прочерки${h.humidityOfflineFrom ? ` с ${h.humidityOfflineFrom}` : ''}. Вероятно, сбой питания или разряд аккумулятора. Гадать не буду: совета по влажности дать не могу.\n\nЧто видно по остальным датчикам: привес ${fmtSigned(delta30d(h) ?? 0)} кг ${periodLabel(h)}, температура${t !== null ? ` ${fmtNum(t)} °C` : ''}. Рекомендую проверить датчик, а заодно осмотреть семью.`,
+   707→      basis: [
+   708→        `Датчик влажности улья №${h.id}: нет данных${h.humidityOfflineFrom ? ` с ${h.humidityOfflineFrom}` : ''}`,
+   709→        `Привес: ${fmtSigned(d30 ?? 0)} кг ${periodLabel(h)}`,
+   710→      ],
+   711→      urgency: 'this-week',
+   712→      urgencyNote: 'Проверить датчик',
+   713→      probability: 'Данных недостаточно — это честный ответ',
+   714→      metrics: [
+   715→        { label: 'Влажность', value: 'нет данных' },
+   716→        { label: 'Привес месяц', value: `${fmtSigned(d30 ?? 0)} кг` },
+   717→        ...(t !== null ? [{ label: 'Темп. внутри', value: `${fmtNum(t)} °C` }] : []),
+   718→      ],
+   719→    }
+   720→  }
+   721→
+   722→  const verdict =
+   723→    hum > 70
+   724→      ? 'выше комфортной зоны — в улье сыро, стоит улучшить вентиляцию'
+   725→      : hum > 64
+   726→        ? 'ближе к верхней границе нормы — понаблюдайте при следующем осмотре'
+   727→        : 'в комфортной зоне для семьи и созревания мёда'
+   728→  return {
+   729→    scenario: 'status',
+   730→    hiveId: h.id,
+   731→    text: `Влажность в улье №${h.id} — ${fmtNum(hum, 0)} %, ${verdict}. Норма для летнего улья — 50–66 %. Показатель считывается датчиком дважды в сутки.`,
+   732→    basis: [`Датчик влажности улья №${h.id}`, 'Норма: 50–66 %'],
+   733→    urgency: hum > 70 ? 'today' : 'ok',
+   734→    urgencyNote: hum > 70 ? 'Улучшить вентиляцию' : 'Наблюдать',
+   735→    metrics: [
+   736→      { label: 'Влажность', value: `${fmtNum(hum, 0)} %` },
+   737→      { label: 'Норма', value: '50–66 %' },
+   738→    ],
+   739→  }
+   740→}
+   741→
+   742→function climateAnswer(h: Hive): AgentMessage {
+   743→  const t = lastPoint(h)?.tempInC ?? null
+   744→  const risky = hiveStatus(h, hiveStatusArgFallback(h)).level === 'risk'
+   745→
+   746→  if (t === null) {
+   747→    return {
+   748→      scenario: 'status',
+   749→      hiveId: h.id,
+   750→      text: `Данных о температуре в улье №${h.id} пока нет — честно: ответить не могу. Добавьте показания датчика температуры в разделе «Данные». Норма для семьи с расплодом — около 34,5 °C: как только появятся измерения, я сравню ваши цифры с нормой.`,
+   751→      basis: ['База данных платформы'],
+   752→      urgency: 'this-week',
+   753→      urgencyNote: 'Загрузить данные',
+   754→      probability: 'Данных недостаточно',
+   755→      metrics: [{ label: 'Темп. внутри', value: 'нет данных' }],
+   756→    }
+   757→  }
+   758→
+   759→  return {
+   760→    scenario: risky ? 'swarm' : 'status',
+   761→    hiveId: h.id,
+   762→    text: risky
+   763→      ? `Температура в улье №${h.id} — ${fmtNum(t)} °C, это на ${fmtNum(t - 34.5)} °C выше нормы семьи (34,5 °C). Само по себе потепление в жару нормально, но вместе с падением веса это похоже на подготовку к роению: пчёлы поднимают температуру, когда готовятся делиться.`
+   764→      : `Температура в улье №${h.id} — ${fmtNum(t)} °C, в норме для семьи с расплодом (около 34,5 °C). Датчик пишет значение дважды в сутки, резких скачков за неделю не было.`,
+   765→    basis: [
+   766→      `Датчик температуры улья №${h.id}`,
+   767→      'Норма семьи: около 34,5 °C',
+   768→      ...(risky ? ['Совместный анализ: температура + падение веса'] : []),
+   769→    ],
+   770→    urgency: risky ? 'today' : 'ok',
+   771→    urgencyNote: risky ? 'Осмотреть сегодня' : 'Наблюдать',
+   772→    probability: risky ? 'Совместный анализ температуры и веса' : undefined,
+   773→    metrics: [
+   774→      { label: 'Темп. сейчас', value: `${fmtNum(t)} °C` },
+   775→      { label: 'Норма', value: '34,5 °C' },
+   776→    ],
+   777→  }
+   778→}
+   779→
+   780→/** Для climateAnswer статус проверяется по одному улью без сравнения с пасекой. */
+   781→function hiveStatusArgFallback(h: Hive): Hive[] {
+   782→  return [h]
+   783→}
+   784→
+   785→function pesticideAnswer(ctx: AgentContext): AgentMessage {
+   786→  const a = ctx.pesticide
+   787→  if (!a) {
+   788→    return {
+   789→      scenario: 'pesticide',
+   790→      hiveId: null,
+   791→      text: `Честный ответ: реестр обработок полей к этой пасеке не подключён, и я не вижу запланированных обработок вокруг. Если вы сами узнали об обработке рядом, напишите дату и расстояние — подскажу протокол защиты семей.\n\nОбщие правила на такой случай: вечером накануне закрыть летки или вывезти пасеку за 7+ км от поля, уточнить препарат у агронома и ждать 24–48 часов, пока он высохнет.`,
+   792→      basis: ['Реестр обработок: не подключён'],
+   793→      urgency: 'ok',
+   794→      urgencyNote: 'Источник данных не подключён',
+   795→      probability: 'Данных недостаточно',
+   796→      metrics: [{ label: 'Реестр обработок', value: 'нет данных' }],
+   797→    }
+   798→  }
+   799→  return {
+   800→    scenario: 'pesticide',
+   801→    hiveId: null,
+   802→    text: `${a.dateLabel} поле ${a.crop} ${a.field} обработают химикатом. Поле в ${fmtNum(a.distanceKm)} км от пасеки — внутри радиуса продуктивного лёта (3–5 км), а ${a.windNote}. Пчёлы могут принести отравленный нектар и погибнуть — под угрозой все семьи.\n\nЧто делать: вечером накануне закрыть летки, если увозить пасеку не вариант, либо вывезти улья за 7+ км от поля. Уточните точное время обработки у агронома хозяйства и дождитесь, пока препарат высохнет, — обычно это 24–48 часов.`,
+   803→    basis: [
+   804→      'Координаты пасеки и поля — ГИС',
+   805→      `${a.source.charAt(0).toUpperCase() + a.source.slice(1)}: обработка ${a.dateLabel}`,
+   806→      'Радиус продуктивного лёта пчёл: 3–5 км',
+   807→      'Прогноз ветра на день обработки',
+   808→    ],
+   809→    urgency: 'act-now',
+   810→    urgencyNote: `Действовать до ${a.dateShort}`,
+   811→    probability: 'Риск для семей — высокий',
+   812→    metrics: [
+   813→      { label: 'Поле', value: `${a.crop}, ${fmtNum(a.distanceKm)} км` },
+   814→      { label: 'Обработка', value: a.dateLabel },
+   815→      { label: 'Ветер', value: 'в сторону пасеки' },
+   816→    ],
+   817→  }
+   818→}
+   819→
+   820→function weatherAnswer(ctx: AgentContext): AgentMessage {
+   821→  const w = ctx.weather
+   822→  if (!w || w.length === 0) {
+   823→    return {
+   824→      scenario: 'weather',
+   825→      hiveId: null,
+   826→      text: `Честный ответ: прогноз погоды к пасеке не подключён, поэтому окна лёта я показать не могу. Могу подсказать правило: активный лёт — при +18…+28 °C и ветре до 5–6 м/с, без дождя; в дождь пчёлы сидят в ульях и привес стоит.\n\nОриентируйтесь на график веса: дни с хорошим привесом — и есть «погода для взятка». Если подключите источник погоды — сразу добавлю прогноз в советы.`,
+   827→      basis: ['Прогноз погоды: не подключён', 'График веса как косвенный признак'],
+   828→      urgency: 'ok',
+   829→      urgencyNote: 'Источник данных не подключён',
+   830→      probability: 'Данных недостаточно',
+   831→      metrics: [{ label: 'Прогноз', value: 'нет данных' }],
+   832→    }
+   833→  }
+   834→  const good = w.filter((d) => d.flight === 'good')
+   835→  const bad = w.filter((d) => d.flight === 'bad')
+   836→  const days = (arr: WeatherDay[]) => arr.map((d) => d.full).join(', ')
+   837→  return {
+   838→    scenario: 'weather',
+   839→    hiveId: null,
+   840→    text: good.length
+   841→      ? `Лучшие дни для лёта — ${days(good)}: до ${fmtSigned(Math.max(...good.map((d) => d.tMax)), 0)} °C, ветер до ${Math.max(...good.map((d) => d.windMs))} м/с, осадки маловероятны. ${
+   842→          bad.length ? `${days(bad)} — дожди (до ${Math.max(...bad.map((d) => d.precipProb))} %) и ветер до ${Math.max(...bad.map((d) => d.windMs))} м/с: лёта почти не будет, привес остановится.` : ''
+   843→        }\n\nВ дождевые дни проверьте вентиляцию и не открывайте ульи без нужды. По плечу ли семьям запасы — подскажет привес на графике.`
+   844→      : `По прогнозу на неделю погода не летная: дожди и ветер. Пчёлы останутся в ульях, привес остановится — проследите, чтобы у семей был запас корма.`,
+   845→    basis: [
+   846→      'Прогноз погоды платформы',
+   847→      'Календарь цветения медоносов — ГИС',
+   848→      'Правило: привес = интенсивность лёта',
+   849→    ],
+   850→    urgency: 'ok',
+   851→    urgencyNote: good.length ? 'Использовать окно лёта' : 'Наблюдать',
+   852→    metrics: [
+   853→      ...(good.length ? [{ label: 'Окно лёта', value: good[0].full }] : []),
+   854→      ...(bad.length ? [{ label: 'Дождь', value: `до ${Math.max(...bad.map((d) => d.precipProb))} %` }] : []),
+   855→    ],
+   856→  }
+   857→}
+   858→
+   859→function migrationAnswer(ctx: AgentContext): AgentMessage {
+   860→  const sites = [...ctx.sites].sort((a, b) => b.score - a.score)
+   861→  if (!sites.length) {
+   862→    return {
+   863→      scenario: 'migration',
+   864→      hiveId: null,
+   865→      text: `Честно: в справочнике пасеки пока нет участков для кочёвки, сравнивать нечего. Добавьте места в разделе «Данные» — медонос, сроки цветения, расстояние и риски. После этого я сравню их по 4 факторам и порекомендую лучший.\n\nКак оцениваю участки: медоносы и сроки цветения (ГИС), погода на дни кочёвки, расстояние и качество дороги, отсутствие обработок полей рядом.`,
+   866→      basis: ['Справочник площадок: пуст'],
+   867→      urgency: 'this-week',
+   868→      urgencyNote: 'Добавить участки в справочник',
+   869→      probability: 'Данных недостаточно',
+   870→      metrics: [{ label: 'Площадок', value: '0' }],
+   871→    }
+   872→  }
+   873→  const best = sites[0]
+   874→  const worst = sites[sites.length - 1]
+   875→  return {
+   876→    scenario: 'migration',
+   877→    hiveId: null,
+   878→    text: `Сравнил ${sites.length} ${
+   879→      sites.length === 1 ? 'участок' : sites.length < 5 ? 'участка' : 'участков'
+   880→    } вокруг пасеки по 4 факторам: медоносы, погода, расстояние, риски.\n\nЛучший выбор — «${best.name}»: ${best.honeyPlant.toLowerCase()} цветёт ${best.bloomWindow}, ${fmtNum(best.distanceKm)} км от пасеки, погода: ${best.weatherNote.toLowerCase()}.${
+   881→      best.risks ? ` Учтите риск: ${best.risks.toLowerCase()}.` : ''
+   882→    }${sites.length > 1 ? `\n\n${sites.slice(1).map((s) => `«${s.name}» — ${fmtNum(s.score)} / 10${s.verdict === 'avoid' ? ', не советую' : ''}`).join('; ')}.` : ''}${
+   883→      worst.verdict === 'avoid' && worst.risks ? ` «${worst.name.replace(/^Донниковое поле \(/, '').replace(/\)$/, '')}»: ${worst.risks.toLowerCase()}.` : ''
+   884→    }\n\nПеревозку лучше планировать на вечер — семьи спокойнее переносят дорогу.`,
+   885→    basis: [
+   886→      'ГИС: медоносы и расстояния',
+   887→      'Прогноз погоды по участкам',
+   888→      'Реестр обработок полей',
+   889→    ],
+   890→    urgency: 'this-week',
+   891→    urgencyNote: 'Решить до начала цветения',
+   892→    metrics: [
+   893→      { label: 'Лучший участок', value: `«${best.name}»` },
+   894→      { label: 'Оценка', value: `${fmtNum(best.score)} / 10` },
+   895→      { label: 'Цветение', value: best.bloomWindow },
+   896→    ],
+   897→  }
+   898→}
+   899→
+   900→function greetingAnswer(ctx: AgentContext): AgentMessage {
+   901→  const withData = ctx.hives.filter((h) => h.series.length > 0).length
+   902→  if (ctx.hives.length === 0 || withData === 0) {
+   903→    return {
+   904→      scenario: 'status',
+   905→      hiveId: null,
+   906→      text: `Здравствуйте! Я цифровой помощник пасеки${ctx.apiaryName ? ` «${ctx.apiaryName}»` : ''}. В базе пока нет телеметрии — честно об этом говорю. Загрузите показания в разделе «Данные»: файлом CSV, вручную через форму или автоматически через API-эндпоинт. После этого я начну следить за весом, температурой и влажностью каждого улья, предупреждать о риске роения и плохой погоде.\n\nПринципы у меня такие: показываю, на какие данные опираюсь; если данных не хватает — говорю прямо; даю вероятность и уровень риска, а решение принимает пчеловод.`,
+   907→      basis: ['База данных платформы'],
+   908→      urgency: 'ok',
+   909→      urgencyNote: 'Жду данные',
+   910→      metrics: [{ label: 'Ульев с данными', value: `0 из ${ctx.hives.length || 0}` }],
+   911→    }
+   912→  }
+   913→  return {
+   914→    scenario: 'status',
+   915→    hiveId: null,
+   916→    text: `Здравствуйте! Я цифровой помощник пасеки${ctx.apiaryName ? ` «${ctx.apiaryName}»` : ''}. Слежу сразу за ${ctx.hives.length} ${
+   917→      ctx.hives.length === 1 ? 'ульем' : 'ульями'
+   918→    } — весом, температурой и влажностью, — проверяю датчики на карте и сверяюсь с${ctx.weather ? ' прогнозом погоды,' : ''}${ctx.pesticide ? ' предупреждениями об обработках,' : ''} картой полей и справочником кочёвки. Отвечаю только о погоде и ульях. Спрашивайте обычными словами, например:\n\n• «Как дела на всех ульях?»\n• «Какая сейчас погода?»\n• «Что показывают датчики?»\n• «Есть ли риск роения?»`,
+   919→    basis: [
+   920→      `Телеметрия: ${withData} из ${ctx.hives.length} ульев`,
+   921→      ...(ctx.weather ? ['Прогноз погоды'] : []),
+   922→      ...(ctx.pesticide ? ['Реестр обработок'] : []),
+   923→      ...(ctx.sites.length ? [`Справочник кочёвки: ${ctx.sites.length} площадок`] : []),
+   924→    ],
+   925→    urgency: 'ok',
+   926→    urgencyNote: 'Готов отвечать',
+   927→    metrics: [{ label: 'Ульев с данными', value: `${withData} из ${ctx.hives.length}` }],
+   928→  }
+   929→}
+   930→
+   931→/** Короткая фраза про активные датчики точек на карте (для общих ответов). */
+   932→function pointsSummary(ctx: AgentContext): string | null {
+   933→  const pts = (ctx.points ?? []).filter((p) => p.sensor.on && p.sensor.tempC !== null)
+   934→  if (!pts.length) return null
+   935→  return pts
+   936→    .map(
+   937→      (p) =>
+   938→        `«${p.name}» (${p.hiveCount} улей на точке): +${fmtNum(p.sensor.tempC ?? 0)} °C, влажность ${fmtNum(p.sensor.humidityPct ?? 0, 0)} %, вес ${fmtNum(p.sensor.weightKg ?? 0)} кг, шум ${fmtNum(p.sensor.noiseDb ?? 0, 0)} дБ`,
+   939→    )
+   940→    .join('; ')
+   941→}
+   942→
+   943→/** Сводка сразу по всем ульям — ответ на общий вопрос о пасеке. */
+   944→function allHivesAnswer(ctx: AgentContext): AgentMessage {
+   945→  const withData = ctx.hives.filter((h) => h.series.length > 0).length
+   946→  const lines = ctx.hives.map((h) => {
+   947→    const st = hiveStatus(h, ctx.hives)
+   948→    const w = lastWeight(h)
+   949→    const t = lastPoint(h)?.tempInC ?? null
+   950→    const hum = lastHumidity(h)
+   951→    const parts = [
+   952→      w !== null ? `${fmtNum(w)} кг` : null,
+   953→      t !== null ? `${fmtNum(t)} °C внутри` : null,
+   954→      hum !== null ? `влажность ${fmtNum(hum, 0)} %` : !h.humiditySensorOk ? 'датчик влажности молчит' : null,
+   955→    ].filter(Boolean)
+   956→    return `• улей №${h.id} — ${st.label.toLowerCase()}: ${parts.join(', ') || 'данных нет'}`
+   957→  })
+   958→  const leader = leaderOf(ctx.hives)
+   959→  const w0 = ctx.weather?.[0]
+   960→  const now = ctx.weatherNow
+   961→  const pts = pointsSummary(ctx)
+   962→  return {
+   963→    scenario: 'status',
+   964→    hiveId: null,
+   965→    text: `Сводка по всем ${ctx.hives.length} ульям пасеки:\n\n${lines.join('\n')}${
+   966→      leader ? `\n\nЛидер медосбора — улей №${leader.id}: ${fmtSigned(delta30d(leader) ?? 0)} кг ${periodLabel(leader)}.` : ''
+   967→    }${
+   968→      now || w0
+   969→        ? `\n\nПогода: ${now ? `${fmtSigned(now.tempC, 0)} °C, ${now.text.toLowerCase()}, ветер ${now.windKmh} км/ч. ` : ''}${
+   970→            w0
+   971→              ? `Сегодня ${w0.flight === 'good' ? 'хорошее окно лёта' : w0.flight === 'bad' ? 'лёта не будет' : 'условия средние'}: от ${fmtSigned(w0.tMin, 0)} до ${fmtSigned(w0.tMax, 0)} °C, осадки ${w0.precipProb} %.`
+   972→              : ''
+   973→          }`
+   974→        : ''
+   975→    }${pts ? `\n\nДатчики на карте: ${pts}.` : ''}`,
+   976→    basis: [
+   977→      `Телеметрия: ${withData} из ${ctx.hives.length} ульев`,
+   978→      ...(ctx.weather ? ['Прогноз погоды'] : []),
+   979→      ...(pts ? ['Датчики точек на карте'] : []),
+   980→    ],
+   981→    urgency: 'ok',
+   982→    urgencyNote: 'Сводка по всем ульям',
+   983→    metrics: [
+   984→      { label: 'Ульев с данными', value: `${withData} из ${ctx.hives.length}` },
+   985→      ...(leader ? [{ label: 'Лидер', value: `№${leader.id}: ${fmtSigned(delta30d(leader) ?? 0)} кг` }] : []),
+   986→      ...(now ? [{ label: 'Погода сейчас', value: `${fmtSigned(now.tempC, 0)} °C` }] : []),
+   987→    ],
+   988→  }
+   989→}
+   990→
+   991→/** Риск роения сразу по всем ульям. */
+   992→function swarmAllAnswer(ctx: AgentContext): AgentMessage {
+   993→  const risky = ctx.hives.filter((h) => {
+   994→    const d2 = delta2d(h)
+   995→    return d2 !== null && d2 <= SWARM_DROP
+   996→  })
+   997→  if (risky.length) {
+   998→    const details = risky.map((h) => {
+   999→      const d2 = delta2d(h) ?? 0
+  1000→      const t = lastPoint(h)?.tempInC ?? null
+  1001→      return `улей №${h.id}: вес упал на ${fmtNum(Math.abs(d2))} кг за 2 дня${
+  1002→        t !== null ? `, температура ${fmtNum(t)} °C (норма около 34,5 °C)` : ''
+  1003→      }`
+  1004→    })
+  1005→    return {
+  1006→      scenario: 'swarm',
+  1007→      hiveId: null,
+  1008→      text: `Проверил все ${ctx.hives.length} улья: признаки подготовки к роению вижу в ${
+  1009→        risky.length === 1 ? 'одном улье' : `${risky.length} ульях`
+  1010→      } — ${risky.map((h) => `№${h.id}`).join(', ')}.\n\n${details.join('.\n')}.\n\nОсмотрите эти семьи сегодня: маточники по краям рамок и «борода» пчёл на летке — главные признаки. По остальным ульям вес растёт ровно, риска нет.`,
+  1011→      basis: risky.map((h) => `График веса улья №${h.id}`),
+  1012→      urgency: 'today',
+  1013→      urgencyNote: 'Осмотреть ульи сегодня',
+  1014→      probability: swarmProbability(delta2d(risky[0]) ?? SWARM_DROP),
+  1015→      metrics: [
+  1016→        { label: 'Ульев в зоне риска', value: `${risky.length} из ${ctx.hives.length}` },
+  1017→        { label: 'Падение веса', value: `${fmtNum(Math.abs(delta2d(risky[0]) ?? 0))} кг за 2 дня` },
+  1018→      ],
+  1019→    }
+  1020→  }
+  1021→  const deltas = ctx.hives.map((h) => `№${h.id} — ${fmtSigned(delta2d(h) ?? 0)} кг`).join(', ')
+  1022→  return {
+  1023→    scenario: 'swarm',
+  1024→    hiveId: null,
+  1025→    text: `Проверил все ульи: выраженных признаков роения не вижу. Изменение веса за 2 дня: ${deltas}. Провалов веса, как бывает перед роением, нет.\n\nПродолжаю следить за привесом и температурой каждый день: если где-то появится резкое падение веса при тёплой погоде — сразу предупрежу.`,
+  1026→    basis: ['Сравнение привеса по всем ульям пасеки'],
+  1027→    urgency: 'ok',
+  1028→    urgencyNote: 'Наблюдать, сигнал придёт при изменениях',
+  1029→    probability: 'Признаков роения сейчас нет',
+  1030→    metrics: [{ label: 'Ульев проверено', value: String(ctx.hives.length) }],
+  1031→  }
+  1032→}
+  1033→
+  1034→/** Температура сразу по всем ульям + погода снаружи. */
+  1035→function climateAllAnswer(ctx: AgentContext): AgentMessage {
+  1036→  const lines = ctx.hives.map((h) => {
+  1037→    const t = lastPoint(h)?.tempInC ?? null
+  1038→    return `№${h.id} — ${t !== null ? `${fmtNum(t)} °C` : 'данных нет'}`
+  1039→  })
+  1040→  const temps = ctx.hives
+  1041→    .map((h) => lastPoint(h)?.tempInC ?? null)
+  1042→    .filter((t): t is number => t !== null)
+  1043→  const maxT = temps.length ? Math.max(...temps) : null
+  1044→  const overheated = maxT !== null && maxT > 35.7
+  1045→  const now = ctx.weatherNow
+  1046→  const w0 = ctx.weather?.[0]
+  1047→  return {
+  1048→    scenario: overheated ? 'swarm' : 'status',
+  1049→    hiveId: null,
+  1050→    text: `Температура внутри ульев: ${lines.join(', ')}. Норма для семьи с расплодом — около 34,5 °C.${
+  1051→      overheated && maxT !== null
+  1052→        ? ` Самый тёплый улей держит ${fmtNum(maxT)} °C — заметно выше нормы; вместе с падением веса это похоже на подготовку к роению, проверьте семью.`
+  1053→        : ' Заметных отклонений от нормы нет: семьи держат стабильный климат.'
+  1054→    }${
+  1055→      now
+  1056→        ? `\n\nСнаружи сейчас ${fmtSigned(now.tempC, 0)} °C (${now.text.toLowerCase()})${
+  1057→            w0 ? `, сегодня от ${fmtSigned(w0.tMin, 0)} до ${fmtSigned(w0.tMax, 0)} °C` : ''
+  1058→          }.`
+  1059→        : ''
+  1060→    }`,
+  1061→    basis: [
+  1062→      'Датчики температуры всех ульёв',
+  1063→      ...(now ? ['Погода Open-Meteo'] : []),
+  1064→      ...(overheated ? ['Совместный анализ: температура + вес'] : []),
+  1065→    ],
+  1066→    urgency: overheated ? 'today' : 'ok',
+  1067→    urgencyNote: overheated ? 'Проверить самый тёплый улей' : 'Климат в норме',
+  1068→    probability: overheated ? 'Совместный анализ температуры и веса' : undefined,
+  1069→    metrics: [
+  1070→      { label: 'Макс. внутри', value: maxT !== null ? `${fmtNum(maxT)} °C` : 'нет данных' },
+  1071→      ...(now ? [{ label: 'Снаружи', value: `${fmtSigned(now.tempC, 0)} °C` }] : []),
+  1072→      { label: 'Норма семьи', value: '34,5 °C' },
+  1073→    ],
+  1074→  }
+  1075→}
+  1076→
+  1077→/** Влажность сразу по всем ульям, с честными пропусками по «молчащим» датчикам. */
+  1078→function humidityAllAnswer(ctx: AgentContext): AgentMessage {
+  1079→  const lines = ctx.hives.map((h) => {
+  1080→    const hum = lastHumidity(h)
+  1081→    if (hum !== null) return `• улей №${h.id} — ${fmtNum(hum, 0)} %`
+  1082→    if (!h.humiditySensorOk) {
+  1083→      return `• улей №${h.id} — датчик влажности молчит${h.humidityOfflineFrom ? ` с ${h.humidityOfflineFrom}` : ''}`
+  1084→    }
+  1085→    return `• улей №${h.id} — данных нет`
+  1086→  })
+  1087→  const wet = ctx.hives.filter((h) => (lastHumidity(h) ?? 0) > 70)
+  1088→  const pts = (ctx.points ?? []).filter((p) => p.sensor.on && p.sensor.humidityPct !== null)
+  1089→  return {
+  1090→    scenario: 'status',
+  1091→    hiveId: null,
+  1092→    text: `Влажность по всем ульям (норма для летнего улья — 50–66 %):\n\n${lines.join('\n')}.${
+  1093→      wet.length
+  1094→        ? `\n\nВ ${wet.map((h) => `№${h.id}`).join(', ')} влажность выше комфортной зоны — в улье сыро, стоит улучшить вентиляцию.`
+  1095→        : '\n\nВыше комфортной зоны влажность нигде не поднимается.'
+  1096→    }${
+  1097→      pts.length
+  1098→        ? `\n\nДатчики точек на карте: ${pts.map((p) => `«${p.name}» — ${fmtNum(p.sensor.humidityPct ?? 0, 0)} %`).join(', ')}.`
+  1099→        : ''
+  1100→    }`,
+  1101→    basis: ['Датчики влажности ульёв', 'Норма: 50–66 %', ...(pts.length ? ['Датчики точек на карте'] : [])],
+  1102→    urgency: wet.length ? 'today' : 'ok',
+  1103→    urgencyNote: wet.length ? 'Улучшить вентиляцию' : 'Наблюдать',
+  1104→    metrics: [
+  1105→      { label: 'Ульев с данными', value: `${ctx.hives.filter((h) => lastHumidity(h) !== null).length} из ${ctx.hives.length}` },
+  1106→      ...(wet.length ? [{ label: 'Сырые ульи', value: wet.map((h) => `№${h.id}`).join(', ') }] : []),
+  1107→    ],
+  1108→  }
+  1109→}
+  1110→
+  1111→/** Вес и привес сразу по всем ульям + контрольные датчики на карте. */
+  1112→function weightAllAnswer(ctx: AgentContext): AgentMessage {
+  1113→  const rows = ctx.hives.map((h) => {
+  1114→    const w = lastWeight(h)
+  1115→    return `• улей №${h.id} — ${w !== null ? `${fmtNum(w)} кг` : 'данных нет'} (${fmtSigned(delta30d(h) ?? 0)} кг ${periodLabel(h)})`
+  1116→  })
+  1117→  const leader = leaderOf(ctx.hives)
+  1118→  const pts = (ctx.points ?? []).filter((p) => p.sensor.on && p.sensor.weightKg !== null)
+  1119→  return {
+  1120→    scenario: 'status',
+  1121→    hiveId: null,
+  1122→    text: `Вес по всем ульям:\n\n${rows.join('\n')}.${
+  1123→      leader
+  1124→        ? `\n\nЛидер медосбора — улей №${leader.id}: ${fmtSigned(delta30d(leader) ?? 0)} кг ${periodLabel(leader)}. Набор веса — главный признак медосбора; резкое падение при тёплой погоде часто означает начало роения.`
+  1125→        : ''
+  1126→    }${
+  1127→      pts.length
+  1128→        ? `\n\nКонтрольные датчики на карте: ${pts.map((p) => `«${p.name}» — ${fmtNum(p.sensor.weightKg ?? 0)} кг (датчик в контрольном улье точки)`).join(', ')}.`
+  1129→        : ''
+  1130→    }`,
+  1131→    basis: ['Графики веса всех ульёв', ...(pts.length ? ['Датчики точек на карте'] : [])],
+  1132→    urgency: 'ok',
+  1133→    urgencyNote: 'Наблюдать за привесом',
+  1134→    metrics: [
+  1135→      ...(leader ? [{ label: 'Лидер', value: `№${leader.id}: ${fmtSigned(delta30d(leader) ?? 0)} кг` }] : []),
+  1136→      { label: 'Ульев с весами', value: `${ctx.hives.filter((h) => lastWeight(h) !== null).length} из ${ctx.hives.length}` },
+  1137→    ],
+  1138→  }
+  1139→}
+  1140→
+  1141→/** Шум по датчикам точек на карте. Нет датчика или он выключен — данных нет. */
+  1142→function noiseAnswer(ctx: AgentContext): AgentMessage {
+  1143→  const pts = (ctx.points ?? []).filter((p) => p.sensor.on && p.sensor.noiseDb !== null)
+  1144→  if (!pts.length) {
+  1145→    return {
+  1146→      scenario: 'status',
+  1147→      hiveId: null,
+  1148→      text: 'Шум внутри улья измеряют датчики, которые стоят в точках на карте. Среди ваших точек активных датчиков нет (или они выключены), поэтому данных о шуме сейчас нет — говорю честно, цифры выдумывать не буду.\n\nВключите датчик в разделе «Датчики ульев» или на карте — и я начну следить: резкий рост шума обычно означает тревогу семьи.',
+  1149→      basis: ['Датчики точек на карте: не активны'],
+  1150→      urgency: 'this-week',
+  1151→      urgencyNote: 'Включить датчики',
+  1152→      probability: 'Данных недостаточно',
+  1153→      metrics: [{ label: 'Активных датчиков', value: '0' }],
+  1154→    }
+  1155→  }
+  1156→  const rows = pts.map((p) => `«${p.name}» — ${fmtNum(p.sensor.noiseDb ?? 0, 0)} дБ`).join(', ')
+  1157→  const loudest = [...pts].sort((a, b) => (b.sensor.noiseDb ?? 0) - (a.sensor.noiseDb ?? 0))[0]
+  1158→  const loud = (loudest.sensor.noiseDb ?? 0) > 60
+  1159→  return {
+  1160→    scenario: 'status',
+  1161→    hiveId: null,
+  1162→    text: `Шум по датчикам на карте: ${rows}. Норма для работающей семьи — 40–55 дБ: ровный монотонный гул.${
+  1163→      loud
+  1164→        ? ` В «${loudest.name}» шум повышенный — семья может быть тревожной или началось роение: стоит осмотреть улей.`
+  1165→        : ' Повышенного шума нет — семьи работают спокойно.'
+  1166→    }`,
+  1167→    basis: [`Датчики точек на карте: ${pts.length} шт.`],
+  1168→    urgency: loud ? 'today' : 'ok',
+  1169→    urgencyNote: loud ? 'Осмотреть улей с повышенным шумом' : 'Шум в норме',
+  1170→    metrics: [{ label: 'Макс. шум', value: `${fmtNum(loudest.sensor.noiseDb ?? 0, 0)} дБ` }],
+  1171→  }
+  1172→}
+  1173→
+  1174→/** Обзор датчиков: точки на карте (температура, вес, влажность, шум) и датчики ульев. */
+  1175→function sensorsAnswer(ctx: AgentContext): AgentMessage {
+  1176→  const ptLines = (ctx.points ?? []).map((p) =>
+  1177→    p.sensor.on
+  1178→      ? `• «${p.name}» (${p.hiveCount} улей на точке) — датчик включён: +${fmtNum(p.sensor.tempC ?? 0)} °C, влажность ${fmtNum(p.sensor.humidityPct ?? 0, 0)} %, вес ${fmtNum(p.sensor.weightKg ?? 0)} кг, шум ${fmtNum(p.sensor.noiseDb ?? 0, 0)} дБ`
+  1179→      : `• «${p.name}» (${p.hiveCount} улей на точке) — ${p.hasSensor ? 'датчик выключен — данных нет' : 'датчика нет — данных нет'}`,
+  1180→  )
+  1181→  const hiveLines = ctx.hives.map((h) =>
+  1182→    h.humiditySensorOk
+  1183→      ? `• улей №${h.id} — датчики в штатном режиме`
+  1184→      : `• улей №${h.id} — датчик влажности не отвечает${h.humidityOfflineFrom ? ` с ${h.humidityOfflineFrom}` : ''}, возможно, сел аккумулятор`,
+  1185→  )
+  1186→  return {
+  1187→    scenario: 'status',
+  1188→    hiveId: null,
+  1189→    text: `Датчики пасеки:\n\n${[...ptLines, ...hiveLines].join('\n')}\n\nПравило платформы: если датчика нет или он выключен — данные по улью не показываются и в советы не попадают. Цифры вслепую я не рисую.`,
+  1190→    basis: ['Датчики точек на карте', 'Датчики ульёв'],
+  1191→    urgency: 'ok',
+  1192→    urgencyNote: 'Все датчики под контролем',
+  1193→    metrics: [
+  1194→      {
+  1195→        label: 'Точек с датчиками',
+  1196→        value: `${(ctx.points ?? []).filter((p) => p.sensor.on).length} из ${(ctx.points ?? []).length}`,
+  1197→      },
+  1198→      { label: 'Ульев на контроле', value: String(ctx.hives.length) },
+  1199→    ],
+  1200→  }
+  1201→}
+  1202→
+  1203→/** Вопрос о самом агенте: модель и устройство не раскрываем. */
+  1204→function identityAnswer(): AgentMessage {
+  1205→  return {
+  1206→    scenario: 'status',
+  1207→    hiveId: null,
+  1208→    text: 'Я — ИИ-агент «Цифровой улей», цифровой помощник пасеки. Технические детали своего устройства не обсуждаю — для работы они и не нужны.\n\nЗато охотно отвечу на вопросы о погоде, ульях и датчиках: например, «Как дела на всех ульях?», «Какая сейчас погода?» или «Что показывают датчики?».',
+  1209→    basis: [],
+  1210→    urgency: 'ok',
+  1211→    urgencyNote: 'Готов отвечать',
+  1212→    metrics: [],
+  1213→  }
+  1214→}
+  1215→
+  1216→function fallbackAnswer(): AgentMessage {
+  1217→  return {
+  1218→    scenario: 'offtopic',
+  1219→    hiveId: null,
+  1220→    text: 'Этот вопрос — не по моей теме. Я агент пасеки и веду разговоры только о погоде и ульях: вес, температура и влажность внутри улья, датчики, шум, медосбор, роение, кочёвка и обработки полей рядом.\n\nСпросите, например: «Как дела на всех ульях?», «Какая сейчас погода?» или «Есть ли риск роения?».',
+  1221→    basis: [],
+  1222→    urgency: 'ok',
+  1223→    urgencyNote: 'Не по теме',
+  1224→    metrics: [],
+  1225→  }
+  1226→}
+  1227→
+  1228→function thanksAnswer(): AgentMessage {
+  1229→  return {
+  1230→    scenario: 'status',
+  1231→    hiveId: null,
+  1232→    text: 'Всегда рядом. Напомню главный принцип: я показываю вероятность и уровень риска, а окончательное решение всегда принимает пчеловод.',
+  1233→    basis: [],
+  1234→    urgency: 'ok',
+  1235→    urgencyNote: 'Наблюдать',
+  1236→    metrics: [],
+  1237→  }
+  1238→}
+  1239→
+  1240→/** Главная функция: вопрос пчеловода → структурированный ответ агента. */
+  1241→export function askAgent(
+  1242→  question: string,
+  1243→  currentHiveId: number,
+  1244→  ctx: AgentContext = DEMO_CONTEXT,
+  1245→): AgentMessage {
+  1246→  const q = norm(question)
+  1247→  const hiveId = extractHiveId(q, ctx)
+  1248→  const hive = ctx.hives.find((x) => x.id === (hiveId ?? currentHiveId)) ?? ctx.hives[0]
+  1249→
+  1250→  const has = (...patterns: RegExp[]) => patterns.some((p) => p.test(q))
+  1251→
+  1252→  // Приветствие и сервисные фразы
+  1253→  if (has(/привет|здравств|добрый день|добрый вечер|доброе утро|что ты умеешь|чем ты можешь|помощь\b|справк/)) {
+  1254→    return greetingAnswer(ctx)
+  1255→  }
+  1256→  // Вопрос о самом агенте: модель и устройство не раскрываем
+  1257→  if (has(/кто ты|кто такой|как тебя зовут|ты бот|чат ?бот|какая (ты )?модель|какой (ты )?модель|на (чем|чём) ты (работаешь|сделан|написан)|что ты за|нейросет|искусственн|\bllm\b|\bgpt\b/)) {
+  1258→    return identityAnswer()
+  1259→  }
+  1260→  if (has(/спасибо|благодар|класс|супер|отлично/)) {
+  1261→    return thanksAnswer()
+  1262→  }
+  1263→
+  1264→  // Сценарий пестицидов
+  1265→  if (has(/пестицид|обработк|хими|опрыск|травят|фунгицид|инсектицид/)) {
+  1266→    return pesticideAnswer(ctx)
+  1267→  }
+  1268→
+  1269→  // Кочёвка
+  1270→  if (has(/кочев|перевез|перевоз|переех|перемест|новое место|куда (вывезти|ехать|ставить)|где лучше|выбор места|участк/)) {
+  1271→    return migrationAnswer(ctx)
+  1272→  }
+  1273→
+  1274→  // Погода и медосбор (включая температуру ВОЗДЕУХА — не путать с температурой улья)
+  1275→  if (has(/погод|медосбор|взятк|летат|лёт|лету|дожд|ветер|осадк|цветен|медонос|снег|мороз|когда вывоз|когда летать|температура (воздуха|за окном|на улице|снаружи)/)) {
+  1276→    return weatherAnswer(ctx)
+  1277→  }
+  1278→
+  1279→  if (!hive) {
+  1280→    return fallbackAnswer()
+  1281→  }
+  1282→
+  1283→  // Темы по ульям: если номер улья не назван — отвечаем сразу по ВСЕМ ульям
+  1284→  if (has(/влажн|сырост|сыро/)) {
+  1285→    return hiveId ? humidityAnswer(hive) : humidityAllAnswer(ctx)
+  1286→  }
+  1287→  if (has(/шум|децибел|гул\b/)) {
+  1288→    return noiseAnswer(ctx)
+  1289→  }
+  1290→  if (has(/ро(ение|иться|й|и\b)|риск роения|делит|делени/)) {
+  1291→    return hiveId ? swarmAnswer(hive, ctx) : swarmAllAnswer(ctx)
+  1292→  }
+  1293→  if (has(/температ|жар|тепло внутри|градус/)) {
+  1294→    return hiveId ? climateAnswer(hive) : climateAllAnswer(ctx)
+  1295→  }
+  1296→  if (has(/вес|мед\b|меда|привес|набор|тяже|лидер/)) {
+  1297→    return hiveId ? weightAnswer(hive, ctx) : weightAllAnswer(ctx)
+  1298→  }
+  1299→  if (has(/датчик|сенсор/)) {
+  1300→    return sensorsAnswer(ctx)
+  1301→  }
+  1302→  if (has(/все.{0,8}уль|всех ульев|всей пасек|пасек|обзор|сводк|итог|общее состояни|как дела|как себя|что происходит|состояни|статус|проверь|проблем|тревог|расскажи|что с улеем|как улей/)) {
+  1303→    return hiveId ? statusAnswer(hive, ctx) : allHivesAnswer(ctx)
+  1304→  }
+  1305→
+  1306→  // Номер улья без распознанной темы — считаем вопросом «что происходит»
+  1307→  if (hiveId !== null) {
+  1308→    return statusAnswer(hive, ctx)
+  1309→  }
+  1310→
+  1311→  return fallbackAnswer()
+  1312→}
+  1313→
+  1314→/** Быстрые вопросы для чата — все про всю пасеку сразу. */
+  1315→export const QUICK_QUESTIONS = [
+  1316→  'Как дела на всех ульях?',
+  1317→  'Какая сейчас погода?',
+  1318→  'Какая температура в ульях?',
+  1319→  'Есть ли риск роения?',
+  1320→  'Какой улей самый тяжёлый?',
+  1321→  'Что показывают датчики?',
+  1322→]
+  1323→

@@ -1,0 +1,702 @@
+    30→    30→import { DEFAULT_PLACE } from '@/lib/sensor-catalog'
+    31→    31→import { blobToWavBase64, getSpeechRecognition, VOICE_LANG, VOICE_MAX_SECONDS, voiceInputSupported, type SpeechRecognitionLike } from '@/lib/voice-input'
+    32→    32→import { weatherResponseToDays } from '@/lib/weather-days'
+    33→    33→import type { MapPointDto, WeatherResponse } from '@/lib/api-types'
+    34→    34→import type { ChatHistoryItem } from '@/lib/api-types'
+    35→    35→
+    36→    36→interface ChatItem {
+    37→    37→  role: 'user' | 'agent'
+    38→    38→  text: string
+    39→    39→  agent?: AgentMessage
+    40→    40→}
+    41→    41→
+    42→    42→/** Состояние голосового ввода: покой / запись / распознавание. */
+    43→    43→type VoiceState = 'idle' | 'recording' | 'transcribing'
+    44→    44→
+    45→    45→const SCENARIO_ICON: Record<string, string> = {
+    46→    46→  swarm: '🐝',
+    47→    47→  pesticide: '☣️',
+    48→    48→  weather: '⛅',
+    49→    49→  migration: '🚚',
+    50→    50→  status: '📊',
+    51→    51→  care: '🩺',
+    52→    52→  offtopic: '🚫',
+    53→    53→  bloom: '🌸',
+    54→    54→}
+    55→    55→
+    56→    56→export function AgentChatView() {
+    57→    57→  const user = useAppState((s) => s.user)
+    58→    58→  const t = useT()
+    59→    59→  const { toast } = useToast()
+    60→    60→  const { status: realStatus, data } = useRealData()
+    61→    61→
+    62→    62→  // Погода по фактическому центру пасеки (среднее координат точек), те же
+    63→    63→  // координаты, что на дашборде, чтобы агент называл те же числа, что видит
+    64→    64→  // пчеловод. Ключ по набору точек — пересчёт только при изменении привязок.
+    65→    65→  const [wResp, setWResp] = useState<WeatherResponse | null>(null)
+    66→    66→  const [apiaryPoints, setApiaryPoints] = useState<MapPointDto[] | null>(null)
+    67→    67→  // Поля Минсельхоза для контекста агента (п. 4 ТЗ)
+    68→    68→  const [cropFields, setCropFields] = useState<AgentCropField[]>([])
+    69→    69→  useEffect(() => {
+    70→    70→    let alive = true
+    71→    71→    const load = async () => {
+    72→    72→      try {
+    73→    73→        const res = await fetch('/api/crop-fields', { cache: 'no-store' })
+    74→    74→        if (!res.ok) return
+    75→    75→        const j = (await res.json()) as { fields: Array<{
+    76→    76→          name: string
+    77→    77→          culture: string
+    78→    78→          cultureName: string
+    79→    79→          areaHa: number
+    80→    80→          district: string
+    81→    81→          distanceKm: number
+    82→    82→          sowingDate: string | null
+    83→    83→          bloomText: string
+    84→    84→          bloomStart: string | null
+    85→    85→          bloomEnd: string | null
+    86→    86→          recommend: { min: number; max: number; optimal: number } | null
+    87→    87→          treatments: Array<{ date: string; drug: string; hazardClass: string }>
+    88→    88→          isMinselhoz: boolean
+    89→    89→        }> }
+    90→    90→        if (alive) setCropFields(j.fields)
+    91→    91→      } catch {
+    92→    92→        // справочник подтянется при следующем открытии чата
+    93→    93→      }
+    94→    94→    }
+    95→    95→    void load()
+    96→    96→    return () => {
+    97→    97→      alive = false
+    98→    98→    }
+    99→    99→  }, [])
+   100→   100→
+   101→   101→  useEffect(() => {
+   102→   102→    let alive = true
+   103→   103→    const load = async () => {
+   104→   104→      try {
+   105→   105→        const res = await fetch('/api/map-points', { cache: 'no-store' })
+   106→   106→        if (!res.ok) return
+   107→   107→        const j = (await res.json()) as { points: MapPointDto[] }
+   108→   108→        if (alive) setApiaryPoints(j.points)
+   109→   109→      } catch {
+   110→   110→        // датчики подтянутся на следующем опросе
+   111→   111→      }
+   112→   112→    }
+   113→   113→    void load()
+   114→   114→    const timer = setInterval(() => void load(), 5000)
+   115→   115→    return () => {
+   116→   116→      alive = false
+   117→   117→      clearInterval(timer)
+   118→   118→    }
+   119→   119→  }, [])
+   120→   120→
+   121→   121→  // Погода по фактическому центру пасеки (среднее координат точек), те же
+   122→   122→  // координаты, что на дашборде, чтобы агент называл те же числа, что видит
+   123→   123→  // пчеловод. Эффект зависит от ЧИСЕЛ координат: опрос точек каждые 5 с
+   124→   124→  // не вызывает перезапрос погоды, пока координаты не изменились.
+   125→   125→  const center = useMemo<[number, number]>(
+   126→   126→    () =>
+   127→   127→      (apiaryPoints && apiaryPoints.length > 0 ? pointsCenter(apiaryPoints) : null) ??
+   128→   128→      DEFAULT_PLACE.center,
+   129→   129→    [apiaryPoints],
+   130→   130→  )
+   131→   131→  const [wLat, wLon] = center
+   132→   132→  useEffect(() => {
+   133→   133→    let cancelled = false
+   134→   134→    const sp = new URLSearchParams({ lat: String(wLat), lon: String(wLon), place: 'Моя пасека' })
+   135→   135→    const load = async () => {
+   136→   136→      try {
+   137→   137→        const res = await fetch(`/api/weather?${sp.toString()}`, { cache: 'no-store' })
+   138→   138→        if (!res.ok) throw new Error('weather')
+   139→   139→        const j = (await res.json()) as WeatherResponse
+   140→   140→        if (!cancelled) setWResp(j)
+   141→   141→      } catch {
+   142→   142→        // погода не критична: агент честно скажет, если данных нет
+   143→   143→      }
+   144→   144→    }
+   145→   145→    void load()
+   146→   146→    const timer = setInterval(() => void load(), 10 * 60 * 1000)
+   147→   147→    return () => {
+   148→   148→      cancelled = true
+   149→   149→      clearInterval(timer)
+   150→   150→    }
+   151→   151→  }, [wLat, wLon])
+   152→   152→  const agentWeather = useMemo(() => (wResp ? weatherResponseToDays(wResp) : null), [wResp])
+   153→   153→
+   154→   154→  // Ульи и показания — те же точки, что на карте (синхронизация с /api/map-points)
+   155→   155→  const pointsCtx = useMemo<AgentContext | null>(() => {
+   156→   156→    if (!apiaryPoints) return null
+   157→   157→    const points: AgentPoint[] = apiaryPoints.map((p) => ({
+   158→   158→      id: p.id,
+   159→   159→      name: p.name,
+   160→   160→      lat: p.lat,
+   161→   161→      lon: p.lon,
+   162→   162→      hiveCount: p.hiveCount,
+   163→   163→      hasSensor: p.hasSensor,
+   164→   164→      sensorOn: p.sensorOn,
+   165→   165→      sensor: p.sensor,
+   166→   166→    }))
+   167→   167→    return makeContext(pointsToHives(apiaryPoints), {
+   168→   168→      weather: agentWeather?.days ?? null,
+   169→   169→      weatherNow: agentWeather?.now ?? null,
+   170→   170→      pesticide: null, // реестр обработок не подключён — агент честно об этом скажет
+   171→   171→      sites: data ? data.sites.map(siteDtoToSite) : [],
+   172→   172→      points,
+   173→   173→      cropFields,
+   174→   174→      apiaryName: 'Моя пасека',
+   175→   175→      lang: useAppState.getState().lang,
+   176→   176→    })
+   177→   177→  }, [apiaryPoints, agentWeather, data, cropFields])
+   178→   178→
+   179→   179→  // контекст мемоизирован, чтобы не пересоздаваться на каждом рендере
+   180→   180→  // (иначе эффекты с ctx в зависимостях зацикливаются)
+   181→   181→  const ctx: AgentContext | null = pointsCtx
+   182→   182→
+   183→   183→  const [items, setItems] = useState<ChatItem[]>([])
+   184→   184→  const [input, setInput] = useState('')
+   185→   185→  const [thinking, setThinking] = useState(false)
+   186→   186→  const thinkingRef = useRef(false)
+   187→   187→  const scrollRef = useRef<HTMLDivElement>(null)
+   188→   188→
+   189→   189→  /* ---------- голосовой ввод: микрофон → текст в поле ввода ---------- */
+   190→   190→  // Основной путь — Web Speech API (Chrome/Edge/Яндекс.Браузер, ru-RU): текст
+   191→   191→  // появляется в поле ввода прямо во время разговора. Запасной путь (браузеры
+   192→   192→  // без нативного распознавания) — запись MediaRecorder → WAV → /api/asr.
+   193→   193→  const srClass = useMemo(() => getSpeechRecognition(), [])
+   194→   194→  const voiceOk = useMemo(() => !!srClass || voiceInputSupported(), [srClass])
+   195→   195→  const [voice, setVoice] = useState<VoiceState>('idle')
+   196→   196→  const speechRef = useRef<SpeechRecognitionLike | null>(null)
+   197→   197→  const recorderRef = useRef<MediaRecorder | null>(null)
+   198→   198→  const streamRef = useRef<MediaStream | null>(null)
+   199→   199→  const chunksRef = useRef<Blob[]>([])
+   200→   200→  const autoStopRef = useRef<number | null>(null)
+   201→   201→  const baseInputRef = useRef('')
+   202→   202→  // push-to-talk: кнопка микрофона зажата и момент начала удержания
+   203→   203→  // (по длительности отличаем намеренное удержание от случайного тапа)
+   204→   204→  const holdActiveRef = useRef(false)
+   205→   205→  const holdStartedAtRef = useRef(0)
+   206→   206→
+   207→   207→  const clearAutoStop = () => {
+   208→   208→    if (autoStopRef.current !== null) {
+   209→   209→      window.clearTimeout(autoStopRef.current)
+   210→   210→      autoStopRef.current = null
+   211→   211→    }
+   212→   212→  }
+   213→   213→
+   214→   214→  const stopVoice = useCallback(() => {
+   215→   215→    clearAutoStop()
+   216→   216→    if (speechRef.current) {
+   217→   217→      try {
+   218→   218→        speechRef.current.stop()
+   219→   219→      } catch {
+   220→   220→        // уже остановлен
+   221→   221→      }
+   222→   222→      return
+   223→   223→    }
+   224→   224→    const rec = recorderRef.current
+   225→   225→    if (rec && rec.state !== 'inactive') rec.stop()
+   226→   226→  }, [])
+   227→   227→
+   228→   228→  /** Отпускание кнопки (push-to-talk): завершаем запись. */
+   229→   229→  const releaseHold = useCallback(() => {
+   230→   230→    if (!holdActiveRef.current) return
+   231→   231→    holdActiveRef.current = false
+   232→   232→    const wasRecording = voice === 'recording'
+   233→   233→    const heldMs = Date.now() - holdStartedAtRef.current
+   234→   234→    stopVoice()
+   235→   235→    // мгновенный тап вместо удержания — вежливо подсказываем, как пользоваться
+   236→   236→    if (wasRecording && heldMs < 600) {
+   237→   237→      toast({
+   238→   238→        title: 'Короткое нажатие',
+   239→   239→        description: 'Зажмите кнопку микрофона и говорите, отпустите — вопрос появится в поле ввода.',
+   240→   240→      })
+   241→   241→    }
+   242→   242→  }, [stopVoice, voice, toast])
+   243→   243→
+   244→   244→  /** Запасной путь: собранный blob → WAV → /api/asr → текст. */
+   245→   245→  const finishVoice = useCallback(async () => {
+   246→   246→    // поток больше не нужен
+   247→   247→    streamRef.current?.getTracks().forEach((t) => t.stop())
+   248→   248→    streamRef.current = null
+   249→   249→    recorderRef.current = null
+   250→   250→    const blob = new Blob(chunksRef.current, { type: chunksRef.current[0]?.type || 'audio/webm' })
+   251→   251→    chunksRef.current = []
+   252→   252→    if (blob.size < 2048) {
+   253→   253→      setVoice('idle')
+   254→   254→      toast({ title: 'Запись пустая', description: 'Зажмите кнопку микрофона и скажите вопрос голосом.' })
+   255→   255→      return
+   256→   256→    }
+   257→   257→    setVoice('transcribing')
+   258→   258→    try {
+   259→   259→      const wav = await blobToWavBase64(blob)
+   260→   260→      const res = await fetch('/api/asr', {
+   261→   261→        method: 'POST',
+   262→   262→        headers: { 'Content-Type': 'application/json' },
+   263→   263→        body: JSON.stringify({ audio: wav }),
+   264→   264→      })
+   265→   265→      const j = (await res.json().catch(() => ({}))) as { text?: string; error?: string }
+   266→   266→      if (!res.ok || !j.text?.trim()) {
+   267→   267→        toast({ title: 'Речь не распознана', description: j.error ?? 'Попробуйте сказать чуть чётче.', variant: 'destructive' })
+   268→   268→        return
+   269→   269→      }
+   270→   270→      // текст подставляем в поле ввода — пчеловод может поправить и отправить
+   271→   271→      const base = baseInputRef.current
+   272→   272→      const text = j.text.trim()
+   273→   273→      setInput(base ? `${base} ${text}` : text)
+   274→   274→      toast({ title: 'Голос распознан', description: text })
+   275→   275→    } catch {
+   276→   276→      toast({ title: 'Не получилось', description: 'Не удалось распознать запись — попробуйте ещё раз.', variant: 'destructive' })
+   277→   277→    } finally {
+   278→   278→      setVoice('idle')
+   279→   279→    }
+   280→   280→  }, [toast])
+   281→   281→
+   282→   282→  const startVoice = useCallback(async () => {
+   283→   283→    // запись уже идёт — второй старт (второй палец/указатель) не нужен
+   284→   284→    if (speechRef.current || recorderRef.current) return
+   285→   285→    clearAutoStop()
+   286→   286→    baseInputRef.current = input.trim()
+   287→   287→
+   288→   288→    // 1) нативное распознавание в браузере — русский отлично работает в Chrome/Яндексе
+   289→   289→    if (srClass) {
+   290→   290→      const rec = new srClass()
+   291→   291→      rec.lang = VOICE_LANG
+   292→   292→      rec.continuous = true
+   293→   293→      rec.interimResults = true
+   294→   294→      rec.maxAlternatives = 1
+   295→   295→      let finalText = ''
+   296→   296→      rec.onresult = (e) => {
+   297→   297→        let interim = ''
+   298→   298→        for (let i = e.resultIndex; i < e.results.length; i++) {
+   299→   299→          const r = e.results[i]
+   300→   300→          const t = r[0]?.transcript ?? ''
+   301→   301→          if (r.isFinal) finalText = finalText ? `${finalText} ${t.trim()}` : t.trim()
+   302→   302→          else interim += t
+   303→   303→        }
+   304→   304→        const text = (finalText + (interim ? ` ${interim}` : '')).trim()
+   305→   305→        if (text) {
+   306→   306→          const base = baseInputRef.current
+   307→   307→          setInput(base ? `${base} ${text}` : text)
+   308→   308→        }
+   309→   309→      }
+   310→   310→      rec.onerror = (ev) => {
+   311→   311→        const code = ev.error ?? ''
+   312→   312→        if (code === 'not-allowed' || code === 'service-not-allowed') {
+   313→   313→          toast({ title: 'Микрофон недоступен', description: 'Разрешите доступ к микрофону в браузере и попробуйте ещё раз.', variant: 'destructive' })
+   314→   314→        } else if (code === 'no-speech') {
+   315→   315→          toast({ title: 'Речи не слышно', description: 'Скажите вопрос чуть ближе к микрофону.' })
+   316→   316→        } else if (code !== 'aborted') {
+   317→   317→          toast({ title: 'Распознавание прервано', description: 'Скажите вопрос ещё раз.', variant: 'destructive' })
+   318→   318→        }
+   319→   319→      }
+   320→   320→      rec.onend = () => {
+   321→   321→        speechRef.current = null
+   322→   322→        clearAutoStop()
+   323→   323→        setVoice('idle')
+   324→   324→      }
+   325→   325→      speechRef.current = rec
+   326→   326→      try {
+   327→   327→        rec.start()
+   328→   328→      } catch {
+   329→   329→        toast({ title: 'Не получилось начать', description: 'Зажмите кнопку микрофона ещё раз.', variant: 'destructive' })
+   330→   330→        return
+   331→   331→      }
+   332→   332→      setVoice('recording')
+   333→   333→      autoStopRef.current = window.setTimeout(() => stopVoice(), VOICE_MAX_SECONDS * 1000)
+   334→   334→      // кнопку отпустили раньше, чем распознавание успело стартовать
+   335→   335→      if (!holdActiveRef.current) stopVoice()
+   336→   336→      return
+   337→   337→    }
+   338→   338→
+   339→   339→    // 2) запасной путь: запись с микрофона → серверное распознавание
+   340→   340→    try {
+   341→   341→      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+   342→   342→      streamRef.current = stream
+   343→   343→      chunksRef.current = []
+   344→   344→      const rec = new MediaRecorder(stream)
+   345→   345→      rec.ondataavailable = (e) => {
+   346→   346→        if (e.data.size > 0) chunksRef.current.push(e.data)
+   347→   347→      }
+   348→   348→      rec.onstop = () => void finishVoice()
+   349→   349→      rec.start()
+   350→   350→      recorderRef.current = rec
+   351→   351→      setVoice('recording')
+   352→   352→      autoStopRef.current = window.setTimeout(() => stopVoice(), VOICE_MAX_SECONDS * 1000)
+   353→   353→      // кнопку отпустили, пока запрашивался доступ к микрофону
+   354→   354→      if (!holdActiveRef.current) stopVoice()
+   355→   355→    } catch {
+   356→   356→      toast({
+   357→   357→        title: 'Микрофон недоступен',
+   358→   358→        description: 'Разрешите доступ к микрофону в браузере и попробуйте ещё раз.',
+   359→   359→        variant: 'destructive',
+   360→   360→      })
+   361→   361→    }
+   362→   362→  }, [srClass, input, finishVoice, stopVoice, toast])
+   363→   363→
+   364→   364→  // при размонтировании прерываем распознавание и закрываем поток
+   365→   365→  useEffect(
+   366→   366→    () => () => {
+   367→   367→      if (autoStopRef.current !== null) window.clearTimeout(autoStopRef.current)
+   368→   368→      try {
+   369→   369→        speechRef.current?.abort()
+   370→   370→      } catch {
+   371→   371→        // нет активного распознавания
+   372→   372→      }
+   373→   373→      streamRef.current?.getTracks().forEach((t) => t.stop())
+   374→   374→    },
+   375→   375→    [],
+   376→   376→  )
+   377→   377→
+   378→   378→  /* История из базы — общая лента пасеки, без привязки к улью */
+   379→   379→  useEffect(() => {
+   380→   380→    if (!user || realStatus !== 'ready' || !ctx) return
+   381→   381→    let cancelled = false
+   382→   382→    void (async () => {
+   383→   383→      try {
+   384→   384→        const res = await fetch('/api/chat?scope=general', { cache: 'no-store' })
+   385→   385→        if (!res.ok) throw new Error('history')
+   386→   386→        const j = (await res.json()) as { items: ChatHistoryItem[] }
+   387→   387→        if (cancelled) return
+   388→   388→        const restored: ChatItem[] = j.items.map((m) => ({
+   389→   389→          role: m.role,
+   390→   390→          text: m.text,
+   391→   391→          ...(m.role === 'agent' && m.agentJson
+   392→   392→            ? { agent: JSON.parse(m.agentJson) as AgentMessage }
+   393→   393→            : {}),
+   394→   394→        }))
+   395→   395→        if (restored.length === 0) {
+   396→   396→          setItems([{ role: 'agent', text: '', agent: askAgent('привет', ctx.hives[0]?.id ?? 1, ctx) }])
+   397→   397→        } else {
+   398→   398→          setItems(restored.slice(-30))
+   399→   399→        }
+   400→   400→      } catch {
+   401→   401→        if (!cancelled) {
+   402→   402→          setItems([{ role: 'agent', text: '', agent: askAgent('привет', ctx.hives[0]?.id ?? 1, ctx) }])
+   403→   403→        }
+   404→   404→      }
+   405→   405→    })()
+   406→   406→    return () => {
+   407→   407→      cancelled = true
+   408→   408→    }
+   409→   409→  }, [user, realStatus, ctx])
+   410→   410→
+   411→   411→  const sendUser = useCallback(
+   412→   412→    (rawText: string) => {
+   413→   413→      const trimmed = rawText.trim()
+   414→   414→      if (!trimmed || thinkingRef.current) return
+   415→   415→      // отправка текста прерывает голосовой ввод (кнопка могла быть ещё зажата)
+   416→   416→      if (holdActiveRef.current) {
+   417→   417→        holdActiveRef.current = false
+   418→   418→        stopVoice()
+   419→   419→      }
+   420→   420→      const context = ctx
+   421→   421→      if (!context) return
+   422→   422→      thinkingRef.current = true
+   423→   423→      setItems((prev) => [...prev, { role: 'user', text: trimmed }])
+   424→   424→      setInput('')
+   425→   425→      setThinking(true)
+   426→   426→      const started = Date.now()
+   427→   427→
+   428→   428→      const run = async () => {
+   429→   429→        let answer: AgentMessage
+   430→   430→        try {
+   431→   431→          // настоящий LLM-агент на сервере; при сбое — встроенные правила
+   432→   432→          const res = await fetch('/api/agent', {
+   433→   433→            method: 'POST',
+   434→   434→            headers: { 'Content-Type': 'application/json' },
+   435→   435→            body: JSON.stringify({ question: trimmed }),
+   436→   436→          })
+   437→   437→          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+   438→   438→          const j = (await res.json()) as { answer: AgentMessage }
+   439→   439→          answer = j.answer
+   440→   440→        } catch {
+   441→   441→          answer = askAgent(trimmed, context.hives[0]?.id ?? 1, context)
+   442→   442→        }
+   443→   443→        // лёгкая пауза, чтобы индикатор «думает» не мигал при быстрых ответах
+   444→   444→        const elapsed = Date.now() - started
+   445→   445→        if (elapsed < 600) await new Promise((r) => setTimeout(r, 600 - elapsed))
+   446→   446→        setItems((prev) => [...prev, { role: 'agent', text: '', agent: answer }])
+   447→   447→        thinkingRef.current = false
+   448→   448→        setThinking(false)
+   449→   449→        // сохраняем переписку в базу — общая лента пасеки
+   450→   450→        if (useAppState.getState().user) {
+   451→   451→          void fetch('/api/chat', {
+   452→   452→            method: 'POST',
+   453→   453→            headers: { 'Content-Type': 'application/json' },
+   454→   454→            body: JSON.stringify({
+   455→   455→              userText: trimmed,
+   456→   456→              agentText: answer.text,
+   457→   457→              agent: answer,
+   458→   458→            }),
+   459→   459→          }).catch(() => undefined)
+   460→   460→        }
+   461→   461→      }
+   462→   462→      void run()
+   463→   463→    },
+   464→   464→    [ctx, stopVoice],
+   465→   465→  )
+   466→   466→
+   467→   467→  // consume prefill, заданного до монтирования + подписка на новые вопросы из дашборда
+   468→   468→  useEffect(() => {
+   469→   469→    useAppState.setState({ chatPrefill: null })
+   470→   470→    const unsub = useAppState.subscribe((state, prev) => {
+   471→   471→      if (state.chatPrefill && state.chatPrefill !== prev.chatPrefill) {
+   472→   472→        useAppState.setState({ chatPrefill: null })
+   473→   473→        sendUser(state.chatPrefill)
+   474→   474→      }
+   475→   475→    })
+   476→   476→    return unsub
+   477→   477→  }, [sendUser])
+   478→   478→
+   479→   479→  useEffect(() => {
+   480→   480→    const el = scrollRef.current
+   481→   481→    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+   482→   482→  }, [items, thinking])
+   483→   483→
+   484→   484→  /* Контекст ещё не готов — экран загрузки; пустая карта — честная подсказка */
+   485→   485→  if (!ctx || ctx.hives.length === 0) {
+   486→   486→    const noPoints = apiaryPoints !== null && apiaryPoints.length === 0
+   487→   487→    return (
+   488→   488→      <Card className="border-red-100">
+   489→   489→        <CardContent className="p-10 text-center">
+   490→   490→          <HexChip className="mx-auto h-12 w-12 animate-pulse bg-red-100">
+   491→   491→            <Bot className="h-6 w-6 text-red-600" />
+   492→   492→          </HexChip>
+   493→   493→          <p className="mt-3 text-sm text-gray-500">
+   494→   494→            {noPoints
+   495→   495→              ? 'На карте пасеки ещё нет ульев — привяжите улей по коду с корпуса датчика, и агент начнёт отвечать по его показаниям.'
+   496→   496→              : 'Агент загружается…'}
+   497→   497→          </p>
+   498→   498→        </CardContent>
+   499→   499→      </Card>
+   500→   500→    )
+   501→   501→  }
+   502→   502→
+   503→   503→  return (
+   504→   504→    <div className="grid gap-4 lg:grid-cols-[1fr_280px]">
+   505→   505→      {/* Чат */}
+   506→   506→      <Card className="flex flex-col border-red-100 shadow-sm lg:h-[calc(100vh-190px)] lg:min-h-[520px]">
+   507→   507→        <CardContent className="flex min-h-0 flex-1 flex-col p-0">
+   508→   508→          {/* шапка чата */}
+   509→   509→          <div className="flex flex-wrap items-center gap-2 border-b border-red-100 px-4 py-3">
+   510→   510→            <HexChip className="h-9 w-9 bg-gradient-to-br from-[#E93A2D] to-[#9B4DFF]">
+   511→   511→              <Sparkles className="h-4.5 w-4.5" />
+   512→   512→            </HexChip>
+   513→   513→            <div>
+   514→   514→              <p className="text-sm font-bold text-[#2A1A12]">ИИ-агент пасеки</p>
+   515→   515→              <p className="text-[11px] text-gray-400">
+   516→   516→                отвечает по телеметрии из базы данных
+   517→   517→              </p>
+   518→   518→            </div>
+   519→   519→            <div className="ml-auto flex items-center gap-1.5">
+   520→   520→              <span className="rounded-lg border border-red-100 bg-white px-2.5 py-1 text-xs font-semibold text-gray-600">
+   521→   521→                все ульи пасеки ({ctx.hives.length})
+   522→   522→              </span>
+   523→   523→            </div>
+   524→   524→          </div>
+   525→   525→
+   526→   526→          {/* лента сообщений */}
+   527→   527→          <div ref={scrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 md:px-5">
+   528→   528→            {items.map((item, idx) =>
+   529→   529→              item.role === 'user' ? (
+   530→   530→                <div key={idx} className="flex justify-end">
+   531→   531→                  <div className="max-w-[85%] rounded-2xl rounded-br-md bg-gradient-to-br from-[#E93A2D] to-[#8B2AFF] px-4 py-2.5 text-sm leading-relaxed text-white shadow-md shadow-red-200">
+   532→   532→                    {item.text}
+   533→   533→                  </div>
+   534→   534→                </div>
+   535→   535→              ) : (
+   536→   536→                <AgentBubble key={idx} msg={item.agent!} />
+   537→   537→              ),
+   538→   538→            )}
+   539→   539→            {thinking && (
+   540→   540→              <div className="flex items-center gap-2 pl-1">
+   541→   541→                <HexChip className="h-8 w-8 animate-pulse bg-red-100">
+   542→   542→                  <Bot className="h-4 w-4 text-red-600" />
+   543→   543→                </HexChip>
+   544→   544→                <span className="text-sm text-gray-400">Агент смотрит данные пасеки…</span>
+   545→   545→              </div>
+   546→   546→            )}
+   547→   547→          </div>
+   548→   548→
+   549→   549→          {/* быстрые вопросы + ввод */}
+   550→   550→          <div className="border-t border-red-100 px-4 py-3 md:px-5">
+   551→   551→            <div className="mb-2.5 flex gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+   552→   552→              {QUICK_QUESTIONS.map((q) => (
+   553→   553→                <button
+   554→   554→                  key={q}
+   555→   555→                  onClick={() => sendUser(tr('ru', q))}
+   556→   556→                  disabled={thinking}
+   557→   557→                  className="shrink-0 rounded-full border border-red-200 bg-red-50/60 px-3 py-1.5 text-xs font-medium text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50"
+   558→   558→                >
+   559→   559→                  {t(q)}
+   560→   560→                </button>
+   561→   561→              ))}
+   562→   562→            </div>
+   563→   563→            <form
+   564→   564→              className="flex items-end gap-2"
+   565→   565→              onSubmit={(e) => {
+   566→   566→                e.preventDefault()
+   567→   567→                sendUser(input)
+   568→   568→              }}
+   569→   569→            >
+   570→   570→              {voiceOk && (
+   571→   571→                <Button
+   572→   572→                  type="button"
+   573→   573→                  size="icon"
+   574→   574→                  /* push-to-talk: зажать кнопку и говорить — отпустить, чтобы завершить */
+   575→   575→                  onPointerDown={(e) => {
+   576→   576→                    if (holdActiveRef.current || voice === 'transcribing' || thinking) return
+   577→   577→                    e.preventDefault() // без выделения текста и «призрачных» кликов при удержании
+   578→   578→                    holdActiveRef.current = true
+   579→   579→                    holdStartedAtRef.current = Date.now()
+   580→   580→                    try {
+   581→   581→                      // захват указателя: отпустят в любом месте — событие всё равно придёт сюда
+   582→   582→                      e.currentTarget.setPointerCapture(e.pointerId)
+   583→   583→                    } catch {
+   584→   584→                      // без захвата остаются подстраховки: автостоп и клавиатурные события
+   585→   585→                    }
+   586→   586→                    void startVoice()
+   587→   587→                  }}
+   588→   588→                  onPointerUp={releaseHold}
+   589→   589→                  onPointerCancel={releaseHold}
+   590→   590→                  onLostPointerCapture={releaseHold}
+   591→   591→                  onKeyDown={(e) => {
+   592→   592→                    // доступность: Space/Enter зажимает кнопку так же, как мышь
+   593→   593→                    if (
+   594→   594→                      (e.code === 'Space' || e.code === 'Enter') &&
+   595→   595→                      !e.repeat &&
+   596→   596→                      !holdActiveRef.current &&
+   597→   597→                      voice !== 'transcribing' &&
+   598→   598→                      !thinking
+   599→   599→                    ) {
+   600→   600→                      e.preventDefault()
+   601→   601→                      holdActiveRef.current = true
+   602→   602→                      holdStartedAtRef.current = Date.now()
+   603→   603→                      void startVoice()
+   604→   604→                    }
+   605→   605→                  }}
+   606→   606→                  onKeyUp={(e) => {
+   607→   607→                    if (e.code === 'Space' || e.code === 'Enter') releaseHold()
+   608→   608→                  }}
+   609→   609→                  onContextMenu={(e) => e.preventDefault()}
+   610→   610→                  disabled={voice === 'transcribing' || thinking}
+   611→   611→                  aria-label={voice === 'recording' ? 'Отпустите, чтобы завершить запись' : 'Голосовой ввод: зажмите и говорите'}
+   612→   612→                  title={
+   613→   613→                    voice === 'recording'
+   614→   614→                      ? 'Говорите… отпустите кнопку, чтобы завершить'
+   615→   615→                      : 'Голосовой ввод: зажмите кнопку и скажите вопрос'
+   616→   616→                  }
+   617→   617→                  className={cn(
+   618→   618→                    'h-[46px] w-[46px] shrink-0 touch-none select-none border transition-all active:scale-95',
+   619→   619→                    voice === 'recording'
+   620→   620→                      ? 'animate-pulse border-red-400 bg-red-600 text-white'
+   621→   621→                      : 'border-red-200 bg-white text-red-600 hover:bg-red-50 dark:bg-[#221814]',
+   622→   622→                  )}
+   623→   623→                >
+   624→   624→                  {voice === 'recording' ? <Square className="h-4 w-4" /> : <Mic className="h-4.5 w-4.5" />}
+   625→   625→                </Button>
+   626→   626→              )}
+   627→   627→              <Textarea
+   628→   628→                value={input}
+   629→   629→                onChange={(e) => setInput(e.target.value)}
+   630→   630→                onKeyDown={(e) => {
+   631→   631→                  if (e.key === 'Enter' && !e.shiftKey) {
+   632→   632→                    e.preventDefault()
+   633→   633→                    sendUser(input)
+   634→   634→                  }
+   635→   635→                }}
+   636→   636→                placeholder="Спросите о погоде или ульях: «Как дела на пасеке?»"
+   637→   637→                className="min-h-[46px] resize-none border-red-200 focus-visible:ring-red-300"
+   638→   638→                rows={1}
+   639→   639→              />
+   640→   640→              <Button
+   641→   641→                type="submit"
+   642→   642→                size="icon"
+   643→   643→                className="h-[46px] w-[46px] shrink-0 bg-red-600 hover:bg-red-700"
+   644→   644→                disabled={thinking || !input.trim()}
+   645→   645→                aria-label="Отправить вопрос"
+   646→   646→              >
+   647→   647→                <Send className="h-4.5 w-4.5" />
+   648→   648→              </Button>
+   649→   649→            </form>
+   650→   650→            {(voice === 'recording' || voice === 'transcribing') && (
+   651→   651→              <p className="mt-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-red-600">
+   652→   652→                {voice === 'recording' ? (
+   653→   653→                  <>
+   654→   654→                    <span className="relative flex h-2 w-2">
+   655→   655→                      <span className="absolute h-full w-full animate-ping rounded-full bg-red-500 opacity-60" />
+   656→   656→                      <span className="relative h-2 w-2 rounded-full bg-red-600" />
+   657→   657→                    </span>
+   658→   658→                    Слушаю… говорите, держите кнопку зажатой — отпустите, и текст появится в поле ввода
+   659→   659→                  </>
+   660→   660→                ) : (
+   661→   661→                  <>
+   662→   662→                    <Loader2 className="h-3 w-3 animate-spin" /> Распознаю речь…
+   663→   663→                  </>
+   664→   664→                )}
+   665→   665→              </p>
+   666→   666→            )}
+   667→   667→          </div>
+   668→   668→        </CardContent>
+   669→   669→      </Card>
+   670→   670→
+   671→   671→      {/* Панель «что я умею» */}
+   672→   672→      <div className="space-y-3 lg:pt-0">
+   673→   673→        <Card className="border-red-100 bg-gradient-to-b from-red-50/70 to-white shadow-sm">
+   674→   674→          <CardContent className="p-4">
+   675→   675→            <p className="flex items-center gap-2 text-sm font-bold text-[#2A1A12]">
+   676→   676→              <Gauge className="h-4 w-4 text-red-600" /> Что я анализирую
+   677→   677→            </p>
+   678→   678→            <ul className="mt-2 space-y-1.5 text-xs leading-relaxed text-gray-600">
+   679→   679→              <li>• телеметрию из вашей базы: вес, температуру, влажность</li>
+   680→   680→              <li>• датчики точек на карте: температура, вес, влажность, шум</li>
+   681→   681→              <li>• погоду по координатам пасеки</li>
+   682→   682→              <li>• справочник площадок для кочёвки</li>
+   683→   683→              <li>• справочник здоровья пчёл: болезни, лечение, уход</li>
+   684→   684→            </ul>
+   685→   685→          </CardContent>
+   686→   686→        </Card>
+   687→   687→        <Card className="border-red-100 shadow-sm">
+   688→   688→          <CardContent className="p-4">
+   689→   689→            <p className="flex items-center gap-2 text-sm font-bold text-[#2A1A12]">
+   690→   690→              <CircleAlert className="h-4 w-4 text-orange-500" /> Принципы работы
+   691→   691→            </p>
+   692→   692→            <ul className="mt-2 space-y-1.5 text-xs leading-relaxed text-gray-600">
+   693→   693→              <li>• отвечаю сразу по всем ульям пасеки</li>
+   694→   694→              <li>• говорю о погоде, ульях и здоровье пчёл — остальное не моя тема</li>
+   695→   695→              <li>• совет опирается на показатели — всегда показываю, какие</li>
+   696→   696→              <li>• датчика нет или он выключен — данных об улье нет</li>
+   697→   697→              <li>• показываю вероятность и риск, а не 100 % прогноз</li>
+   698→   698→            </ul>
+   699→   699→          </CardContent>
+   700→   700→        </Card>
+   701→   701→        <Card className="border-red-100 shadow-sm">
+   702→   702→          <CardContent className="p-4">
+   703→   703→            <p className="text-sm font-bold text-[#2A1A12]">Текущий контекст</p>
+   704→   704→            <p className="mt-2 text-xs leading-relaxed text-gray-600">
+   705→   705→              Агент отвечает сразу по всем ульям пасеки: телеметрия, датчики точек на карте и погода.{' '}
+   706→   706→              История переписки сохраняется в базе.
+   707→   707→            </p>
+   708→   708→          </CardContent>
+   709→   709→        </Card>
+   710→   710→      </div>
+   711→   711→    </div>
+   712→   712→  )
+   713→   713→}
+   714→   714→
+   715→   715→function AgentBubble({ msg }: { msg: AgentMessage }) {
+   716→   716→  const t = useT()
+   717→   717→  const meta = URGENCY_META[msg.urgency]
+   718→   718→  return (
+   719→   719→    <div className="flex justify-start">
+   720→   720→      <div className="max-w-[92%] rounded-2xl rounded-bl-md border border-red-100 bg-white px-4 py-3 shadow-md shadow-red-100/60 md:max-w-[88%]">
+   721→   721→        <div className="flex flex-wrap items-center gap-2">
+   722→   722→          <HexChip className="h-7 w-7 bg-gradient-to-br from-[#E93A2D] to-[#9B4DFF]">
+   723→   723→            <span className="text-[10px] font-bold">{SCENARIO_ICON[msg.scenario] ?? '📊'}</span>
+   724→   724→          </HexChip>
+   725→   725→          {msg.scenario !== 'offtopic' && (
+   726→   726→            <span
+   727→   727→              className={cn(
+   728→   728→                'rounded-full border px-2.5 py-0.5 text-xs font-bold',
+   729→   729→                meta.cls,
+
+[showing lines 30-729 of 783; use offset=730 with limit to continue reading]

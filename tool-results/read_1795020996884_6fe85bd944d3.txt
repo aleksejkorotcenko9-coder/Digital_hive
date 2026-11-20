@@ -1,0 +1,706 @@
+     1→     1→'use client'
+     2→     2→
+     3→     3→/**
+     4→     4→ * Экран «ИИ-агент»: чат пчеловода с цифровым помощником.
+     5→     5→ * Агент отвечает сразу по всем ульям пасеки: телеметрия из базы, датчики точек
+     6→     6→ * на карте (температура, вес, влажность, шум) и реальная погода Open-Meteo.
+     7→     7→ * Темы строго ограничены: погода и ульи — отвечает, всё остальное — вежливо
+     8→     8→ * отказывается. Модель, на которой работает агент, пользователю не показывается.
+     9→     9→ * Есть голосовой ввод: кнопка микрофона записывает вопрос, речь распознаётся
+    10→    10→ * на сервере (/api/asr) и подставляется в поле ввода.
+    11→    11→ * Улии и показания синхронизированы с картой: и в демо, и в «Моих данных» агент
+    12→    12→ * говорит по тем же точкам и датчикам, что видит пчеловод на карте и дашборде.
+    13→    13→ * История переписки в реальном режиме сохраняется в SQLite (общая лента пасеки).
+    14→    14→ */
+    15→    15→import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+    16→    16→import { Bot, CircleAlert, Gauge, Loader2, Mic, Send, Sparkles, Square } from 'lucide-react'
+    17→    17→import { Button } from '@/components/ui/button'
+    18→    18→import { Card, CardContent } from '@/components/ui/card'
+    19→    19→import { Textarea } from '@/components/ui/textarea'
+    20→    20→import { useToast } from '@/hooks/use-toast'
+    21→    21→import { HexChip } from './decor'
+    22→    22→import { useAppState } from '@/lib/store'
+    23→    23→import { cn } from '@/lib/utils'
+    24→    24→import { askAgent, makeContext, QUICK_QUESTIONS, URGENCY_META, type AgentContext, type AgentMessage, type AgentPoint } from '@/lib/agent'
+    25→    25→import { apiary, migrationSites, pesticideAlert } from '@/lib/demo-data'
+    26→    26→import { pointsToHives } from '@/lib/hive-sync'
+    27→    27→import { buildRealContext, useRealData } from '@/lib/real-data'
+    28→    28→import { blobToWavBase64, getSpeechRecognition, VOICE_LANG, VOICE_MAX_SECONDS, voiceInputSupported, type SpeechRecognitionLike } from '@/lib/voice-input'
+    29→    29→import { weatherResponseToDays } from '@/lib/weather-days'
+    30→    30→import type { MapPointDto, WeatherResponse } from '@/lib/api-types'
+    31→    31→import type { ChatHistoryItem } from '@/lib/api-types'
+    32→    32→
+    33→    33→interface ChatItem {
+    34→    34→  role: 'user' | 'agent'
+    35→    35→  text: string
+    36→    36→  agent?: AgentMessage
+    37→    37→}
+    38→    38→
+    39→    39→/** Состояние голосового ввода: покой / запись / распознавание. */
+    40→    40→type VoiceState = 'idle' | 'recording' | 'transcribing'
+    41→    41→
+    42→    42→const SCENARIO_ICON: Record<string, string> = {
+    43→    43→  swarm: '🐝',
+    44→    44→  pesticide: '☣️',
+    45→    45→  weather: '⛅',
+    46→    46→  migration: '🚚',
+    47→    47→  status: '📊',
+    48→    48→  offtopic: '🚫',
+    49→    49→}
+    50→    50→
+    51→    51→export function AgentChatView() {
+    52→    52→  const mode = useAppState((s) => s.mode)
+    53→    53→  const user = useAppState((s) => s.user)
+    54→    54→  const { toast } = useToast()
+    55→    55→  const { status: realStatus, data } = useRealData()
+    56→    56→
+    57→    57→  // Погода для контекста агента: Open-Meteo через /api/weather (в обоих режимах —
+    58→    58→  // та же панель погоды, что на дашборде, чтобы агент называл те же числа)
+    59→    59→  const [wResp, setWResp] = useState<WeatherResponse | null>(null)
+    60→    60→  useEffect(() => {
+    61→    61→    let cancelled = false
+    62→    62→    void (async () => {
+    63→    63→      try {
+    64→    64→        const res = await fetch('/api/weather', { cache: 'no-store' })
+    65→    65→        if (!res.ok) throw new Error('weather')
+    66→    66→        const j = (await res.json()) as WeatherResponse
+    67→    67→        if (!cancelled) setWResp(j)
+    68→    68→      } catch {
+    69→    69→        // погода не критична: агент честно скажет, если данных нет
+    70→    70→      }
+    71→    71→    })()
+    72→    72→    const timer = setInterval(() => {
+    73→    73→      void (async () => {
+    74→    74→        try {
+    75→    75→          const res = await fetch('/api/weather', { cache: 'no-store' })
+    76→    76→          if (!res.ok) return
+    77→    77→          const j = (await res.json()) as WeatherResponse
+    78→    78→          if (!cancelled) setWResp(j)
+    79→    79→        } catch {
+    80→    80→          // оставляем предыдущий прогноз
+    81→    81→        }
+    82→    82→      })()
+    83→    83→    }, 10 * 60 * 1000)
+    84→    84→    return () => {
+    85→    85→      cancelled = true
+    86→    86→      clearInterval(timer)
+    87→    87→    }
+    88→    88→  }, [])
+    89→    89→  const agentWeather = useMemo(() => (wResp ? weatherResponseToDays(wResp) : null), [wResp])
+    90→    90→
+    91→    91→  // Демо: ульи и показания — те же точки, что на карте (синхронизация с /api/map-points)
+    92→    92→  const [demoPoints, setDemoPoints] = useState<MapPointDto[] | null>(null)
+    93→    93→  useEffect(() => {
+    94→    94→    if (mode !== 'demo') return
+    95→    95→    let alive = true
+    96→    96→    const load = async () => {
+    97→    97→      try {
+    98→    98→        const res = await fetch('/api/map-points', { cache: 'no-store' })
+    99→    99→        if (!res.ok) return
+   100→   100→        const j = (await res.json()) as { points: MapPointDto[] }
+   101→   101→        if (alive) setDemoPoints(j.points)
+   102→   102→      } catch {
+   103→   103→        // датчики подтянутся на следующем опросе
+   104→   104→      }
+   105→   105→    }
+   106→   106→    void load()
+   107→   107→    const timer = setInterval(() => void load(), 5000)
+   108→   108→    return () => {
+   109→   109→      alive = false
+   110→   110→      clearInterval(timer)
+   111→   111→    }
+   112→   112→  }, [mode])
+   113→   113→
+   114→   114→  const demoCtx = useMemo<AgentContext | null>(() => {
+   115→   115→    if (!demoPoints) return null
+   116→   116→    const points: AgentPoint[] = demoPoints.map((p) => ({
+   117→   117→      id: p.id,
+   118→   118→      name: p.name,
+   119→   119→      lat: p.lat,
+   120→   120→      lon: p.lon,
+   121→   121→      hiveCount: p.hiveCount,
+   122→   122→      hasSensor: p.hasSensor,
+   123→   123→      sensorOn: p.sensorOn,
+   124→   124→      sensor: p.sensor,
+   125→   125→    }))
+   126→   126→    return makeContext(pointsToHives(demoPoints), {
+   127→   127→      weather: agentWeather?.days ?? null,
+   128→   128→      weatherNow: agentWeather?.now ?? null,
+   129→   129→      pesticide: pesticideAlert, // сценарий демо: реестр обработок к пасеке не подключён
+   130→   130→      sites: migrationSites,
+   131→   131→      points,
+   132→   132→      apiaryName: apiary.name,
+   133→   133→    })
+   134→   134→  }, [demoPoints, agentWeather])
+   135→   135→
+   136→   136→  // контекст мемоизирован, чтобы не пересоздаваться на каждом рендере
+   137→   137→  // (иначе эффекты с ctx в зависимостях зацикливаются)
+   138→   138→  const ctx: AgentContext | null = useMemo(
+   139→   139→    () =>
+   140→   140→      mode === 'demo'
+   141→   141→        ? demoCtx
+   142→   142→        : data
+   143→   143→          ? buildRealContext(data, agentWeather?.days ?? null, agentWeather?.now ?? null)
+   144→   144→          : null,
+   145→   145→    [mode, demoCtx, data, agentWeather],
+   146→   146→  )
+   147→   147→
+   148→   148→  const [items, setItems] = useState<ChatItem[]>([])
+   149→   149→  const [input, setInput] = useState('')
+   150→   150→  const [thinking, setThinking] = useState(false)
+   151→   151→  const thinkingRef = useRef(false)
+   152→   152→  const scrollRef = useRef<HTMLDivElement>(null)
+   153→   153→
+   154→   154→  /* ---------- голосовой ввод: микрофон → текст в поле ввода ---------- */
+   155→   155→  // Основной путь — Web Speech API (Chrome/Edge/Яндекс.Браузер, ru-RU): текст
+   156→   156→  // появляется в поле ввода прямо во время разговора. Запасной путь (браузеры
+   157→   157→  // без нативного распознавания) — запись MediaRecorder → WAV → /api/asr.
+   158→   158→  const srClass = useMemo(() => getSpeechRecognition(), [])
+   159→   159→  const voiceOk = useMemo(() => !!srClass || voiceInputSupported(), [srClass])
+   160→   160→  const [voice, setVoice] = useState<VoiceState>('idle')
+   161→   161→  const speechRef = useRef<SpeechRecognitionLike | null>(null)
+   162→   162→  const recorderRef = useRef<MediaRecorder | null>(null)
+   163→   163→  const streamRef = useRef<MediaStream | null>(null)
+   164→   164→  const chunksRef = useRef<Blob[]>([])
+   165→   165→  const autoStopRef = useRef<number | null>(null)
+   166→   166→  const baseInputRef = useRef('')
+   167→   167→
+   168→   168→  const clearAutoStop = () => {
+   169→   169→    if (autoStopRef.current !== null) {
+   170→   170→      window.clearTimeout(autoStopRef.current)
+   171→   171→      autoStopRef.current = null
+   172→   172→    }
+   173→   173→  }
+   174→   174→
+   175→   175→  const stopVoice = useCallback(() => {
+   176→   176→    clearAutoStop()
+   177→   177→    if (speechRef.current) {
+   178→   178→      try {
+   179→   179→        speechRef.current.stop()
+   180→   180→      } catch {
+   181→   181→        // уже остановлен
+   182→   182→      }
+   183→   183→      return
+   184→   184→    }
+   185→   185→    const rec = recorderRef.current
+   186→   186→    if (rec && rec.state !== 'inactive') rec.stop()
+   187→   187→  }, [])
+   188→   188→
+   189→   189→  /** Запасной путь: собранный blob → WAV → /api/asr → текст. */
+   190→   190→  const finishVoice = useCallback(async () => {
+   191→   191→    // поток больше не нужен
+   192→   192→    streamRef.current?.getTracks().forEach((t) => t.stop())
+   193→   193→    streamRef.current = null
+   194→   194→    recorderRef.current = null
+   195→   195→    const blob = new Blob(chunksRef.current, { type: chunksRef.current[0]?.type || 'audio/webm' })
+   196→   196→    chunksRef.current = []
+   197→   197→    if (blob.size < 2048) {
+   198→   198→      setVoice('idle')
+   199→   199→      toast({ title: 'Запись пустая', description: 'Нажмите микрофон и скажите вопрос голосом.' })
+   200→   200→      return
+   201→   201→    }
+   202→   202→    setVoice('transcribing')
+   203→   203→    try {
+   204→   204→      const wav = await blobToWavBase64(blob)
+   205→   205→      const res = await fetch('/api/asr', {
+   206→   206→        method: 'POST',
+   207→   207→        headers: { 'Content-Type': 'application/json' },
+   208→   208→        body: JSON.stringify({ audio: wav }),
+   209→   209→      })
+   210→   210→      const j = (await res.json().catch(() => ({}))) as { text?: string; error?: string }
+   211→   211→      if (!res.ok || !j.text?.trim()) {
+   212→   212→        toast({ title: 'Речь не распознана', description: j.error ?? 'Попробуйте сказать чуть чётче.', variant: 'destructive' })
+   213→   213→        return
+   214→   214→      }
+   215→   215→      // текст подставляем в поле ввода — пчеловод может поправить и отправить
+   216→   216→      const base = baseInputRef.current
+   217→   217→      const text = j.text.trim()
+   218→   218→      setInput(base ? `${base} ${text}` : text)
+   219→   219→      toast({ title: 'Голос распознан', description: text })
+   220→   220→    } catch {
+   221→   221→      toast({ title: 'Не получилось', description: 'Не удалось распознать запись — попробуйте ещё раз.', variant: 'destructive' })
+   222→   222→    } finally {
+   223→   223→      setVoice('idle')
+   224→   224→    }
+   225→   225→  }, [toast])
+   226→   226→
+   227→   227→  const startVoice = useCallback(async () => {
+   228→   228→    clearAutoStop()
+   229→   229→    baseInputRef.current = input.trim()
+   230→   230→
+   231→   231→    // 1) нативное распознавание в браузере — русский отлично работает в Chrome/Яндексе
+   232→   232→    if (srClass) {
+   233→   233→      const rec = new srClass()
+   234→   234→      rec.lang = VOICE_LANG
+   235→   235→      rec.continuous = true
+   236→   236→      rec.interimResults = true
+   237→   237→      rec.maxAlternatives = 1
+   238→   238→      let finalText = ''
+   239→   239→      rec.onresult = (e) => {
+   240→   240→        let interim = ''
+   241→   241→        for (let i = e.resultIndex; i < e.results.length; i++) {
+   242→   242→          const r = e.results[i]
+   243→   243→          const t = r[0]?.transcript ?? ''
+   244→   244→          if (r.isFinal) finalText = finalText ? `${finalText} ${t.trim()}` : t.trim()
+   245→   245→          else interim += t
+   246→   246→        }
+   247→   247→        const text = (finalText + (interim ? ` ${interim}` : '')).trim()
+   248→   248→        if (text) {
+   249→   249→          const base = baseInputRef.current
+   250→   250→          setInput(base ? `${base} ${text}` : text)
+   251→   251→        }
+   252→   252→      }
+   253→   253→      rec.onerror = (ev) => {
+   254→   254→        const code = ev.error ?? ''
+   255→   255→        if (code === 'not-allowed' || code === 'service-not-allowed') {
+   256→   256→          toast({ title: 'Микрофон недоступен', description: 'Разрешите доступ к микрофону в браузере и попробуйте ещё раз.', variant: 'destructive' })
+   257→   257→        } else if (code === 'no-speech') {
+   258→   258→          toast({ title: 'Речи не слышно', description: 'Скажите вопрос чуть ближе к микрофону.' })
+   259→   259→        } else if (code !== 'aborted') {
+   260→   260→          toast({ title: 'Распознавание прервано', description: 'Скажите вопрос ещё раз.', variant: 'destructive' })
+   261→   261→        }
+   262→   262→      }
+   263→   263→      rec.onend = () => {
+   264→   264→        speechRef.current = null
+   265→   265→        clearAutoStop()
+   266→   266→        setVoice('idle')
+   267→   267→      }
+   268→   268→      speechRef.current = rec
+   269→   269→      try {
+   270→   270→        rec.start()
+   271→   271→      } catch {
+   272→   272→        toast({ title: 'Не получилось начать', description: 'Нажмите микрофон ещё раз.', variant: 'destructive' })
+   273→   273→        return
+   274→   274→      }
+   275→   275→      setVoice('recording')
+   276→   276→      autoStopRef.current = window.setTimeout(() => stopVoice(), VOICE_MAX_SECONDS * 1000)
+   277→   277→      return
+   278→   278→    }
+   279→   279→
+   280→   280→    // 2) запасной путь: запись с микрофона → серверное распознавание
+   281→   281→    try {
+   282→   282→      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+   283→   283→      streamRef.current = stream
+   284→   284→      chunksRef.current = []
+   285→   285→      const rec = new MediaRecorder(stream)
+   286→   286→      rec.ondataavailable = (e) => {
+   287→   287→        if (e.data.size > 0) chunksRef.current.push(e.data)
+   288→   288→      }
+   289→   289→      rec.onstop = () => void finishVoice()
+   290→   290→      rec.start()
+   291→   291→      recorderRef.current = rec
+   292→   292→      setVoice('recording')
+   293→   293→      autoStopRef.current = window.setTimeout(() => stopVoice(), VOICE_MAX_SECONDS * 1000)
+   294→   294→    } catch {
+   295→   295→      toast({
+   296→   296→        title: 'Микрофон недоступен',
+   297→   297→        description: 'Разрешите доступ к микрофону в браузере и попробуйте ещё раз.',
+   298→   298→        variant: 'destructive',
+   299→   299→      })
+   300→   300→    }
+   301→   301→  }, [srClass, input, finishVoice, stopVoice, toast])
+   302→   302→
+   303→   303→  // при размонтировании прерываем распознавание и закрываем поток
+   304→   304→  useEffect(
+   305→   305→    () => () => {
+   306→   306→      if (autoStopRef.current !== null) window.clearTimeout(autoStopRef.current)
+   307→   307→      try {
+   308→   308→        speechRef.current?.abort()
+   309→   309→      } catch {
+   310→   310→        // нет активного распознавания
+   311→   311→      }
+   312→   312→      streamRef.current?.getTracks().forEach((t) => t.stop())
+   313→   313→    },
+   314→   314→    [],
+   315→   315→  )
+   316→   316→
+   317→   317→  /* История из базы (реальный режим) — общая лента пасеки, без привязки к улью */
+   318→   318→  useEffect(() => {
+   319→   319→    if (mode !== 'real' || !user || realStatus !== 'ready' || !ctx) return
+   320→   320→    let cancelled = false
+   321→   321→    void (async () => {
+   322→   322→      try {
+   323→   323→        const res = await fetch('/api/chat?scope=general', { cache: 'no-store' })
+   324→   324→        if (!res.ok) throw new Error('history')
+   325→   325→        const j = (await res.json()) as { items: ChatHistoryItem[] }
+   326→   326→        if (cancelled) return
+   327→   327→        const restored: ChatItem[] = j.items.map((m) => ({
+   328→   328→          role: m.role,
+   329→   329→          text: m.text,
+   330→   330→          ...(m.role === 'agent' && m.agentJson
+   331→   331→            ? { agent: JSON.parse(m.agentJson) as AgentMessage }
+   332→   332→            : {}),
+   333→   333→        }))
+   334→   334→        if (restored.length === 0) {
+   335→   335→          setItems([{ role: 'agent', text: '', agent: askAgent('привет', ctx.hives[0]?.id ?? 1, ctx) }])
+   336→   336→        } else {
+   337→   337→          setItems(restored.slice(-30))
+   338→   338→        }
+   339→   339→      } catch {
+   340→   340→        if (!cancelled) {
+   341→   341→          setItems([{ role: 'agent', text: '', agent: askAgent('привет', ctx.hives[0]?.id ?? 1, ctx) }])
+   342→   342→        }
+   343→   343→      }
+   344→   344→    })()
+   345→   345→    return () => {
+   346→   346→      cancelled = true
+   347→   347→    }
+   348→   348→  }, [mode, user, realStatus, ctx])
+   349→   349→
+   350→   350→  /* Демо: приветствие один раз (история в демо не сохраняется) */
+   351→   351→  useEffect(() => {
+   352→   352→    if (mode !== 'demo' || !ctx) return
+   353→   353→    if (items.length === 0) {
+   354→   354→      setItems([{ role: 'agent', text: '', agent: askAgent('привет', ctx.hives[0]?.id ?? 1, ctx) }])
+   355→   355→    }
+   356→   356→  }, [mode, ctx, items.length])
+   357→   357→
+   358→   358→  const sendUser = useCallback(
+   359→   359→    (rawText: string) => {
+   360→   360→      const trimmed = rawText.trim()
+   361→   361→      if (!trimmed || thinkingRef.current) return
+   362→   362→      const context =
+   363→   363→        mode === 'demo'
+   364→   364→          ? demoCtx
+   365→   365→          : data
+   366→   366→            ? buildRealContext(data, agentWeather?.days ?? null, agentWeather?.now ?? null)
+   367→   367→            : null
+   368→   368→      if (!context) return
+   369→   369→      thinkingRef.current = true
+   370→   370→      setItems((prev) => [...prev, { role: 'user', text: trimmed }])
+   371→   371→      setInput('')
+   372→   372→      setThinking(true)
+   373→   373→      const started = Date.now()
+   374→   374→
+   375→   375→      const run = async () => {
+   376→   376→        let answer: AgentMessage
+   377→   377→        try {
+   378→   378→          // настоящий LLM-агент на сервере; при сбое — встроенные правила
+   379→   379→          const res = await fetch('/api/agent', {
+   380→   380→            method: 'POST',
+   381→   381→            headers: { 'Content-Type': 'application/json' },
+   382→   382→            body: JSON.stringify({ question: trimmed, mode }),
+   383→   383→          })
+   384→   384→          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+   385→   385→          const j = (await res.json()) as { answer: AgentMessage }
+   386→   386→          answer = j.answer
+   387→   387→        } catch {
+   388→   388→          answer = askAgent(trimmed, context.hives[0]?.id ?? 1, context)
+   389→   389→        }
+   390→   390→        // лёгкая пауза, чтобы индикатор «думает» не мигал при быстрых ответах
+   391→   391→        const elapsed = Date.now() - started
+   392→   392→        if (elapsed < 600) await new Promise((r) => setTimeout(r, 600 - elapsed))
+   393→   393→        setItems((prev) => [...prev, { role: 'agent', text: '', agent: answer }])
+   394→   394→        thinkingRef.current = false
+   395→   395→        setThinking(false)
+   396→   396→        // сохраняем переписку в базу (реальный режим) — общая лента пасеки
+   397→   397→        if (mode === 'real' && useAppState.getState().user) {
+   398→   398→          void fetch('/api/chat', {
+   399→   399→            method: 'POST',
+   400→   400→            headers: { 'Content-Type': 'application/json' },
+   401→   401→            body: JSON.stringify({
+   402→   402→              userText: trimmed,
+   403→   403→              agentText: answer.text,
+   404→   404→              agent: answer,
+   405→   405→            }),
+   406→   406→          }).catch(() => undefined)
+   407→   407→        }
+   408→   408→      }
+   409→   409→      void run()
+   410→   410→    },
+   411→   411→    [mode, demoCtx, data, agentWeather],
+   412→   412→  )
+   413→   413→
+   414→   414→  // consume prefill, заданного до монтирования + подписка на новые вопросы из дашборда
+   415→   415→  useEffect(() => {
+   416→   416→    useAppState.setState({ chatPrefill: null })
+   417→   417→    const unsub = useAppState.subscribe((state, prev) => {
+   418→   418→      if (state.chatPrefill && state.chatPrefill !== prev.chatPrefill) {
+   419→   419→        useAppState.setState({ chatPrefill: null })
+   420→   420→        sendUser(state.chatPrefill)
+   421→   421→      }
+   422→   422→    })
+   423→   423→    return unsub
+   424→   424→  }, [sendUser])
+   425→   425→
+   426→   426→  useEffect(() => {
+   427→   427→    const el = scrollRef.current
+   428→   428→    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+   429→   429→  }, [items, thinking])
+   430→   430→
+   431→   431→  /* Контекст ещё не готов — экран загрузки; пустая карта — честная подсказка */
+   432→   432→  if (!ctx || ctx.hives.length === 0) {
+   433→   433→    const demoEmpty = mode === 'demo' && demoPoints !== null && demoPoints.length === 0
+   434→   434→    return (
+   435→   435→      <Card className="border-red-100">
+   436→   436→        <CardContent className="p-10 text-center">
+   437→   437→          <HexChip className="mx-auto h-12 w-12 animate-pulse bg-red-100">
+   438→   438→            <Bot className="h-6 w-6 text-red-600" />
+   439→   439→          </HexChip>
+   440→   440→          <p className="mt-3 text-sm text-gray-500">
+   441→   441→            {demoEmpty
+   442→   442→              ? 'На карте пасеки ещё нет ульев с датчиками — привяжите улей по коду с корпуса датчика, и агент начнёт отвечать по его показаниям.'
+   443→   443→              : mode === 'real'
+   444→   444→                ? 'Ждём данные из базы: агент отвечает по телеметрии ваших ульев.'
+   445→   445→                : 'Агент загружается…'}
+   446→   446→          </p>
+   447→   447→        </CardContent>
+   448→   448→      </Card>
+   449→   449→    )
+   450→   450→  }
+   451→   451→
+   452→   452→  return (
+   453→   453→    <div className="grid gap-4 lg:grid-cols-[1fr_280px]">
+   454→   454→      {/* Чат */}
+   455→   455→      <Card className="flex flex-col border-red-100 shadow-sm lg:h-[calc(100vh-190px)] lg:min-h-[520px]">
+   456→   456→        <CardContent className="flex min-h-0 flex-1 flex-col p-0">
+   457→   457→          {/* шапка чата */}
+   458→   458→          <div className="flex flex-wrap items-center gap-2 border-b border-red-100 px-4 py-3">
+   459→   459→            <HexChip className="h-9 w-9 bg-gradient-to-br from-[#E93A2D] to-[#9B4DFF]">
+   460→   460→              <Sparkles className="h-4.5 w-4.5" />
+   461→   461→            </HexChip>
+   462→   462→            <div>
+   463→   463→              <p className="text-sm font-bold text-[#2A1A12]">ИИ-агент пасеки</p>
+   464→   464→              <p className="text-[11px] text-gray-400">
+   465→   465→                {mode === 'demo' ? 'данные — ульи и датчики на карте пасеки' : 'отвечает по телеметрии из базы данных'}
+   466→   466→              </p>
+   467→   467→            </div>
+   468→   468→            <div className="ml-auto flex items-center gap-1.5">
+   469→   469→              <span className="rounded-lg border border-red-100 bg-white px-2.5 py-1 text-xs font-semibold text-gray-600">
+   470→   470→                все ульи пасеки ({ctx.hives.length})
+   471→   471→              </span>
+   472→   472→            </div>
+   473→   473→          </div>
+   474→   474→
+   475→   475→          {/* лента сообщений */}
+   476→   476→          <div ref={scrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 md:px-5">
+   477→   477→            {items.map((item, idx) =>
+   478→   478→              item.role === 'user' ? (
+   479→   479→                <div key={idx} className="flex justify-end">
+   480→   480→                  <div className="max-w-[85%] rounded-2xl rounded-br-md bg-gradient-to-br from-[#E93A2D] to-[#8B2AFF] px-4 py-2.5 text-sm leading-relaxed text-white shadow-md shadow-red-200">
+   481→   481→                    {item.text}
+   482→   482→                  </div>
+   483→   483→                </div>
+   484→   484→              ) : (
+   485→   485→                <AgentBubble key={idx} msg={item.agent!} />
+   486→   486→              ),
+   487→   487→            )}
+   488→   488→            {thinking && (
+   489→   489→              <div className="flex items-center gap-2 pl-1">
+   490→   490→                <HexChip className="h-8 w-8 animate-pulse bg-red-100">
+   491→   491→                  <Bot className="h-4 w-4 text-red-600" />
+   492→   492→                </HexChip>
+   493→   493→                <span className="text-sm text-gray-400">Агент смотрит данные пасеки…</span>
+   494→   494→              </div>
+   495→   495→            )}
+   496→   496→          </div>
+   497→   497→
+   498→   498→          {/* быстрые вопросы + ввод */}
+   499→   499→          <div className="border-t border-red-100 px-4 py-3 md:px-5">
+   500→   500→            <div className="mb-2.5 flex gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+   501→   501→              {QUICK_QUESTIONS.map((q) => (
+   502→   502→                <button
+   503→   503→                  key={q}
+   504→   504→                  onClick={() => sendUser(q)}
+   505→   505→                  disabled={thinking}
+   506→   506→                  className="shrink-0 rounded-full border border-red-200 bg-red-50/60 px-3 py-1.5 text-xs font-medium text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50"
+   507→   507→                >
+   508→   508→                  {q}
+   509→   509→                </button>
+   510→   510→              ))}
+   511→   511→            </div>
+   512→   512→            <form
+   513→   513→              className="flex items-end gap-2"
+   514→   514→              onSubmit={(e) => {
+   515→   515→                e.preventDefault()
+   516→   516→                sendUser(input)
+   517→   517→              }}
+   518→   518→            >
+   519→   519→              {voiceOk && (
+   520→   520→                <Button
+   521→   521→                  type="button"
+   522→   522→                  size="icon"
+   523→   523→                  onClick={() => (voice === 'recording' ? stopVoice() : void startVoice())}
+   524→   524→                  disabled={voice === 'transcribing' || thinking}
+   525→   525→                  aria-label={voice === 'recording' ? 'Завершить запись' : 'Голосовой ввод'}
+   526→   526→                  title={
+   527→   527→                    voice === 'recording'
+   528→   528→                      ? 'Говорите… нажмите ещё раз, чтобы завершить'
+   529→   529→                      : 'Голосовой ввод: нажмите и скажите вопрос'
+   530→   530→                  }
+   531→   531→                  className={cn(
+   532→   532→                    'h-[46px] w-[46px] shrink-0 border transition-colors',
+   533→   533→                    voice === 'recording'
+   534→   534→                      ? 'animate-pulse border-red-400 bg-red-600 text-white hover:bg-red-700'
+   535→   535→                      : 'border-red-200 bg-white text-red-600 hover:bg-red-50 dark:bg-[#221814]',
+   536→   536→                  )}
+   537→   537→                >
+   538→   538→                  {voice === 'recording' ? <Square className="h-4 w-4" /> : <Mic className="h-4.5 w-4.5" />}
+   539→   539→                </Button>
+   540→   540→              )}
+   541→   541→              <Textarea
+   542→   542→                value={input}
+   543→   543→                onChange={(e) => setInput(e.target.value)}
+   544→   544→                onKeyDown={(e) => {
+   545→   545→                  if (e.key === 'Enter' && !e.shiftKey) {
+   546→   546→                    e.preventDefault()
+   547→   547→                    sendUser(input)
+   548→   548→                  }
+   549→   549→                }}
+   550→   550→                placeholder="Спросите о погоде или ульях: «Как дела на пасеке?»"
+   551→   551→                className="min-h-[46px] resize-none border-red-200 focus-visible:ring-red-300"
+   552→   552→                rows={1}
+   553→   553→              />
+   554→   554→              <Button
+   555→   555→                type="submit"
+   556→   556→                size="icon"
+   557→   557→                className="h-[46px] w-[46px] shrink-0 bg-red-600 hover:bg-red-700"
+   558→   558→                disabled={thinking || !input.trim()}
+   559→   559→                aria-label="Отправить вопрос"
+   560→   560→              >
+   561→   561→                <Send className="h-4.5 w-4.5" />
+   562→   562→              </Button>
+   563→   563→            </form>
+   564→   564→            {(voice === 'recording' || voice === 'transcribing') && (
+   565→   565→              <p className="mt-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-red-600">
+   566→   566→                {voice === 'recording' ? (
+   567→   567→                  <>
+   568→   568→                    <span className="relative flex h-2 w-2">
+   569→   569→                      <span className="absolute h-full w-full animate-ping rounded-full bg-red-500 opacity-60" />
+   570→   570→                      <span className="relative h-2 w-2 rounded-full bg-red-600" />
+   571→   571→                    </span>
+   572→   572→                    Слушаю… говорите — текст появится в поле ввода; нажмите кнопку, чтобы завершить
+   573→   573→                  </>
+   574→   574→                ) : (
+   575→   575→                  <>
+   576→   576→                    <Loader2 className="h-3 w-3 animate-spin" /> Распознаю речь…
+   577→   577→                  </>
+   578→   578→                )}
+   579→   579→              </p>
+   580→   580→            )}
+   581→   581→          </div>
+   582→   582→        </CardContent>
+   583→   583→      </Card>
+   584→   584→
+   585→   585→      {/* Панель «что я умею» */}
+   586→   586→      <div className="space-y-3 lg:pt-0">
+   587→   587→        <Card className="border-red-100 bg-gradient-to-b from-red-50/70 to-white shadow-sm">
+   588→   588→          <CardContent className="p-4">
+   589→   589→            <p className="flex items-center gap-2 text-sm font-bold text-[#2A1A12]">
+   590→   590→              <Gauge className="h-4 w-4 text-red-600" /> Что я анализирую
+   591→   591→            </p>
+   592→   592→            <ul className="mt-2 space-y-1.5 text-xs leading-relaxed text-gray-600">
+   593→   593→              {mode === 'demo' ? (
+   594→   594→                <>
+   595→   595→                  <li>• телеметрию: вес, температуру, влажность всех ульев</li>
+   596→   596→                  <li>• датчики точек на карте: температура, вес, влажность, шум</li>
+   597→   597→                  <li>• прогноз погоды и окна лёта пчёл</li>
+   598→   598→                  <li>• карту полей и предупреждения об обработках</li>
+   599→   599→                </>
+   600→   600→              ) : (
+   601→   601→                <>
+   602→   602→                  <li>• телеметрию из вашей базы: вес, температуру, влажность</li>
+   603→   603→                  <li>• датчики точек на карте: температура, вес, влажность, шум</li>
+   604→   604→                  <li>• погоду по координатам пасеки (Open-Meteo)</li>
+   605→   605→                  <li>• справочник площадок для кочёвки</li>
+   606→   606→                </>
+   607→   607→              )}
+   608→   608→            </ul>
+   609→   609→          </CardContent>
+   610→   610→        </Card>
+   611→   611→        <Card className="border-red-100 shadow-sm">
+   612→   612→          <CardContent className="p-4">
+   613→   613→            <p className="flex items-center gap-2 text-sm font-bold text-[#2A1A12]">
+   614→   614→              <CircleAlert className="h-4 w-4 text-orange-500" /> Принципы работы
+   615→   615→            </p>
+   616→   616→            <ul className="mt-2 space-y-1.5 text-xs leading-relaxed text-gray-600">
+   617→   617→              <li>• отвечаю сразу по всем ульям пасеки</li>
+   618→   618→              <li>• говорю только о погоде и ульях — остальное не моя тема</li>
+   619→   619→              <li>• совет опирается на показатели — всегда показываю, какие</li>
+   620→   620→              <li>• датчика нет или он выключен — данных об улье нет</li>
+   621→   621→              <li>• показываю вероятность и риск, а не 100 % прогноз</li>
+   622→   622→            </ul>
+   623→   623→          </CardContent>
+   624→   624→        </Card>
+   625→   625→        <Card className="border-red-100 shadow-sm">
+   626→   626→          <CardContent className="p-4">
+   627→   627→            <p className="text-sm font-bold text-[#2A1A12]">Текущий контекст</p>
+   628→   628→            <p className="mt-2 text-xs leading-relaxed text-gray-600">
+   629→   629→              Агент отвечает сразу по всем ульям пасеки: телеметрия, датчики точек на карте и погода.{' '}
+   630→   630→              {mode === 'real' ? 'История переписки сохраняется в базе.' : 'Данные синхронизированы с ульями на карте пасеки.'}
+   631→   631→            </p>
+   632→   632→          </CardContent>
+   633→   633→        </Card>
+   634→   634→      </div>
+   635→   635→    </div>
+   636→   636→  )
+   637→   637→}
+   638→   638→
+   639→   639→function AgentBubble({ msg }: { msg: AgentMessage }) {
+   640→   640→  const meta = URGENCY_META[msg.urgency]
+   641→   641→  return (
+   642→   642→    <div className="flex justify-start">
+   643→   643→      <div className="max-w-[92%] rounded-2xl rounded-bl-md border border-red-100 bg-white px-4 py-3 shadow-md shadow-red-100/60 md:max-w-[88%]">
+   644→   644→        <div className="flex flex-wrap items-center gap-2">
+   645→   645→          <HexChip className="h-7 w-7 bg-gradient-to-br from-[#E93A2D] to-[#9B4DFF]">
+   646→   646→            <span className="text-[10px] font-bold">{SCENARIO_ICON[msg.scenario] ?? '📊'}</span>
+   647→   647→          </HexChip>
+   648→   648→          {msg.scenario !== 'offtopic' && (
+   649→   649→            <span
+   650→   650→              className={cn(
+   651→   651→                'rounded-full border px-2.5 py-0.5 text-xs font-bold',
+   652→   652→                meta.cls,
+   653→   653→              )}
+   654→   654→            >
+   655→   655→              {meta.label}
+   656→   656→            </span>
+   657→   657→          )}
+   658→   658→          {msg.scenario === 'offtopic' && (
+   659→   659→            <span className="rounded-full border border-gray-200 bg-gray-100 px-2.5 py-0.5 text-xs font-bold text-gray-600">
+   660→   660→              Не по теме
+   661→   661→            </span>
+   662→   662→          )}
+   663→   663→          {msg.urgencyNote && (
+   664→   664→            <span className="text-xs font-semibold text-gray-500">{msg.urgencyNote}</span>
+   665→   665→          )}
+   666→   666→        </div>
+   667→   667→
+   668→   668→        <p className="mt-2.5 whitespace-pre-line text-sm leading-relaxed text-gray-700">
+   669→   669→          {msg.text}
+   670→   670→        </p>
+   671→   671→
+   672→   672→        {msg.metrics.length > 0 && (
+   673→   673→          <div className="mt-3 grid grid-cols-3 gap-2">
+   674→   674→            {msg.metrics.map((m) => (
+   675→   675→              <div key={m.label} className="rounded-xl bg-red-50/70 px-2.5 py-2">
+   676→   676→                <p className="truncate text-[10px] uppercase tracking-wide text-gray-400">{m.label}</p>
+   677→   677→                <p className="mt-0.5 text-sm font-extrabold text-[#2A1A12]">{m.value}</p>
+   678→   678→              </div>
+   679→   679→            ))}
+   680→   680→          </div>
+   681→   681→        )}
+   682→   682→
+   683→   683→        {msg.basis.length > 0 && (
+   684→   684→          <div className="mt-3">
+   685→   685→            <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Основание</p>
+   686→   686→            <div className="mt-1 flex flex-wrap gap-1.5">
+   687→   687→              {msg.basis.map((b) => (
+   688→   688→                <span key={b} className="rounded-full bg-gray-100 px-2.5 py-1 text-xs text-gray-600">
+   689→   689→                  {b}
+   690→   690→                </span>
+   691→   691→              ))}
+   692→   692→            </div>
+   693→   693→          </div>
+   694→   694→        )}
+   695→   695→
+   696→   696→        {msg.probability && (
+   697→   697→          <p className="mt-2.5 text-xs font-semibold text-red-700">{msg.probability}</p>
+   698→   698→        )}
+   699→   699→        <p className="mt-2 border-t border-dashed border-red-100 pt-2 text-[11px] text-gray-400">
+   700→   700→          Вероятностная оценка — решение принимает пчеловод
+   701→   701→        </p>
+   702→   702→      </div>
+   703→   703→    </div>
+   704→   704→  )
+   705→   705→}
+   706→   706→

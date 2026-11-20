@@ -1,0 +1,927 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Демо-режим дашборда «Цифровой улей»: четыре сценарных улья (№1 норма,
+     5→ * №2 медосбор, №3 заклещенность, №4 предроевое) с живой телеметрией —
+     6→ * тик каждые 2 секунды, плавные колебания ±0,1 °C / ±1 % / ±10–15 г /
+     7→ * ±3 Гц / ±15 ppm / ±3 пчелы/мин. Структура колонок та же, что в реальном
+     8→ * режиме: слева погода + GDD, в центре состояние пасеки и все 6 групп
+     9→ * датчиков, справа доказательные предписания агента и вечерний отчет.
+    10→ */
+    11→import { useState } from 'react'
+    12→import { AnimatePresence, motion } from 'framer-motion'
+    13→import {
+    14→  AlertTriangle,
+    15→  AudioLines,
+    16→  Bug,
+    17→  CalendarDays,
+    18→  Cctv,
+    19→  CheckCircle2,
+    20→  ClipboardList,
+    21→  Droplets,
+    22→  FlaskConical,
+    23→  Flower2,
+    24→  Gauge,
+    25→  MapPin,
+    26→  MessageSquareText,
+    27→  Scale,
+    28→  Search,
+    29→  Split,
+    30→  Sun,
+    31→  Thermometer,
+    32→  TrendingUp,
+    33→  Wind,
+    34→} from 'lucide-react'
+    35→import { format } from 'date-fns'
+    36→import { ru } from 'date-fns/locale'
+    37→import { Button } from '@/components/ui/button'
+    38→import { useToast } from '@/hooks/use-toast'
+    39→import { cn } from '@/lib/utils'
+    40→import { fmtNum, fmtSigned } from '@/lib/hive-model'
+    41→import {
+    42→  DEMO_HIVES,
+    43→  GDD_CURRENT,
+    44→  GDD_PER_DAY,
+    45→  SCENARIO_DOT,
+    46→  demoClimateSeries,
+    47→  demoGaugeInfo,
+    48→  demoHiveById,
+    49→  demoVarroaSeries,
+    50→  demoWeightSeries,
+    51→  gddForecast,
+    52→  trafficState,
+    53→  varroaStatus,
+    54→  vocState,
+    55→  type DemoFinding,
+    56→  type DemoScenario,
+    57→} from '@/lib/demo-hives'
+    58→import { liveForHive, useLiveTelemetry } from '@/hooks/use-live-demo'
+    59→import { useAppState } from '@/lib/store'
+    60→import { WeatherPanel } from './WeatherPanel'
+    61→import { StatusGauge } from './StatusGauge'
+    62→import { ModeSwitcher } from './ModeSwitcher'
+    63→import { UrgencyBadge } from './decor'
+    64→import {
+    65→  AcousticSpark,
+    66→  DemoClimateMini,
+    67→  DemoWeightBars,
+    68→  LiveValue,
+    69→  Rise,
+    70→  SensorCardIcon,
+    71→  VarroaChart,
+    72→} from './DemoCharts'
+    73→import { EvidenceDialog, EveningReportDialog } from './DemoDialogs'
+    74→
+    75→/** Демо-пасека стоит в поле у Белебея — погода берётся там же. */
+    76→const FIELD_CENTER: [number, number] = [54.0265, 55.7391]
+    77→
+    78→/* ------------------------------------------------------------------ */
+    79→/* Баннер срочности по сценарию улья                                   */
+    80→/* ------------------------------------------------------------------ */
+    81→
+    82→const BANNERS: Record<
+    83→  DemoScenario,
+    84→  { cls: string; icon: typeof Sun; title: string; text: string; cta: string }
+    85→> = {
+    86→  norm: {
+    87→    cls: 'bg-gradient-to-r from-emerald-600 to-teal-500 shadow-emerald-100',
+    88→    icon: Sun,
+    89→    title: 'Все показатели в норме',
+    90→    text: 'Семья №1 работает штатно: температура, вес, акустика и качество воздуха — в рабочих диапазонах. Вмешательство не требуется.',
+    91→    cta: 'Доказательства агента',
+    92→  },
+    93→  flow: {
+    94→    cls: 'bg-gradient-to-r from-amber-500 to-orange-400 shadow-amber-100',
+    95→    icon: TrendingUp,
+    96→    title: 'Активный медосбор',
+    97→    text: 'Семья №2 приносит +480 г/сут: весы, гигрометр и акустика синхронно показывают сушку нектара — дайте семье объем под свежий мед.',
+    98→    cta: 'Доказательства агента',
+    99→  },
+   100→  varroa: {
+   101→    cls: 'bg-gradient-to-r from-[#D93E00] to-[#FF5A1F] shadow-red-100',
+   102→    icon: AlertTriangle,
+   103→    title: 'Критическая заклещенность',
+   104→    text: 'Заклещенность 3,6 % — порог 3 % превышен. Прогноз через 14 дней — 5,2 %: высокий риск вируса деформации крыла. Обработка щавелевой кислотой — сегодня.',
+   105→    cta: 'Почему агент так решил?',
+   106→  },
+   107→  swarm: {
+   108→    cls: 'bg-gradient-to-r from-[#C23000] to-[#F2542D] shadow-red-100',
+   109→    icon: Split,
+   110→    title: 'Предроевое состояние',
+   111→    text: 'Пение маток 390 Гц, «борода» на летке, CO₂ 1450 ppm — рой выйдет через 3–5 дней. Осмотрите маточники сегодня.',
+   112→    cta: 'Почему агент так решил?',
+   113→  },
+   114→}
+   115→
+   116→/* ------------------------------------------------------------------ */
+   117→/* Мелкие блоки                                                        */
+   118→/* ------------------------------------------------------------------ */
+   119→
+   120→function LiveTile({
+   121→  icon,
+   122→  label,
+   123→  value,
+   124→  hint,
+   125→}: {
+   126→  icon: React.ReactNode
+   127→  label: string
+   128→  value: React.ReactNode
+   129→  hint?: string
+   130→}) {
+   131→  return (
+   132→    <div className="rounded-xl border border-red-50 bg-red-50/40 px-3 py-2.5 dark:bg-[#2C211C]">
+   133→      <p className="flex items-center gap-1.5 text-[11px] font-semibold text-gray-500">
+   134→        <span className="text-red-400">{icon}</span>
+   135→        {label}
+   136→      </p>
+   137→      <p className="mt-1 text-lg font-extrabold leading-none text-gray-900">
+   138→        <LiveValue value={value as string} />
+   139→      </p>
+   140→      {hint && <p className="mt-1 text-[10px] text-gray-400">{hint}</p>}
+   141→    </div>
+   142→  )
+   143→}
+   144→
+   145→function MiniCard({
+   146→  title,
+   147→  value,
+   148→  note,
+   149→  icon,
+   150→  children,
+   151→}: {
+   152→  title: string
+   153→  value: React.ReactNode
+   154→  note: string
+   155→  icon: React.ReactNode
+   156→  children: React.ReactNode
+   157→}) {
+   158→  return (
+   159→    <div className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]">
+   160→      <div className="flex items-center justify-between gap-2">
+   161→        <h3 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   162→          <span className="text-red-400">{icon}</span>
+   163→          {title}
+   164→        </h3>
+   165→        <span className="text-base font-extrabold text-red-600">{value}</span>
+   166→      </div>
+   167→      <div className="mt-1 h-[150px]">{children}</div>
+   168→      <p className="mt-1 text-[11px] text-gray-400">{note}</p>
+   169→    </div>
+   170→  )
+   171→}
+   172→
+   173→/** Плитка выбора улья: номер, индекс, сценарий — с анимированным выделением. */
+   174→function HiveCard({
+   175→  id,
+   176→  scenario,
+   177→  scenarioLabel,
+   178→  index,
+   179→  active,
+   180→  onClick,
+   181→}: {
+   182→  id: number
+   183→  scenario: DemoScenario
+   184→  scenarioLabel: string
+   185→  index: number
+   186→  active: boolean
+   187→  onClick: () => void
+   188→}) {
+   189→  return (
+   190→    <button
+   191→      onClick={onClick}
+   192→      aria-pressed={active}
+   193→      className="relative rounded-2xl border border-red-100 bg-white px-3 py-2.5 text-left transition-shadow hover:shadow-md hover:shadow-red-50 dark:bg-[#221814]"
+   194→    >
+   195→      {active && (
+   196→        <motion.span
+   197→          layoutId="demo-hive-active"
+   198→          className="absolute inset-0 rounded-2xl bg-red-50/70 ring-2 ring-red-500"
+   199→          transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+   200→        />
+   201→      )}
+   202→      <span className="relative flex items-center justify-between gap-2">
+   203→        <span className="flex items-center gap-1.5 text-sm font-extrabold text-[#2A1A12]">
+   204→          <span className={cn('h-2 w-2 rounded-full', SCENARIO_DOT[scenario])} />
+   205→          №{id}
+   206→        </span>
+   207→        <span className="text-sm font-extrabold text-red-600">
+   208→          <LiveValue value={fmtNum(index)} />
+   209→        </span>
+   210→      </span>
+   211→      <span className="relative mt-1 block text-[11px] font-semibold leading-tight text-gray-600">
+   212→        {scenarioLabel}
+   213→      </span>
+   214→    </button>
+   215→  )
+   216→}
+   217→
+   218→/** GDD-прогресс до цветения ближайших медоносов. */
+   219→function GddCard() {
+   220→  const crops = gddForecast()
+   221→  const soon = crops.filter((c) => c.soon)
+   222→  return (
+   223→    <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   224→      <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   225→        <Flower2 className="h-4 w-4 text-red-500" /> Цветение медоносов · GDD
+   226→      </h2>
+   227→      <p className="mt-1 text-[11px] text-gray-400">
+   228→        Сумма эффективных температур: {GDD_CURRENT} °C·сут · +{GDD_PER_DAY} в сутки
+   229→      </p>
+   230→      <ul className="mt-3 space-y-3">
+   231→        {crops.map((c) => (
+   232→          <li key={c.key}>
+   233→            <div className="flex items-center justify-between text-xs">
+   234→              <span className="font-bold text-gray-800">{c.name}</span>
+   235→              <span className={cn('font-semibold', c.soon ? 'text-amber-600' : 'text-gray-400')}>
+   236→                через ~{c.daysLeft} дн.
+   237→              </span>
+   238→            </div>
+   239→            <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-red-50 dark:bg-[#2C211C]">
+   240→              <motion.div
+   241→                className={cn(
+   242→                  'h-full rounded-full bg-gradient-to-r',
+   243→                  c.soon ? 'from-amber-400 to-orange-500' : 'from-emerald-400 to-emerald-500',
+   244→                )}
+   245→                initial={{ width: 0 }}
+   246→                animate={{ width: `${c.pct}%` }}
+   247→                transition={{ duration: 0.9, ease: 'easeOut', delay: 0.15 }}
+   248→              />
+   249→            </div>
+   250→            <p className="mt-1 text-[10px] text-gray-400">
+   251→              {c.note} · {c.pct} % порога
+   252→            </p>
+   253→          </li>
+   254→        ))}
+   255→      </ul>
+   256→      {soon.length > 0 && (
+   257→        <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-semibold leading-relaxed text-amber-800">
+   258→          Автопредупреждение: до цветения «{soon[0].name}» около {soon[0].daysLeft} дн. — поставьте магазины и
+   259→          проверьте вентиляцию заранее.
+   260→        </p>
+   261→      )}
+   262→    </section>
+   263→  )
+   264→}
+   265→
+   266→/* ------------------------------------------------------------------ */
+   267→/* Демо-дашборд                                                        */
+   268→/* ------------------------------------------------------------------ */
+   269→
+   270→export function DemoDashboard() {
+   271→  const hiveId = useAppState((s) => s.hiveId)
+   272→  const setHive = useAppState((s) => s.setHive)
+   273→  const ask = useAppState((s) => s.ask)
+   274→  const reminders = useAppState((s) => s.reminders)
+   275→  const setView = useAppState((s) => s.setView)
+   276→  const { toast } = useToast()
+   277→
+   278→  const live = useLiveTelemetry()
+   279→  const hive = demoHiveById(hiveId)
+   280→  const liveV = liveForHive(live, hive)
+   281→
+   282→  // выполненные предписания: улей → список id; индекс улья растёт на boost
+   283→  const [done, setDone] = useState<Record<number, string[]>>({})
+   284→  const [evidence, setEvidence] = useState<DemoFinding | null>(null)
+   285→  const [reportOpen, setReportOpen] = useState(false)
+   286→
+   287→  const doneForHive = done[hive.id] ?? []
+   288→  const indexWithBoost = (id: number) => {
+   289→    const h = demoHiveById(id)
+   290→    const boosts = h.prescriptions
+   291→      .filter((f) => (done[id] ?? []).includes(f.id))
+   292→      .reduce((s, f) => s + f.boost, 0)
+   293→    return Math.min(10, h.index + boosts)
+   294→  }
+   295→  const gaugeValue = indexWithBoost(hive.id)
+   296→  const gauge = demoGaugeInfo(gaugeValue)
+   297→
+   298→  const climate = demoClimateSeries(hive)
+   299→  const weight = demoWeightSeries(hive)
+   300→  const varroaSeries = demoVarroaSeries(hive)
+   301→  // живой спарклайн гула: буфер последних тиков выбранного улья
+   302→  const sparkHz = (live.spark[hive.id] ?? []).map((v) => v.soundHz)
+   303→
+   304→  const banner = BANNERS[hive.scenario]
+   305→  const BannerIcon = banner.icon
+   306→  const varroa = varroaStatus(hive.base.varroaPct)
+   307→  const voc = vocState(liveV.vocIndex)
+   308→  const traffic = trafficState(liveV.trafficPerMin)
+   309→  const crops = gddForecast()
+   310→  const nearest = [...crops].sort((a, b) => a.daysLeft - b.daysLeft)[0]
+   311→
+   312→  const todayLabel = format(new Date(), 'EEEE, d MMMM yyyy', { locale: ru })
+   313→
+   314→  const complete = (f: DemoFinding) => {
+   315→    const before = indexWithBoost(hive.id)
+   316→    setDone((prev) => {
+   317→      const cur = prev[hive.id] ?? []
+   318→      if (cur.includes(f.id)) return prev
+   319→      return { ...prev, [hive.id]: [...cur, f.id] }
+   320→    })
+   321→    setEvidence(null)
+   322→    const after = Math.min(10, before + f.boost)
+   323→    toast({
+   324→      title: 'Предписание выполнено',
+   325→      description: `«${f.action}» — индекс улья №${hive.id}: ${fmtNum(before)} → ${fmtNum(after)}`,
+   326→    })
+   327→  }
+   328→
+   329→  const upcomingReminders = reminders
+   330→    .filter((r) => !r.done)
+   331→    .sort((a, b) => a.remindAt.localeCompare(b.remindAt))
+   332→    .slice(0, 3)
+   333→
+   334→  return (
+   335→    <div className="space-y-5">
+   336→      {/* Баннер срочности по сценарию выбранного улья */}
+   337→      <AnimatePresence mode="wait" initial={false}>
+   338→        <motion.div
+   339→          key={hive.id}
+   340→          initial={{ opacity: 0, y: -8 }}
+   341→          animate={{ opacity: 1, y: 0 }}
+   342→          exit={{ opacity: 0, y: 8 }}
+   343→          transition={{ duration: 0.3 }}
+   344→          className={cn(
+   345→            'animate-sheen relative overflow-hidden rounded-2xl p-4 text-white shadow-lg md:p-5',
+   346→            banner.cls,
+   347→          )}
+   348→        >
+   349→          <BannerIcon className="absolute -right-3 -top-3 h-28 w-28 rotate-12 text-white/15" />
+   350→          <div className="relative flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+   351→            <div className="flex items-start gap-3">
+   352→              <BannerIcon className="mt-0.5 h-6 w-6 shrink-0" />
+   353→              <div>
+   354→                <p className="text-sm font-bold uppercase tracking-wide text-white/90">{banner.title}</p>
+   355→                <p className="mt-1 text-sm leading-snug md:text-base">{banner.text}</p>
+   356→              </div>
+   357→            </div>
+   358→            <Button
+   359→              className="w-fit shrink-0 bg-white font-semibold text-red-700 hover:bg-red-50"
+   360→              onClick={() => setEvidence(hive.prescriptions[0])}
+   361→            >
+   362→              <Search className="h-4 w-4" /> {banner.cta}
+   363→            </Button>
+   364→          </div>
+   365→        </motion.div>
+   366→      </AnimatePresence>
+   367→
+   368→      {/* Заголовок пасеки + переключатель «Демо / Мои данные» */}
+   369→      <div className="flex flex-wrap items-end justify-between gap-3">
+   370→        <div>
+   371→          <h1 className="text-2xl font-extrabold tracking-tight text-[#2A1A12] md:text-3xl">
+   372→            Моя пасека · <span className="text-red-600">демо-режим</span>
+   373→          </h1>
+   374→          <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-gray-500">
+   375→            <span className="flex items-center gap-1">
+   376→              <FlaskConical className="h-3.5 w-3.5 text-red-500" /> 4 улья-сценария · телеметрия каждые 2 с
+   377→            </span>
+   378→            <span className="flex items-center gap-1">
+   379→              <MapPin className="h-3.5 w-3.5 text-red-500" /> поле у Белебея
+   380→            </span>
+   381→            <span className="flex items-center gap-1">
+   382→              <CalendarDays className="h-3.5 w-3.5 text-red-500" /> {todayLabel}
+   383→            </span>
+   384→          </p>
+   385→        </div>
+   386→        <ModeSwitcher />
+   387→      </div>
+   388→
+   389→      {/* Три колонки */}
+   390→      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[320px_minmax(0,1fr)_340px]">
+   391→        {/* Колонка 1: погода + GDD */}
+   392→        <div className="order-2 space-y-3 xl:order-1">
+   393→          <Rise delay={0.05}>
+   394→            <WeatherPanel coords={FIELD_CENTER} place="Моя пасека" />
+   395→          </Rise>
+   396→          <Rise delay={0.1}>
+   397→            <GddCard />
+   398→          </Rise>
+   399→        </div>
+   400→
+   401→        {/* Колонка 2: состояние пасеки */}
+   402→        <div className="order-1 space-y-4 xl:order-2">
+   403→          <Rise delay={0}>
+   404→            <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   405→              <div className="flex flex-wrap items-center justify-between gap-2">
+   406→                <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   407→                  <TrendingUp className="h-4 w-4 text-red-500" /> Состояние пасеки
+   408→                </h2>
+   409→                {/* LIVE-индикатор живой телеметрии */}
+   410→                <span
+   411→                  title="Живой поток с датчиков · обновление каждые 2 с"
+   412→                  className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700"
+   413→                >
+   414→                  <span className="live-dot h-2 w-2 rounded-full bg-emerald-500" />
+   415→                  LIVE · телеметрия
+   416→                </span>
+   417→              </div>
+   418→
+   419→              <div className="mt-2">
+   420→                <StatusGauge info={{ value: gaugeValue, label: gauge.label, tone: gauge.tone }} className="mx-auto" />
+   421→                <div className="mt-2">
+   422→                  <p className="text-base font-extrabold text-[#2A1A12] md:text-lg">
+   423→                    {hive.label} · {hive.scenarioLabel}
+   424→                  </p>
+   425→                  <p className="mt-1 text-sm leading-snug text-gray-500">{hive.scenarioHint}</p>
+   426→                  <div className="mt-2 flex flex-wrap gap-1.5">
+   427→                    <span className={cn('rounded-full border px-2 py-0.5 text-[11px] font-bold', varroa.cls)}>
+   428→                      заклещенность {fmtNum(hive.base.varroaPct)} %
+   429→                    </span>
+   430→                    <span className="rounded-full border border-red-100 bg-red-50/60 px-2 py-0.5 text-[11px] font-bold text-red-700">
+   431→                      гул {Math.round(liveV.soundHz)} Гц
+   432→                    </span>
+   433→                    <span className="rounded-full border border-red-100 bg-red-50/60 px-2 py-0.5 text-[11px] font-bold text-red-700">
+   434→                      CO₂ {Math.round(liveV.co2Ppm)} ppm
+   435→                    </span>
+   436→                    <span className="rounded-full border border-red-100 bg-red-50/60 px-2 py-0.5 text-[11px] font-bold text-red-700">
+   437→                      трафик {Math.round(liveV.trafficPerMin)} пч/мин
+   438→                    </span>
+   439→                  </div>
+   440→                </div>
+   441→              </div>
+   442→
+   443→              {/* Живые плитки показателей */}
+   444→              <div className="mt-3 grid grid-cols-[repeat(auto-fit,minmax(140px,1fr))] gap-2">
+   445→                <LiveTile
+   446→                  icon={<Thermometer className="h-3.5 w-3.5" />}
+   447→                  label="Темп. внутри"
+   448→                  value={`${fmtNum(liveV.tempC)} °C`}
+   449→                  hint={`улей №${hive.id} · норма 34,5–35,0`}
+   450→                />
+   451→                <LiveTile
+   452→                  icon={<Droplets className="h-3.5 w-3.5" />}
+   453→                  label="Влажность"
+   454→                  value={`${fmtNum(liveV.humidityPct, 0)} %`}
+   455→                  hint={hive.scenario === 'flow' ? 'сушка нектара' : 'норма 50–66 %'}
+   456→                />
+   457→                <LiveTile
+   458→                  icon={<Scale className="h-3.5 w-3.5" />}
+   459→                  label="Масса улья"
+   460→                  value={`${fmtNum(liveV.weightKg)} кг`}
+   461→                  hint={`улей №${hive.id}`}
+   462→                />
+   463→                <LiveTile
+   464→                  icon={<AudioLines className="h-3.5 w-3.5" />}
+   465→                  label="Гул семьи"
+   466→                  value={`${Math.round(liveV.soundHz)} Гц`}
+   467→                  hint="норма 200–230 Гц"
+   468→                />
+   469→                <LiveTile
+   470→                  icon={<Wind className="h-3.5 w-3.5" />}
+   471→                  label="CO₂"
+   472→                  value={`${Math.round(liveV.co2Ppm)} ppm`}
+   473→                  hint="норма < 800 ppm"
+   474→                />
+   475→                <LiveTile
+   476→                  icon={<Cctv className="h-3.5 w-3.5" />}
+   477→                  label="Трафик на летке"
+   478→                  value={`${Math.round(liveV.trafficPerMin)} пч/мин`}
+   479→                  hint={traffic.label.toLowerCase()}
+   480→                />
+   481→              </div>
+   482→
+   483→              {/* Выбор улья №1–№4: разные состояния для наглядной демонстрации */}
+   484→              <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-2" role="group" aria-label="Выбор демо-улья">
+   485→                {DEMO_HIVES.map((h) => (
+   486→                  <HiveCard
+   487→                    key={h.id}
+   488→                    id={h.id}
+   489→                    scenario={h.scenario}
+   490→                    scenarioLabel={h.scenarioLabel}
+   491→                    index={indexWithBoost(h.id)}
+   492→                    active={h.id === hive.id}
+   493→                    onClick={() => setHive(h.id)}
+   494→                  />
+   495→                ))}
+   496→              </div>
+   497→            </section>
+   498→          </Rise>
+   499→
+   500→          {/* Температура и влажность */}
+   501→          <div className="grid grid-cols-[repeat(auto-fit,minmax(250px,1fr))] gap-4">
+   502→            <Rise delay={0.05} className="h-full">
+   503→              <MiniCard
+   504→                title="Температура"
+   505→                icon={<Thermometer className="h-4 w-4" />}
+   506→                value={`${fmtNum(liveV.tempC)} °C`}
+   507→                note="норма семьи 34,5–35,0 °C · 14 дней"
+   508→              >
+   509→                <DemoClimateMini data={climate} metric="tempInC" />
+   510→              </MiniCard>
+   511→            </Rise>
+   512→            <Rise delay={0.1} className="h-full">
+   513→              <MiniCard
+   514→                title="Влажность"
+   515→                icon={<Droplets className="h-4 w-4" />}
+   516→                value={`${fmtNum(liveV.humidityPct, 0)} %`}
+   517→                note={
+   518→                  hive.scenario === 'flow'
+   519→                    ? '73 % — семья сушит свежий нектар'
+   520→                    : 'норма 50–66 % · 14 дней'
+   521→                }
+   522→              >
+   523→                <DemoClimateMini data={climate} metric="humidityPct" />
+   524→              </MiniCard>
+   525→            </Rise>
+   526→          </div>
+   527→
+   528→          {/* Динамика заклещенности (Varroa) */}
+   529→          <Rise delay={0.1}>
+   530→            <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   531→              <div className="flex flex-wrap items-center justify-between gap-2">
+   532→                <h3 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   533→                  <Bug className="h-4 w-4 text-red-500" /> Динамика заклещенности (Varroa)
+   534→                </h3>
+   535→                <div className="flex flex-wrap items-center gap-1.5">
+   536→                  <span className={cn('rounded-full border px-2.5 py-0.5 text-[11px] font-bold', varroa.cls)}>
+   537→                    {varroa.label}
+   538→                  </span>
+   539→                  <span className="rounded-full border border-red-100 bg-red-50/60 px-2.5 py-0.5 text-[11px] font-bold text-red-700">
+   540→                    прогноз +14 дн.: {fmtNum(hive.base.varroaForecast14d)} %
+   541→                  </span>
+   542→                  {hive.scenario === 'varroa' ? (
+   543→                    <span className="rounded-full border border-red-200 bg-red-50 px-2.5 py-0.5 text-[11px] font-bold text-red-700">
+   544→                      лечения не было
+   545→                    </span>
+   546→                  ) : (
+   547→                    <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-[11px] font-bold text-emerald-700">
+   548→                      обработка проведена
+   549→                    </span>
+   550→                  )}
+   551→                </div>
+   552→              </div>
+   553→              <p className="mt-1 text-[11px] text-gray-400">
+   554→                Порог критичности 3 % (пунктир) · статусы: Норма &lt;2 % / Риск 2–3 % / Критично &gt;3 %
+   555→              </p>
+   556→              <div className="mt-2">
+   557→                <VarroaChart data={varroaSeries} />
+   558→              </div>
+   559→            </section>
+   560→          </Rise>
+   561→
+   562→          {/* Умные весы */}
+   563→          <Rise delay={0.1}>
+   564→            <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   565→              <div className="flex flex-wrap items-center justify-between gap-2">
+   566→                <h3 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   567→                  <Scale className="h-4 w-4 text-red-500" /> Умные весы
+   568→                </h3>
+   569→                <span
+   570→                  title="Колебания меньше ±150 г от ветра и дождя в привес не попадают"
+   571→                  className="inline-flex items-center gap-1.5 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-0.5 text-[11px] font-bold text-sky-700"
+   572→                >
+   573→                  <Gauge className="h-3 w-3" /> Порог тишины ±150 г
+   574→                </span>
+   575→              </div>
+   576→              <div className="mt-2 flex flex-wrap items-end gap-x-7 gap-y-2">
+   577→                <p className="text-3xl font-extrabold leading-none text-[#2A1A12]">
+   578→                  <LiveValue value={`${fmtNum(liveV.weightKg)} кг`} />
+   579→                </p>
+   580→                <div>
+   581→                  <p className="text-[11px] font-semibold text-gray-400">Суточный привес</p>
+   582→                  <p
+   583→                    className={cn(
+   584→                      'text-base font-extrabold',
+   585→                      hive.base.dailyGainKg >= 0.2 ? 'text-emerald-600' : 'text-amber-600',
+   586→                    )}
+   587→                  >
+   588→                    {fmtSigned(hive.base.dailyGainKg, 2)} кг
+   589→                  </p>
+   590→                </div>
+   591→                <div>
+   592→                  <p className="text-[11px] font-semibold text-gray-400">Утренний сброс (фуражиры)</p>
+   593→                  <p className="text-base font-extrabold text-sky-600">
+   594→                    −{fmtNum(hive.base.morningDropKg)} кг
+   595→                  </p>
+   596→                </div>
+   597→                <div>
+   598→                  <p className="text-[11px] font-semibold text-gray-400">Фильтр</p>
+   599→                  <p className="text-base font-extrabold text-gray-700">ветер и дождь отсечены</p>
+   600→                </div>
+   601→              </div>
+   602→              <div className="mt-3 h-[150px]">
+   603→                <DemoWeightBars data={weight} />
+   604→              </div>
+   605→              <p className="mt-1 text-[11px] text-gray-400">
+   606→                Вечерние веса 14 дней · чистый привес после возврата летной пчелы
+   607→              </p>
+   608→            </section>
+   609→          </Rise>
+   610→
+   611→          {/* Камера, акустика, газ */}
+   612→          <div className="grid grid-cols-[repeat(auto-fit,minmax(250px,1fr))] gap-4">
+   613→            <Rise delay={0.05} className="h-full">
+   614→              <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]">
+   615→                <div className="flex items-center gap-2">
+   616→                  <SensorCardIcon tone="red">
+   617→                    <Cctv className="h-4 w-4" />
+   618→                  </SensorCardIcon>
+   619→                  <div>
+   620→                    <h3 className="text-sm font-bold text-[#2A1A12]">Компьютерное зрение</h3>
+   621→                    <p className="text-[10px] text-gray-400">камера на летке</p>
+   622→                  </div>
+   623→                </div>
+   624→                <p className="mt-3 text-2xl font-extrabold leading-none text-[#2A1A12]">
+   625→                  <LiveValue value={`${Math.round(liveV.trafficPerMin)}`} />
+   626→                  <span className="ml-1 text-xs font-bold text-gray-400">пч/мин</span>
+   627→                </p>
+   628→                <div className="mt-2 space-y-1.5 text-xs text-gray-600">
+   629→                  <p className="flex items-center justify-between gap-2">
+   630→                    <span>Клещей на спинках за смену</span>
+   631→                    <span
+   632→                      className={cn(
+   633→                        'font-extrabold',
+   634→                        hive.base.mitesCounted === 0
+   635→                          ? 'text-emerald-600'
+   636→                          : hive.base.mitesCounted >= 5
+   637→                            ? 'text-red-600'
+   638→                            : 'text-amber-600',
+   639→                      )}
+   640→                    >
+   641→                      {hive.base.mitesCounted}
+   642→                    </span>
+   643→                  </p>
+   644→                  <p className="flex items-center justify-between gap-2">
+   645→                    <span>Средняя по пасеке</span>
+   646→                    <span className="font-extrabold text-gray-700">45 пч/мин</span>
+   647→                  </p>
+   648→                </div>
+   649→                <p
+   650→                  className={cn(
+   651→                    'mt-auto rounded-xl px-3 py-2 text-[11px] font-bold leading-snug',
+   652→                    hive.base.entranceLevel === 'beard'
+   653→                      ? 'border border-red-200 bg-red-50 text-red-700'
+   654→                      : hive.base.entranceLevel === 'weak'
+   655→                        ? 'border border-amber-200 bg-amber-50 text-amber-700'
+   656→                        : 'border border-emerald-200 bg-emerald-50 text-emerald-700',
+   657→                  )}
+   658→                >
+   659→                  {hive.base.entranceLabel}
+   660→                </p>
+   661→              </section>
+   662→            </Rise>
+   663→
+   664→            <Rise delay={0.1} className="h-full">
+   665→              <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]">
+   666→                <div className="flex items-center gap-2">
+   667→                  <SensorCardIcon tone="amber">
+   668→                    <AudioLines className="h-4 w-4" />
+   669→                  </SensorCardIcon>
+   670→                  <div>
+   671→                    <h3 className="text-sm font-bold text-[#2A1A12]">Акустика</h3>
+   672→                    <p className="text-[10px] text-gray-400">гул семьи</p>
+   673→                  </div>
+   674→                </div>
+   675→                <p className="mt-3 text-2xl font-extrabold leading-none text-[#2A1A12]">
+   676→                  <LiveValue value={`${Math.round(liveV.soundHz)}`} />
+   677→                  <span className="ml-1 text-xs font-bold text-gray-400">Гц</span>
+   678→                </p>
+   679→                <div className="mt-2">
+   680→                  <AcousticSpark data={sparkHz} />
+   681→                </div>
+   682→                <p className="mt-auto rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-bold leading-snug text-amber-700">
+   683→                  {hive.base.acousticLabel}
+   684→                </p>
+   685→              </section>
+   686→            </Rise>
+   687→
+   688→            <Rise delay={0.15} className="h-full">
+   689→              <section className="flex h-full flex-col rounded-2xl border border-red-100 bg-white p-4 shadow-sm dark:bg-[#221814]">
+   690→                <div className="flex items-center gap-2">
+   691→                  <SensorCardIcon tone="sky">
+   692→                    <Wind className="h-4 w-4" />
+   693→                  </SensorCardIcon>
+   694→                  <div>
+   695→                    <h3 className="text-sm font-bold text-[#2A1A12]">Качество воздуха</h3>
+   696→                    <p className="text-[10px] text-gray-400">газовый сенсор</p>
+   697→                  </div>
+   698→                </div>
+   699→                <p className="mt-3 text-2xl font-extrabold leading-none text-[#2A1A12]">
+   700→                  <LiveValue value={`${Math.round(liveV.co2Ppm)}`} />
+   701→                  <span className="ml-1 text-xs font-bold text-gray-400">ppm CO₂</span>
+   702→                </p>
+   703→                <div className="mt-2 space-y-1.5 text-xs">
+   704→                  <div className="flex items-center justify-between gap-2 text-gray-600">
+   705→                    <span>Индекс ЛОС</span>
+   706→                    <span className={cn('font-extrabold', voc.cls)}>{Math.round(liveV.vocIndex)} / 100</span>
+   707→                  </div>
+   708→                  <div className="h-2 overflow-hidden rounded-full bg-red-50 dark:bg-[#2C211C]">
+   709→                    <motion.div
+   710→                      className={cn(
+   711→                        'h-full rounded-full',
+   712→                        liveV.vocIndex > 60 ? 'bg-red-500' : liveV.vocIndex > 30 ? 'bg-amber-500' : 'bg-emerald-500',
+   713→                      )}
+   714→                      animate={{ width: `${Math.min(100, liveV.vocIndex)}%` }}
+   715→                      transition={{ duration: 0.6 }}
+   716→                    />
+   717→                  </div>
+   718→                </div>
+   719→                <p
+   720→                  className={cn(
+   721→                    'mt-auto rounded-xl border border-red-100 bg-red-50/50 px-3 py-2 text-[11px] font-bold leading-snug',
+   722→                    voc.cls,
+   723→                  )}
+   724→                >
+   725→                  {voc.label}
+   726→                </p>
+   727→              </section>
+   728→            </Rise>
+   729→          </div>
+   730→        </div>
+   731→
+   732→        {/* Колонка 3: предписания агента + события */}
+   733→        <div className="order-3 space-y-4">
+   734→          <Rise delay={0.05}>
+   735→            <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   736→              <div className="flex items-center justify-between gap-2">
+   737→                <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   738→                  <MessageSquareText className="h-4 w-4 text-red-500" /> Предписания агента
+   739→                </h2>
+   740→                <span className="text-[11px] text-gray-400">контекст: №{hive.id}</span>
+   741→              </div>
+   742→
+   743→              {/* Вечерний отчет (21:00) */}
+   744→              <Button
+   745→                variant="outline"
+   746→                onClick={() => setReportOpen(true)}
+   747→                className="mt-3 w-full gap-2 border-red-200 font-bold text-red-700 hover:bg-red-50 hover:text-red-700"
+   748→              >
+   749→                <ClipboardList className="h-4 w-4" /> Вечерний отчет (21:00)
+   750→              </Button>
+   751→
+   752→              <ol className="mt-3 space-y-2">
+   753→                {hive.prescriptions.map((f, i) => {
+   754→                  const isDone = doneForHive.includes(f.id)
+   755→                  return (
+   756→                    <li
+   757→                      key={f.id}
+   758→                      className={cn(
+   759→                        'rise-in overflow-hidden rounded-xl border transition-shadow',
+   760→                        isDone
+   761→                          ? 'border-emerald-200 bg-emerald-50/40'
+   762→                          : f.urgency === 'act-now'
+   763→                            ? 'border-red-200 hover:shadow-md hover:shadow-red-100'
+   764→                            : 'border-red-100 hover:shadow-md hover:shadow-red-50',
+   765→                      )}
+   766→                    >
+   767→                      <button
+   768→                        onClick={() => setEvidence(f)}
+   769→                        aria-label={`Почему агент так решил: ${f.title}`}
+   770→                        className="flex w-full items-start gap-2.5 px-3 py-2.5 text-left"
+   771→                      >
+   772→                        <span
+   773→                          className={cn(
+   774→                            'mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-extrabold',
+   775→                            isDone
+   776→                              ? 'bg-emerald-600 text-white'
+   777→                              : f.urgency === 'act-now'
+   778→                                ? 'bg-red-600 text-white'
+   779→                                : 'bg-red-100 text-red-700',
+   780→                          )}
+   781→                        >
+   782→                          {isDone ? <CheckCircle2 className="h-3.5 w-3.5" /> : i + 1}
+   783→                        </span>
+   784→                        <span className="min-w-0 flex-1">
+   785→                          <span
+   786→                            className={cn(
+   787→                              'block text-[13px] font-bold leading-snug',
+   788→                              isDone ? 'text-emerald-800 line-through decoration-emerald-300' : 'text-gray-800',
+   789→                            )}
+   790→                          >
+   791→                            {f.title}
+   792→                          </span>
+   793→                          <span className="mt-0.5 line-clamp-2 block text-[11px] leading-snug text-gray-500">
+   794→                            {f.summary}
+   795→                          </span>
+   796→                          {isDone && (
+   797→                            <span className="mt-1 inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-extrabold text-emerald-700">
+   798→                              <CheckCircle2 className="h-3 w-3" /> Выполнено · индекс +{fmtNum(f.boost)}
+   799→                            </span>
+   800→                          )}
+   801→                        </span>
+   802→                      </button>
+   803→                      <div className="flex flex-wrap gap-1 px-3 pb-2">
+   804→                        {f.basis.map((b) => (
+   805→                          <span
+   806→                            key={b}
+   807→                            className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] text-red-700 dark:bg-[#2C211C]"
+   808→                          >
+   809→                            {b}
+   810→                          </span>
+   811→                        ))}
+   812→                      </div>
+   813→                      <div className="flex items-center justify-between gap-2 border-t border-red-50 px-3 py-2">
+   814→                        <UrgencyBadge urgency={f.urgency} note={f.urgencyNote} />
+   815→                        <div className="ml-auto flex items-center">
+   816→                          <Button
+   817→                            size="sm"
+   818→                            variant="ghost"
+   819→                            className="gap-1 text-red-600 hover:bg-red-50 hover:text-red-700"
+   820→                            onClick={() => setEvidence(f)}
+   821→                          >
+   822→                            <Search className="h-3.5 w-3.5" /> Почему?
+   823→                          </Button>
+   824→                          <Button
+   825→                            size="sm"
+   826→                            variant="ghost"
+   827→                            className="hidden gap-1 text-gray-500 hover:bg-red-50 hover:text-red-700 sm:inline-flex"
+   828→                            onClick={() => ask(`Обсудим предписание по улью №${hive.id}: ${f.title}`)}
+   829→                          >
+   830→                            Обсудить
+   831→                          </Button>
+   832→                        </div>
+   833→                      </div>
+   834→                    </li>
+   835→                  )
+   836→                })}
+   837→              </ol>
+   838→              <p className="mt-3 text-[11px] leading-relaxed text-gray-400">
+   839→                Каждое предписание — кросс-проверка показаний нескольких датчиков, биологический риск на 3–14 дней
+   840→                и действие. Решение принимает пчеловод.
+   841→              </p>
+   842→            </section>
+   843→          </Rise>
+   844→
+   845→          <Rise delay={0.1}>
+   846→            <section className="rounded-2xl border border-red-100 bg-white p-4 shadow-sm md:p-5 dark:bg-[#221814]">
+   847→              <div className="flex items-center justify-between">
+   848→                <h2 className="flex items-center gap-1.5 text-sm font-bold text-[#2A1A12]">
+   849→                  <Flower2 className="h-4 w-4 text-red-500" /> Ближайшие события
+   850→                </h2>
+   851→                <button
+   852→                  onClick={() => setView('reminders')}
+   853→                  className="text-[11px] font-bold text-red-600 hover:text-red-700"
+   854→                >
+   855→                  все напоминания →
+   856→                </button>
+   857→              </div>
+   858→
+   859→              {/* GDD-событие: предупреждение за 5–7 дней до цветения */}
+   860→              <div className="mt-2 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2">
+   861→                <Flower2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
+   862→                <div className="min-w-0 flex-1">
+   863→                  <p className="text-[13px] font-semibold leading-snug text-gray-800">
+   864→                    {nearest.name}: старт цветения через ~{nearest.daysLeft} дн.
+   865→                  </p>
+   866→                  <p className="text-[11px] text-gray-400">
+   867→                    GDD {GDD_CURRENT} из {nearest.need} · +{GDD_PER_DAY}/день — проверьте объем ульев
+   868→                  </p>
+   869→                </div>
+   870→              </div>
+   871→
+   872→              {upcomingReminders.length === 0 ? (
+   873→                <p className="mt-2 text-sm text-gray-400">
+   874→                  Напоминаний нет — поставьте первое в разделе «Напоминания».
+   875→                </p>
+   876→              ) : (
+   877→                <ul className="mt-2 space-y-1.5">
+   878→                  {upcomingReminders.map((r) => (
+   879→                    <li
+   880→                      key={r.id}
+   881→                      className="flex items-start gap-2.5 rounded-xl bg-red-50/50 px-3 py-2 dark:bg-[#2C211C]"
+   882→                    >
+   883→                      <ClipboardList className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+   884→                      <div className="min-w-0 flex-1">
+   885→                        <p className="text-[13px] font-semibold leading-snug text-gray-800">{r.text}</p>
+   886→                      </div>
+   887→                    </li>
+   888→                  ))}
+   889→                </ul>
+   890→              )}
+   891→
+   892→              <h3 className="mt-4 flex items-center gap-1.5 text-xs font-bold text-gray-500">
+   893→                <ClipboardList className="h-3.5 w-3.5" /> Демо-сценарии пасеки
+   894→              </h3>
+   895→              <ul className="mt-1.5 space-y-1.5">
+   896→                {DEMO_HIVES.map((h) => (
+   897→                  <li
+   898→                    key={h.id}
+   899→                    className="flex flex-wrap items-center gap-2 rounded-xl border border-red-50 px-3 py-2 text-[13px]"
+   900→                  >
+   901→                    <span className={cn('h-2 w-2 rounded-full', SCENARIO_DOT[h.scenario])} />
+   902→                    <span className="font-semibold text-gray-700">{h.label}</span>
+   903→                    <span className="text-gray-500">{h.scenarioLabel.toLowerCase()}</span>
+   904→                    <span className="ml-auto text-[11px] font-bold text-red-600">
+   905→                      индекс {fmtNum(indexWithBoost(h.id))}
+   906→                    </span>
+   907→                  </li>
+   908→                ))}
+   909→              </ul>
+   910→            </section>
+   911→          </Rise>
+   912→        </div>
+   913→      </div>
+   914→
+   915→      {/* Диалоги: доказательная аргументация и вечерний отчет */}
+   916→      <EvidenceDialog
+   917→        finding={evidence}
+   918→        hive={hive}
+   919→        done={evidence ? doneForHive.includes(evidence.id) : false}
+   920→        onComplete={complete}
+   921→        onOpenChange={(v) => !v && setEvidence(null)}
+   922→      />
+   923→      <EveningReportDialog open={reportOpen} onOpenChange={setReportOpen} doneList={done} />
+   924→    </div>
+   925→  )
+   926→}
+   927→
